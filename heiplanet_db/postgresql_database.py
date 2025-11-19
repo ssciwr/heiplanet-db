@@ -1,4 +1,5 @@
 from sqlalchemy import (
+    cast,
     create_engine,
     text,
     Float,
@@ -397,24 +398,90 @@ def insert_grid_points(session: Session, latitudes: np.ndarray, longitudes: np.n
     print("Grid points inserted.")
 
 
-def create_resolution_groups(
+def insert_resolution_groups(
     session: Session,
-    resolutions: np.ndarray = [0.1, 0.25, 0.5, 1.0, 1.5, 2.5, 3.0, 5.0],
+    resolutions: np.ndarray = np.asarray([0.1, 0.2, 0.5, 1.0, 1.5, 2.5, 3.0, 5.0]),
+    descriptions: list[str] | None = None,
 ) -> None:
     """Create the resolution groups.
 
     There are different degrees resolution that can be requested:
-    0.1 degree, 0.25/0.5/1.0/1.5/2.0/2.5/3.0/5.0 degrees.
+    0.1 degree, 0.2/0.5/1.0/1.5/2.0/2.5/3.0/5.0 degrees.
+    We are currently using 0.2 degree resolution and not 0.25 degree resolution here,
+    since this is a subset of 0.1 degree resolution grid points. Otherwise we would
+    need to create additional grid points for 0.25 degree resolution through interpolation,
+    which has not been defined as to which interpolation method can be used for this.
+
+    Args:
+        session (Session): SQLAlchemy session object.
+        resolutions (np.ndarray): Array of resolutions to insert. Defaults to
+            0.1, 0.2, 0.5, 1.0, 1.5, 2.5, 3.0, 5.0 degree resolution.
+        descriptions (list[str]|None): List of descriptions for each resolution.
+            If None, default descriptions will be used.
     """
-    # insert the resolution values into the resolution table
+    if descriptions is None:
+        descriptions = [f"{res} degree resolution" for res in resolutions]
+    # create list of dictionaries for bulk insert
+    resolution_groups = [
+        {
+            "resolution": float(resolution),
+            "description": description,
+        }
+        for resolution, description in zip(resolutions, descriptions)
+    ]
+    add_data_list_bulk(session, resolution_groups, ResolutionGroup)
+    print("Resolution groups inserted.")
 
 
-def assign_grid_resolution_group_to_grid_point():
+def assign_grid_resolution_group_to_grid_point(session: Session) -> None:
     """
     Assign the grid resolution group to each grid point,
     creating the many-to-many relationship between resolutions and
     grid points.
+
+    Args:
+        session (Session): SQLAlchemy session object.
     """
+    # all grid id's are at 0.1 degree resolution
+    grid_points = session.query(GridPoint).all()
+    resolution_group = (
+        session.query(ResolutionGroup).filter(ResolutionGroup.resolution == 0.1).first()
+    )
+    if not resolution_group:
+        raise ValueError("Resolution group for 0.1 degree not found.")
+    grid_point_resolutions = [
+        {
+            "grid_id": grid_point.id,
+            "resolution_id": resolution_group.id,
+        }
+        for grid_point in grid_points
+    ]
+    # get id's for 0.2 degree resolution
+    # this is every second grid point in both lat and lon direction
+    grid_points_0_2 = (
+        session.query(GridPoint)
+        .filter(
+            (cast(func.round(GridPoint.latitude * 10), Integer) % 2 == 0)
+            & (cast(func.round(GridPoint.longitude * 10), Integer) % 2 == 0)
+        )
+        .all()
+    )
+    resolution_group_0_2 = (
+        session.query(ResolutionGroup).filter(ResolutionGroup.resolution == 0.2).first()
+    )
+    if not resolution_group_0_2:
+        raise ValueError("Resolution group for 0.2 degree not found.")
+    grid_point_resolutions.extend(
+        [
+            {
+                "grid_id": grid_point.id,
+                "resolution_id": resolution_group_0_2.id,
+            }
+            for grid_point in grid_points_0_2
+        ]
+    )
+    add_data_list_bulk(session, grid_point_resolutions, GridPointResolution)
+    print("Grid point resolutions assigned.")
 
 
 def extract_time_point(
