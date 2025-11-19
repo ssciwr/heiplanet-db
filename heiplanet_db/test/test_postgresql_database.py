@@ -281,7 +281,7 @@ def test_assign_grid_resolution_group_to_grid_point(get_session):
         .filter(postdb.ResolutionGroup.resolution == 0.1)
         .first()
     )
-    assert resolution_0_1.resolution == 0.1
+    assert math.isclose(resolution_0_1.resolution, 0.1, abs_tol=1e-5)
     for gp in grid_points:
         gpr = (
             get_session.query(postdb.GridPointResolution)
@@ -298,7 +298,7 @@ def test_assign_grid_resolution_group_to_grid_point(get_session):
         .filter(postdb.ResolutionGroup.resolution == 0.2)
         .first()
     )
-    assert resolution_0_2.resolution == 0.2
+    assert math.isclose(resolution_0_2.resolution, 0.2, abs_tol=1e-5)
     # Grid points where both lat and lon satisfy round(coord*10) % 2 == 0
     # These are: 0.0, 0.2, 0.4 in both dimensions
     gp_0_2 = (

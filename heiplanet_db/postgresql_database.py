@@ -5,6 +5,7 @@ from sqlalchemy import (
     Float,
     String,
     Integer,
+    Numeric,
     BigInteger,
     Index,
     ForeignKey,
@@ -204,7 +205,9 @@ class ResolutionGroup(Base):
     __tablename__ = "resolution_group"
 
     id: Mapped[int] = mapped_column(Integer(), primary_key=True, autoincrement=True)
-    resolution: Mapped[float] = mapped_column(Float(), unique=True)
+    resolution: Mapped[float] = mapped_column(
+        Numeric(precision=4, scale=2), unique=True
+    )
     description: Mapped[str] = mapped_column(String(), nullable=True)
 
 
