@@ -194,6 +194,32 @@ class VarValueNuts(Base):
     )
 
 
+class ResolutionGroup(Base):
+    """Resolution group for the different grid resolutions."""
+
+    # create different grid resolution groups
+    # 0.1, 0.25, 0.5 resolution degree resolution
+    # ideally, we want values at 0.1, 0.25, 0.5, 1, 1.5, 2, 3, 5
+    __tablename__ = "resolution_group"
+
+    id: Mapped[int] = mapped_column(Integer(), primary_key=True, autoincrement=True)
+    resolution: Mapped[float] = mapped_column(Float(), unique=True)
+    description: Mapped[str] = mapped_column(String(), nullable=True)
+
+
+class GridPointResolution(Base):
+    """Many-to-many relationship between GridPoint and ResolutionGroup"""
+
+    __tablename__ = "grid_point_resolution"
+
+    grid_id: Mapped[int] = mapped_column(
+        Integer(), ForeignKey("grid_point.id"), primary_key=True
+    )
+    resolution_id: Mapped[int] = mapped_column(
+        Integer(), ForeignKey("resolution_group.id"), primary_key=True
+    )
+
+
 def install_postgis(engine: engine.Engine):
     """
     Install PostGIS extension on the database.

@@ -43,6 +43,8 @@ def get_missing_tables(engine):
         "var_type",
         "var_value",
         "var_value_nuts",
+        "resolution_group",
+        "grid_point_resolution",
     }
     existing_tables = set(inspector.get_table_names(schema="public"))
     missing_tables = expected_tables - existing_tables
