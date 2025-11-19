@@ -397,6 +397,26 @@ def insert_grid_points(session: Session, latitudes: np.ndarray, longitudes: np.n
     print("Grid points inserted.")
 
 
+def create_resolution_groups(
+    session: Session,
+    resolutions: np.ndarray = [0.1, 0.25, 0.5, 1.0, 1.5, 2.5, 3.0, 5.0],
+) -> None:
+    """Create the resolution groups.
+
+    There are different degrees resolution that can be requested:
+    0.1 degree, 0.25/0.5/1.0/1.5/2.0/2.5/3.0/5.0 degrees.
+    """
+    # insert the resolution values into the resolution table
+
+
+def assign_grid_resolution_group_to_grid_point():
+    """
+    Assign the grid resolution group to each grid point,
+    creating the many-to-many relationship between resolutions and
+    grid points.
+    """
+
+
 def extract_time_point(
     time_point: np.datetime64,
 ) -> tuple[int, int, int, int, int, int]:
