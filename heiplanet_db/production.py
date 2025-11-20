@@ -9,6 +9,7 @@ from heiplanet_db import postgresql_database as db
 import zipfile
 import xarray as xr
 from sqlalchemy import engine
+import numpy as np
 
 
 def read_production_config(dict_path: str | Traversable | Path | None = None) -> dict:
@@ -173,6 +174,10 @@ def insert_var_values(
     _, _ = db.insert_var_values(
         engine, r0_ds, "R0", grid_id_map, time_id_map, var_type_id_map
     )
+    # assign resolution groups to grid points
+    resolution_session = db.create_session(engine)
+    db.assign_grid_resolution_group_to_grid_point(resolution_session)
+    resolution_session.close()
     return 0
 
 
@@ -270,6 +275,10 @@ def main() -> None:
     var_types = get_var_types_from_config(config=config["data_to_fetch"])
     db.insert_var_types(var_type_session, var_types)
     var_type_session.close()
+    # insert the resolution groups
+    resolution_session = db.create_session(engine)
+    db.insert_resolution_groups(resolution_session, resolutions=np.array([0.1, 0.2]))
+    resolution_session.close()
     # insert the data
     insert_var_values(engine, era5_land_path=era5_land_path, r0_path=r0_path)
     # insert the nuts variables data
