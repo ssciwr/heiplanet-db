@@ -93,12 +93,20 @@ def insert_data(get_session, get_dataset, get_engine_with_tables):
         var_id_map,
         to_monthly=False,
     )
+
+    # insert resolution values
+    postdb.insert_resolution_groups(get_session, resolutions=np.array([0.1, 0.2]))
+    postdb.assign_grid_resolution_group_to_grid_point(get_session)
+
     yield get_session
     # clean up
     get_session.execute(text("TRUNCATE TABLE var_value RESTART IDENTITY CASCADE"))
     get_session.execute(text("TRUNCATE TABLE var_type RESTART IDENTITY CASCADE"))
     get_session.execute(text("TRUNCATE TABLE time_point RESTART IDENTITY CASCADE"))
     get_session.execute(text("TRUNCATE TABLE grid_point RESTART IDENTITY CASCADE"))
+    get_session.execute(
+        text("TRUNCATE TABLE resolution_group RESTART IDENTITY CASCADE")
+    )
     get_session.commit()
 
 
@@ -178,8 +186,8 @@ def get_dataset():
         data,
         dims=["latitude", "longitude", "time"],
         coords={
-            "latitude": [10, 11],
-            "longitude": [10, 11, 12],
+            "latitude": [10.1, 10.2],
+            "longitude": [10.1, 10.2, 10.3],
             "time": [
                 np.datetime64("2023-01-01", "ns"),
                 np.datetime64("2024-01-01", "ns"),

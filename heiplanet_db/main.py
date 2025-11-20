@@ -96,6 +96,7 @@ class CartesianRequest(BaseModel):
     requested_time_point: datetime.date
     requested_variable_type: str | None = None
     requested_area: tuple[float, float, float, float] | None = None
+    requested_grid_resolution: float | None = None
 
 
 @app.post("/cartesian")
@@ -123,6 +124,7 @@ def get_cartesian(
             session,
             time_point=date_requested,
             area=request.requested_area,
+            grid_resolution=request.requested_grid_resolution,
             var_name=var_name,
         )
         return {"result": var_value}

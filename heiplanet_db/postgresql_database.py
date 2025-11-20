@@ -403,7 +403,7 @@ def insert_grid_points(session: Session, latitudes: np.ndarray, longitudes: np.n
 
 def insert_resolution_groups(
     session: Session,
-    resolutions: np.ndarray = np.asarray([0.1, 0.2, 0.5, 1.0, 1.5, 2.5, 3.0, 5.0]),
+    resolutions: np.ndarray = np.array([0.1, 0.2, 0.5, 1.0, 1.5, 2.5, 3.0, 5.0]),
     descriptions: list[str] | None = None,
 ) -> None:
     """Create the resolution groups.
@@ -888,8 +888,46 @@ def get_time_points(
     )
 
 
+def get_resolution_id(session: Session, resolution: float) -> int | None:
+    """Get the resolution ID for a given resolution value.
+
+    Args:
+        session (Session): SQLAlchemy session object.
+        resolution (float): Resolution value to look up.
+
+    Returns:
+        int | None: Resolution ID if found, None otherwise.
+    """
+    resolution_group = (
+        session.query(ResolutionGroup)
+        .filter(ResolutionGroup.resolution == resolution)
+        .first()
+    )
+    return resolution_group.id if resolution_group else None
+
+
+def get_grid_ids_by_resolution(session: Session, resolution_id: int) -> List[int]:
+    """Get all grid point IDs for a specific resolution.
+
+    Args:
+        session (Session): SQLAlchemy session object.
+        resolution_id (int): Resolution ID to filter by.
+
+    Returns:
+        List[int]: List of grid point IDs belonging to the specified resolution.
+    """
+    grid_point_resolutions = (
+        session.query(GridPointResolution.grid_id)
+        .filter(GridPointResolution.resolution_id == resolution_id)
+        .all()
+    )
+    return [gpr.grid_id for gpr in grid_point_resolutions]
+
+
 def get_grid_points(
-    session: Session, area: None | Tuple[float, float, float, float] = None
+    session: Session,
+    area: None | Tuple[float, float, float, float] = None,
+    resolution_id: int | None = None,
 ) -> List[GridPoint]:
     """Get grid points from the database that fall within a specified area.
     Args:
@@ -897,22 +935,30 @@ def get_grid_points(
         area (None | Tuple[float, float, float, float]):
             Area as (North, West, South, East).
             If None, all grid points are returned.
+        resolution_id (int | None): Resolution ID of the grid points. Defaults to None.
     Returns:
         List[GridPoint]: List of GridPoint objects within the specified area.
     """
-    if area is None:
-        return session.query(GridPoint).all()
-    north, west, south, east = area
-    return (
-        session.query(GridPoint)
-        .filter(
+
+    query = session.query(GridPoint)
+
+    # Filter by resolution if specified
+    if resolution_id is not None:
+        query = query.join(
+            GridPointResolution, GridPoint.id == GridPointResolution.grid_id
+        ).filter(GridPointResolution.resolution_id == resolution_id)
+
+    # Filter by area if specified
+    if area is not None:
+        north, west, south, east = area
+        query = query.filter(
             GridPoint.latitude <= north,
             GridPoint.latitude >= south,
             GridPoint.longitude >= west,
             GridPoint.longitude <= east,
         )
-        .all()
-    )
+
+    return query.all()
 
 
 def get_var_types(
@@ -957,6 +1003,7 @@ def sort_grid_points_get_ids(
 def get_var_values_cartesian(
     session: Session,
     time_point: Tuple[int, int],
+    grid_resolution: float = 0.1,
     area: None | Tuple[float, float, float, float] = None,
     var_name: None | str = None,
 ) -> dict:
@@ -965,6 +1012,7 @@ def get_var_values_cartesian(
     Args:
         session (Session): SQLAlchemy session object.
         time_point (Tuple[int, int]): Date point as (year, month).
+        grid_resolution (float): Resolution of the grid points. Defaults to 0.1 degree.
         area (None | Tuple[float, float, float, float]):
             Area as (North, West, South, East).
             If None, all grid points are used.
@@ -988,13 +1036,24 @@ def get_var_values_cartesian(
     # get time id
     time_id = date_object.id
 
+    # get the resolution id for the targeted resolution
+    resolution_id = get_resolution_id(session=session, resolution=grid_resolution)
+    if not resolution_id:
+        print("No resolution id found for requested resolution.")
+        raise HTTPException(
+            status_code=400, detail="No id found for specified resolution."
+        )
+
     # get the grid points and their ids
-    grid_points = get_grid_points(session, area)
+    grid_points = get_grid_points(session, area, resolution_id)
 
     if not grid_points:
-        print("No grid points found in the specified area.")
+        print(
+            "No grid points found in the specified area or with the specified resolution."
+        )
         raise HTTPException(
-            status_code=400, detail="No grid points found in specified area."
+            status_code=400,
+            detail="No grid points found in specified area or with the specified resolution.",
         )
     # get grid ids for lookup
     grid_ids = [grid_point.id for grid_point in grid_points]
