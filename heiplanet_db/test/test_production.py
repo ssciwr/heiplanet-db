@@ -22,7 +22,7 @@ def test_read_production_config(production_config: Traversable):
     assert dict1["var_name"][0]["name"] in ["t2m", "tp"]
     assert (
         dict1["filename"]
-        == "era5_data_2016_2017_all_2t_tp_monthly_unicoords_adjlon_celsius_mm_05deg_trim.nc"
+        == "era5_data_2016-2017_allm_2t_tp_monthly_unicoords_adjlon_celsius_mm_ts20251120.nc"
     )
     assert dict1["host"] == "heibox"
     assert dict1["description"]
@@ -35,7 +35,7 @@ def test_read_production_config(production_config: Traversable):
     assert config_dict["data_to_fetch"][0]["var_name"][0]["name"] == "t2m"
     assert (
         config_dict["data_to_fetch"][0]["filename"]
-        == "era5_data_2016_01_2t_tp_monthly_celsius_mm_resampled_0.5degree_trim.nc"
+        == "era5_data_2016-2017_allm_2t_tp_monthly_unicoords_adjlon_celsius_mm_ts20251120.nc"
     )
     assert "local" in config_dict["data_to_fetch"][0]["host"]
     config_dict = prod.read_production_config(str(production_config))
