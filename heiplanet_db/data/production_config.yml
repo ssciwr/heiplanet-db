@@ -1,17 +1,5 @@
 data_to_fetch:
   - var_name: 
-    - type: "temperature"
-      name: "t2m"
-      unit: "Celsius"
-      grid: "0.5"
-      description: "2m temperature"
-      level: "silver"
-    filename: "era5_data_2016-2017_allm_2t_tp_monthly_unicoords_adjlon_celsius_mm_ts20251120.nc"
-    host: "heibox"
-    url: "https://heibox.uni-heidelberg.de/f/6863449de44d494796f3/?dl=1"
-    filehash: "d487262650f3eaa4ccedc02c173e4fc0f610c6b385b06d33c37c249678a07c1d"
-    description: "ERA5 data for 2m temperature and total precipitation, monthly averages, resampled to 0.5 degree resolution, trimmed to specific region."
-  - var_name: 
     - type: "definition"
       name: "NUTS-definition"
       unit: "shape"

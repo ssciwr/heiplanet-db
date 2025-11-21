@@ -1083,6 +1083,7 @@ def get_var_values_cartesian(
             VarValue.var_id == var_id,
         )
         .order_by(GridPoint.latitude, GridPoint.longitude)  # Ensure consistent ordering
+        # for some reason the ordering does not work coorectly
         .all()
     )
     # Convert directly to list of tuples (much faster)
