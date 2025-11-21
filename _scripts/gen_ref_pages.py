@@ -5,7 +5,7 @@ import mkdocs_gen_files
 nav = mkdocs_gen_files.Nav()
 
 root = Path(__file__).parent.parent
-script_folder = "onehealth_db"
+script_folder = "heiplanet_db"
 src = root / script_folder
 
 for path in sorted(src.glob("*.py")):

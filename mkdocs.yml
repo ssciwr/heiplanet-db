@@ -1,7 +1,7 @@
 site_name: One Health Platform
-site_url: https://ssciwr.github.io/onehealth-db/
-repo_url: https://github.com/ssciwr/onehealth-db
-repo_name: "ssciwr/onehealth-db"
+site_url: https://ssciwr.github.io/heiplanet-db/
+repo_url: https://github.com/ssciwr/heiplanet-db
+repo_name: "ssciwr/heiplanet-db"
 copyright: Copyright &copy; 2025, Scientific Software Center, Heidelberg University.
 watch: [docs, docs_extra, README.md, LICENSE, mkdocs.yml]
 

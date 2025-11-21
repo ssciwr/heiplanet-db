@@ -14,7 +14,7 @@ services:
         max-size: 20m
         max-file: 25
     networks:
-      - onehealth-network
+      - heiplanet-network
   db:
     image: postgis/postgis:17-3.5
     restart: always  
@@ -25,16 +25,16 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d onehealth_db"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d heiplanet_db"]
       interval: 10s
       timeout: 5s
       retries: 5
     networks:
-      - onehealth-network
+      - heiplanet-network
 
   # FastAPI Application service (Stage 2)
   api:
-    image: ghcr.io/ssciwr/onehealth-backend:latest
+    image: ghcr.io/ssciwr/heiplanet-backend:latest
     build:
       context: .
       dockerfile: Dockerfile
@@ -50,16 +50,16 @@ services:
       - DB_USER=${DB_USER}
       - WAIT_FOR_DB=${WAIT_FOR_DB}
     volumes:
-      - ./production.yaml:/onehealth_db/production.yaml
-      - ./onehealth_db:/onehealth_db/onehealth_db  # For development hot reload
+      - ./production.yaml:/heiplanet_db/production.yaml
+      - ./heiplanet_db:/heiplanet_db/heiplanet_db  # For development hot reload
     command: ["api"]  # Run FastAPI server
     restart: "no"
     networks:
-      - onehealth-network
+      - heiplanet-network
     profiles: ["api"]
 
   production-runner:
-    image: ghcr.io/ssciwr/onehealth-backend:latest
+    image: ghcr.io/ssciwr/heiplanet-backend:latest
     build:
       context: .
       dockerfile: Dockerfile
@@ -73,16 +73,16 @@ services:
       - DB_USER=${DB_USER}
       - WAIT_FOR_DB=${WAIT_FOR_DB}
     volumes:
-      - ./production.yaml:/onehealth_db/production.yaml
+      - ./production.yaml:/heiplanet_db/production.yaml
     command: ["production"]
     restart: "no"  # Run once
     networks:
-      - onehealth-network
+      - heiplanet-network
     profiles: ["init"]
 
 volumes:
   postgres_data:
 
 networks:
-  onehealth-network:
+  heiplanet-network:
     driver: bridge

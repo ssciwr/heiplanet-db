@@ -40,4 +40,4 @@ conda env config vars set JUPYTER_PLATFORM_DIRS=1 #(1)!
 1.  reactivate `your_env` would be needed
 
 ## Other issues
-Other issues are listed [here](https://github.com/ssciwr/onehealth-db/issues)
+Other issues are listed [here](https://github.com/ssciwr/heiplanet-db/issues)

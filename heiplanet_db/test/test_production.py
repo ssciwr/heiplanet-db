@@ -1,4 +1,4 @@
-from onehealth_db import production as prod
+from heiplanet_db import production as prod
 import pytest
 from pathlib import Path
 from importlib import resources
@@ -9,7 +9,7 @@ from importlib.resources.abc import Traversable
 def production_config() -> Traversable:
     """Fixture to provide the path to the test configuration file."""
     dict_path = (
-        resources.files("onehealth_db") / "test" / "data" / "test_production_config.yml"
+        resources.files("heiplanet_db") / "test" / "data" / "test_production_config.yml"
     )
     return dict_path
 
@@ -19,16 +19,13 @@ def test_read_production_config(production_config: Traversable):
     assert config_dict
     assert len(config_dict) == 2
     dict1 = config_dict["data_to_fetch"][0]
-    assert dict1["var_name"][0]["name"] in ["t2m", "tp"]
-    assert (
-        dict1["filename"]
-        == "era5_data_2016_2017_all_2t_tp_monthly_unicoords_adjlon_celsius_mm_05deg_trim.nc"
-    )
+    assert dict1["var_name"][0]["name"] == "NUTS-definition"
+    assert dict1["filename"] == "NUTS_RG_20M_2024_4326.shp.zip"
     assert dict1["host"] == "heibox"
-    assert dict1["description"]
+    assert dict1["var_name"][0]["description"]
     dict2 = config_dict["data_to_fetch"][1]
-    assert dict2["var_name"][0]["name"] == "NUTS-definition"
-    assert dict2["filename"] == "NUTS_RG_20M_2024_4326.shp.zip"
+    assert dict2["var_name"][0]["name"] == "R0"
+    assert dict2["filename"] == "output_JModel_global_ts20251120.nc"
     assert dict2["host"] == "heibox"
     # read another config file
     config_dict = prod.read_production_config(production_config)
