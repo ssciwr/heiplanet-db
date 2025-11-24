@@ -136,21 +136,17 @@ def check_paths(paths: list[Path | None]) -> None:
 
 def insert_var_values(
     engine: engine.Engine,
-    era5_land_path: Path | None = None,
     r0_path: Path | None = None,
 ) -> int:
-    check_paths([era5_land_path, r0_path])
-    era5_ds = xr.open_dataset(era5_land_path, chunks={})
     r0_ds = xr.open_dataset(r0_path, chunks={})
     # rechunk the dataset
-    era5_ds = era5_ds.chunk({"time": 1, "latitude": 180, "longitude": 360})
     r0_ds = r0_ds.chunk({"time": 1, "latitude": 180, "longitude": 360})
     # add grid points
     grid_point_session = db.create_session(engine)
     db.insert_grid_points(
         grid_point_session,
-        latitudes=era5_ds.latitude.to_numpy(),
-        longitudes=era5_ds.longitude.to_numpy(),
+        latitudes=r0_ds.latitude.to_numpy(),
+        longitudes=r0_ds.longitude.to_numpy(),
     )
     grid_point_session.close()
     # add time points
@@ -158,7 +154,7 @@ def insert_var_values(
     db.insert_time_points(
         time_point_session,
         time_point_data=[
-            (era5_ds.time.to_numpy(), False),
+            (r0_ds.time.to_numpy(), False),
         ],
     )  # True means yearly data
     time_point_session.close()
@@ -166,10 +162,6 @@ def insert_var_values(
     id_map_session = db.create_session(engine)
     grid_id_map, time_id_map, var_type_id_map = db.get_id_maps(id_map_session)
     id_map_session.close()
-    # add t2m values
-    _, _ = db.insert_var_values(
-        engine, era5_ds, "t2m", grid_id_map, time_id_map, var_type_id_map
-    )
     # add R0 values
     _, _ = db.insert_var_values(
         engine, r0_ds, "R0", grid_id_map, time_id_map, var_type_id_map
@@ -209,7 +201,6 @@ def main() -> None:
     """
     # set up production database and data lake using the provided config
     config = read_production_config()
-    era5_land_path = None
     shapefile_folder_path = None
     r0_path = None
     r0_nuts_path = None
@@ -241,11 +232,7 @@ def main() -> None:
                 filehash=data["filehash"],
                 outputdir=Path(config["datalake"][data_level]),
             )
-        if data["var_name"][0]["type"] in ["temperature", "precipitation"]:
-            # set the path to the ERA5 data
-            era5_land_path = Path(config["datalake"][data_level]) / data["filename"]
-            print(f"ERA5 land data path: {era5_land_path}")
-        elif data["var_name"][0]["type"] == "R0":
+        if data["var_name"][0]["type"] == "R0":
             # set the path to the R0 data
             r0_path = Path(config["datalake"][data_level]) / data["filename"]
             print(f"R0 data path: {r0_path}")
@@ -280,7 +267,7 @@ def main() -> None:
     db.insert_resolution_groups(resolution_session, resolutions=np.array([0.1, 0.2]))
     resolution_session.close()
     # insert the data
-    insert_var_values(engine, era5_land_path=era5_land_path, r0_path=r0_path)
+    insert_var_values(engine, r0_path=r0_path)
     # insert the nuts variables data
     insert_var_values_nuts(engine, r0_nuts_path=r0_nuts_path)
 
