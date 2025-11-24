@@ -134,6 +134,10 @@ class VarValue(Base):
     grid_id: Mapped[int] = mapped_column(Integer(), ForeignKey("grid_point.id"))
     time_id: Mapped[int] = mapped_column(Integer(), ForeignKey("time_point.id"))
     var_id: Mapped[int] = mapped_column(Integer(), ForeignKey("var_type.id"))
+    # not sure if we should put resolution id here, since the same grid point
+    # can belong to different resolution groups
+    # so we have a separate many-to-many relationship table between grid points and resolution groups
+    # however, this makes lookup somewhat more complex and maybe slower
     value: Mapped[float] = mapped_column(Float())
 
     __table_args__ = (
@@ -445,44 +449,42 @@ def assign_grid_resolution_group_to_grid_point(session: Session) -> None:
     Args:
         session (Session): SQLAlchemy session object.
     """
-    # all grid id's are at 0.1 degree resolution
-    grid_points = session.query(GridPoint).all()
-    resolution_group = (
-        session.query(ResolutionGroup).filter(ResolutionGroup.resolution == 0.1).first()
-    )
-    if not resolution_group:
-        raise ValueError("Resolution group for 0.1 degree not found.")
-    grid_point_resolutions = [
-        {
-            "grid_id": grid_point.id,
-            "resolution_id": resolution_group.id,
-        }
-        for grid_point in grid_points
-    ]
-    # get id's for 0.2 degree resolution
-    # this is every second grid point in both lat and lon direction
-    grid_points_0_2 = (
-        session.query(GridPoint)
-        .filter(
-            (cast(func.round(GridPoint.latitude * 10), Integer) % 2 == 0)
-            & (cast(func.round(GridPoint.longitude * 10), Integer) % 2 == 0)
+    # we assume that by multiplying the resolution, and the
+    # lat/long values by 10, we can use the modulo operator to
+    # map the grid points to the resolution groups
+    # also we are using exact equality check since the way it is stored on postgresql
+    # should be exact and not numerically imprecise
+    grid_point_resolutions = []
+    # get the resolution groups from the database
+    resolution_groups = session.query(ResolutionGroup).all()
+    if not resolution_groups:
+        raise ValueError("No resolution groups found in the database.")
+    for resolution_group in resolution_groups:
+        resolution = float(resolution_group.resolution) * 10
+        grid_points = (
+            session.query(GridPoint)
+            .filter(
+                (cast(func.round(GridPoint.latitude * 10), Integer) % resolution == 0)
+                & (
+                    cast(func.round(GridPoint.longitude * 10), Integer) % resolution
+                    == 0
+                )
+            )
+            .all()
         )
-        .all()
-    )
-    resolution_group_0_2 = (
-        session.query(ResolutionGroup).filter(ResolutionGroup.resolution == 0.2).first()
-    )
-    if not resolution_group_0_2:
-        raise ValueError("Resolution group for 0.2 degree not found.")
-    grid_point_resolutions.extend(
-        [
-            {
-                "grid_id": grid_point.id,
-                "resolution_id": resolution_group_0_2.id,
-            }
-            for grid_point in grid_points_0_2
-        ]
-    )
+        if not grid_points:
+            raise ValueError(
+                f"No matching grid points for {resolution / 10} degree resolution found."
+            )
+        grid_point_resolutions.extend(
+            [
+                {
+                    "grid_id": grid_point.id,
+                    "resolution_id": resolution_group.id,
+                }
+                for grid_point in grid_points
+            ]
+        )
     add_data_list_bulk(session, grid_point_resolutions, GridPointResolution)
     print("Grid point resolutions assigned.")
 
@@ -1083,10 +1085,9 @@ def get_var_values_cartesian(
             VarValue.var_id == var_id,
         )
         .order_by(GridPoint.latitude, GridPoint.longitude)  # Ensure consistent ordering
-        # for some reason the ordering does not work coorectly
         .all()
     )
-    # Convert directly to list of tuples (much faster)
+    # Convert directly to list of tuples
     values_list = [(lat, lon, val) for lat, lon, val in values]
 
     mydict = {"latitude, longitude, var_value": values_list}
