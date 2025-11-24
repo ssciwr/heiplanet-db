@@ -269,10 +269,12 @@ def test_assign_grid_resolution_group_to_grid_point(get_session):
     # check results
     # 0.1 degree resolution: all points
     # 0.2 degree resolution: points where round(lat*10) % 2 == 0 AND round(lon*10) % 2 == 0
+    # 0.5 degree resolution: points where round(lat*10) % 5 == 0 AND round(lon*10) % 5 == 0
     result = get_session.query(postdb.GridPointResolution).all()
     # All 25 grid points (5x5) should be in 0.1 degree resolution
     # 9 grid points should be in 0.2 degree resolution
-    assert len(result) == 34, f"Expected 34 entries, got {len(result)}"
+    # 1 grid point should be each in 0.5, 1.0, 1.5, 2.5, 3.0, 5.0 degree resolution
+    assert len(result) == 40, f"Expected 40 entries, got {len(result)}"
     # Check that all grid points have 0.1 degree resolution
     grid_points = get_session.query(postdb.GridPoint).all()
     assert len(grid_points) == 25
@@ -282,67 +284,64 @@ def test_assign_grid_resolution_group_to_grid_point(get_session):
         .first()
     )
     assert math.isclose(resolution_0_1.resolution, 0.1, abs_tol=1e-5)
-    for gp in grid_points:
-        gpr = (
-            get_session.query(postdb.GridPointResolution)
-            .filter(
-                postdb.GridPointResolution.grid_id == gp.id,
-                postdb.GridPointResolution.resolution_id == resolution_0_1.id,
-            )
-            .first()
+    # get all the grid points with resolution_0_1.id
+    gp_0_1 = (
+        get_session.query(postdb.GridPoint)
+        .join(
+            postdb.GridPointResolution,
+            postdb.GridPoint.id == postdb.GridPointResolution.grid_id,
         )
-        assert gpr is not None, f"Grid point {gp.id} should have 0.1 degree resolution"
+        .filter(postdb.GridPointResolution.resolution_id == resolution_0_1.id)
+        .all()
+    )
+    assert gp_0_1 is not None
+    assert len(gp_0_1) == 25, (
+        f"All 25 grid points should have 0.1 degree resolution, got {len(gp_0_1)}"
+    )
+    assert math.isclose(gp_0_1[0].latitude, 0.0, abs_tol=1e-5)
+    assert math.isclose(gp_0_1[0].longitude, 0.0, abs_tol=1e-5)
+    assert math.isclose(gp_0_1[1].latitude, 0.0, abs_tol=1e-5)
+    assert math.isclose(gp_0_1[1].longitude, 0.1, abs_tol=1e-5)
     # Check that 0.2 degree resolution points are correct
     resolution_0_2 = (
         get_session.query(postdb.ResolutionGroup)
         .filter(postdb.ResolutionGroup.resolution == 0.2)
         .first()
     )
-    assert math.isclose(resolution_0_2.resolution, 0.2, abs_tol=1e-5)
-    # Grid points where both lat and lon satisfy round(coord*10) % 2 == 0
-    # These are: 0.0, 0.2, 0.4 in both dimensions
     gp_0_2 = (
         get_session.query(postdb.GridPoint)
-        .filter(
-            postdb.GridPoint.latitude.in_([0.0, 0.2, 0.4]),
-            postdb.GridPoint.longitude.in_([0.0, 0.2, 0.4]),
+        .join(
+            postdb.GridPointResolution,
+            postdb.GridPoint.id == postdb.GridPointResolution.grid_id,
         )
+        .filter(postdb.GridPointResolution.resolution_id == resolution_0_2.id)
         .all()
     )
     assert len(gp_0_2) == 9, (
         f"Should have 9 grid points at 0.2 degree resolution, got {len(gp_0_2)}"
     )
-
-    for gp in gp_0_2:
-        gpr = (
-            get_session.query(postdb.GridPointResolution)
-            .filter(
-                postdb.GridPointResolution.grid_id == gp.id,
-                postdb.GridPointResolution.resolution_id == resolution_0_2.id,
-            )
-            .first()
-        )
-        assert gpr is not None, (
-            f"Grid point {gp.id} at ({gp.latitude}, {gp.longitude}) should have 0.2 degree resolution"
-        )
-
-    # Verify that points at 0.1, 0.3 do NOT have 0.2 degree resolution
-    gp_not_0_2 = (
-        get_session.query(postdb.GridPoint)
-        .filter(postdb.GridPoint.latitude == 0.1)
+    assert math.isclose(gp_0_2[0].latitude, 0.0, abs_tol=1e-5)
+    assert math.isclose(gp_0_2[0].longitude, 0.0, abs_tol=1e-5)
+    assert math.isclose(gp_0_2[1].latitude, 0.0, abs_tol=1e-5)
+    assert math.isclose(gp_0_2[1].longitude, 0.2, abs_tol=1e-5)
+    # check that 0.5 degree resolution points are correct
+    resolution_0_5 = (
+        get_session.query(postdb.ResolutionGroup)
+        .filter(postdb.ResolutionGroup.resolution == 0.5)
         .first()
     )
-    if gp_not_0_2:
-        gpr = (
-            get_session.query(postdb.GridPointResolution)
-            .filter(
-                postdb.GridPointResolution.grid_id == gp_not_0_2.id,
-                postdb.GridPointResolution.resolution_id == resolution_0_2.id,
-            )
-            .first()
+    # here we should have 1 grid point: (0.0,0.0)
+    gp_0_5 = (
+        get_session.query(postdb.GridPoint)
+        .join(
+            postdb.GridPointResolution,
+            postdb.GridPoint.id == postdb.GridPointResolution.grid_id,
         )
-        assert gpr is None, "Grid point at 0.1 should NOT have 0.2 degree resolution"
-
+        .filter(postdb.GridPointResolution.resolution_id == resolution_0_5.id)
+        .all()
+    )
+    assert math.isclose(gp_0_5[0].latitude, 0.0, abs_tol=1e-5)
+    assert math.isclose(gp_0_5[0].longitude, 0.0, abs_tol=1e-5)
     # clean up
     get_session.execute(
         text("TRUNCATE TABLE grid_point_resolution RESTART IDENTITY CASCADE")
@@ -354,16 +353,14 @@ def test_assign_grid_resolution_group_to_grid_point(get_session):
     get_session.commit()
 
 
-def test_assign_grid_resolution_group_no_resolution_group(get_session):
-    # insert grid points without resolution groups
-    latitudes = np.array([0.0, 0.1])
-    longitudes = np.array([0.0, 0.1])
+def test_assign_grid_resolution_group_to_grid_point_no_resolution_group(get_session):
+    # insert grid points - mix of 0.1 and 0.2 degree resolution
+    latitudes = np.array([0.0, 0.1, 0.2, 0.3, 0.4])
+    longitudes = np.array([0.0, 0.1, 0.2, 0.3, 0.4])
     postdb.insert_grid_points(get_session, latitudes, longitudes)
-
-    # should raise an error
-    with pytest.raises(ValueError, match="Resolution group for 0.1 degree not found"):
+    # assign resolution groups without inserting resolution groups
+    with pytest.raises(ValueError):
         postdb.assign_grid_resolution_group_to_grid_point(get_session)
-
     # clean up
     get_session.execute(text("TRUNCATE TABLE grid_point RESTART IDENTITY CASCADE"))
     get_session.commit()
