@@ -407,7 +407,7 @@ def insert_grid_points(session: Session, latitudes: np.ndarray, longitudes: np.n
 
 def insert_resolution_groups(
     session: Session,
-    resolutions: np.ndarray = np.array([0.1, 0.2, 0.5, 1.0, 1.5, 2.5, 3.0, 5.0]),
+    resolutions: np.ndarray = np.array([0.1, 0.2, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 5.0]),
     descriptions: list[str] | None = None,
 ) -> None:
     """Create the resolution groups.
@@ -422,7 +422,7 @@ def insert_resolution_groups(
     Args:
         session (Session): SQLAlchemy session object.
         resolutions (np.ndarray): Array of resolutions to insert. Defaults to
-            0.1, 0.2, 0.5, 1.0, 1.5, 2.5, 3.0, 5.0 degree resolution.
+            0.1, 0.2, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 5.0 degree resolution.
         descriptions (list[str]|None): List of descriptions for each resolution.
             If None, default descriptions will be used.
     """
