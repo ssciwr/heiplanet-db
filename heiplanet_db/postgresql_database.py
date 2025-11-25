@@ -437,7 +437,7 @@ def insert_resolution_groups(
         for resolution, description in zip(resolutions, descriptions)
     ]
     add_data_list_bulk(session, resolution_groups, ResolutionGroup)
-    print("Resolution groups inserted.")
+    print("Resolution groups inserted:", resolutions)
 
 
 def assign_grid_resolution_group_to_grid_point(session: Session) -> None:
@@ -1088,7 +1088,8 @@ def get_var_values_cartesian(
         .all()
     )
     # Convert directly to list of tuples
-    values_list = [(lat, lon, val) for lat, lon, val in values]
+    values_list = [(lat, lon) for lat, lon, _ in values]
+    # values_list = [(lat, lon, val) for lat, lon, val in values]
 
     mydict = {"latitude, longitude, var_value": values_list}
     return mydict

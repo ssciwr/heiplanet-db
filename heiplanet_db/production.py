@@ -9,7 +9,6 @@ from heiplanet_db import postgresql_database as db
 import zipfile
 import xarray as xr
 from sqlalchemy import engine
-import numpy as np
 
 
 def read_production_config(dict_path: str | Traversable | Path | None = None) -> dict:
@@ -264,7 +263,7 @@ def main() -> None:
     var_type_session.close()
     # insert the resolution groups
     resolution_session = db.create_session(engine)
-    db.insert_resolution_groups(resolution_session, resolutions=np.array([0.1, 0.2]))
+    db.insert_resolution_groups(resolution_session)
     resolution_session.close()
     # insert the data
     insert_var_values(engine, r0_path=r0_path)
