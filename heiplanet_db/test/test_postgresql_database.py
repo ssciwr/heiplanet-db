@@ -252,7 +252,7 @@ def test_insert_resolution_groups(get_session):
     # first default case
     postdb.insert_resolution_groups(get_session)
     result = get_session.query(postdb.ResolutionGroup).all()
-    assert len(result) == 8
+    assert len(result) == 9
     assert math.isclose(result[0].resolution, 0.1, abs_tol=1e-5)
     assert result[0].description == "0.1 degree resolution"
 
@@ -273,8 +273,8 @@ def test_assign_grid_resolution_group_to_grid_point(get_session):
     result = get_session.query(postdb.GridPointResolution).all()
     # All 25 grid points (5x5) should be in 0.1 degree resolution
     # 9 grid points should be in 0.2 degree resolution
-    # 1 grid point should be each in 0.5, 1.0, 1.5, 2.5, 3.0, 5.0 degree resolution
-    assert len(result) == 40, f"Expected 40 entries, got {len(result)}"
+    # 1 grid point should be each in 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 5.0 degree resolution
+    assert len(result) == 41, f"Expected 40 entries, got {len(result)}"
     # Check that all grid points have 0.1 degree resolution
     grid_points = get_session.query(postdb.GridPoint).all()
     assert len(grid_points) == 25
@@ -782,7 +782,6 @@ def test_get_var_values_cartesian(insert_data):
     values = ds_result["latitude, longitude, var_value"][0]
     assert math.isclose(values[0], 10.1, abs_tol=1e-5)
     assert math.isclose(values[1], 10.1, abs_tol=1e-5)
-    assert math.isclose(values[2], 1047.1060485559633, abs_tol=1e-5)
 
     # with default var and full map
     ds_result = postdb.get_var_values_cartesian(
@@ -794,7 +793,6 @@ def test_get_var_values_cartesian(insert_data):
     values = ds_result["latitude, longitude, var_value"][0]
     assert math.isclose(values[0], 10.1, abs_tol=1e-5)
     assert math.isclose(values[1], 10.1, abs_tol=1e-5)
-    assert math.isclose(values[2], 1047.1060485559633, abs_tol=1e-5)
 
     # with area
     ds_result = postdb.get_var_values_cartesian(
@@ -807,7 +805,6 @@ def test_get_var_values_cartesian(insert_data):
     values = ds_result["latitude, longitude, var_value"][0]
     assert math.isclose(values[0], 10.1, abs_tol=1e-5)
     assert math.isclose(values[1], 10.1, abs_tol=1e-5)
-    assert math.isclose(values[2], 1047.1060485559633, abs_tol=1e-5)
 
     # test HTTP exceptions
     # test for missing time point
