@@ -1088,8 +1088,7 @@ def get_var_values_cartesian(
         .all()
     )
     # Convert directly to list of tuples
-    values_list = [(lat, lon) for lat, lon, _ in values]
-    # values_list = [(lat, lon, val) for lat, lon, val in values]
+    values_list = [(lat, lon, val) for lat, lon, val in values]
 
     mydict = {"latitude, longitude, var_value": values_list}
     return mydict
