@@ -4,10 +4,10 @@
 [![pre-commit.ci status](https://results.pre-commit.ci/badge/github/ssciwr/heiplanet-db/main.svg)](https://results.pre-commit.ci/latest/github/ssciwr/heiplanet-db/main)
 ![License: MIT](https://img.shields.io/github/license/ssciwr/heiplanet-db)
 ![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/ssciwr/heiplanet-db/ci.yml?branch=main)
-![codecov](https://img.shields.io/codecov/c/github/ssciwr/heiplanet-db)
-![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=ssciwr_heiplanet-db&metric=alert_status)
+[![codecov](https://codecov.io/gh/ssciwr/heiplanet-db/graph/badge.svg?token=BQ9HZLEEJ3)](https://codecov.io/gh/ssciwr/heiplanet-db)
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=ssciwr_onehealth-db&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=ssciwr_onehealth-db)
 ![Language](https://img.shields.io/github/languages/top/ssciwr/heiplanet-db)
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/ssciwr/heiplanet-data-backend/blob/main/heiplanet-db/docs/source/notebooks/insert_data.ipynb)
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/ssciwr/heiplanet-db/blob/main/docs/source/notebooks/insert_data.ipynb)
 
 A surveillance platform displaying statistical information on mosquito-borne diseases across European regions.
 
