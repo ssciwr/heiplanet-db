@@ -96,7 +96,7 @@ class CartesianRequest(BaseModel):
     requested_time_point: datetime.date
     requested_variable_type: str | None = "R0"
     requested_area: tuple[float, float, float, float] = (180.0, 0.0, 0.0, 180.0)
-    requested_grid_resolution: float = 0.1
+    requested_grid_resolution: float = 0.2
 
 
 @app.post("/cartesian")
