@@ -136,4 +136,4 @@ data
 # private test data
 pdf_files/*.pdf
 
-.data_onehealth_db
+.data_heiplanet_db
