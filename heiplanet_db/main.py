@@ -1,4 +1,4 @@
-from onehealth_db import postgresql_database as db
+from heiplanet_db import postgresql_database as db
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -94,8 +94,9 @@ def db_status():
 
 class CartesianRequest(BaseModel):
     requested_time_point: datetime.date
-    requested_variable_type: str | None = None
-    requested_area: tuple[float, float, float, float] | None = None
+    requested_variable_type: str | None = "R0"
+    requested_area: tuple[float, float, float, float] = (180.0, 0.0, 0.0, 180.0)
+    requested_grid_resolution: float = 0.2
 
 
 @app.post("/cartesian")
@@ -123,6 +124,7 @@ def get_cartesian(
             session,
             time_point=date_requested,
             area=request.requested_area,
+            grid_resolution=request.requested_grid_resolution,
             var_name=var_name,
         )
         return {"result": var_value}

@@ -2,7 +2,7 @@
 # ------      Backend build    -----
 # ----------------------------------------------
 # Authors:
-#   OneHealth Platform Team
+#   heiplanet Platform Team
 #	Scientific Software Center
 # Last update: 28.07.2025
 FROM python:3.11-slim AS application
@@ -20,23 +20,23 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy files and install Python dependencies
-COPY onehealth_db ./onehealth_db
+COPY heiplanet_db ./heiplanet_db
 COPY README.md .
 COPY pyproject.toml .
 RUN pip install --no-cache-dir .
 
 
 # Create entrypoint script for flexibility
-RUN cat > /onehealth_db/entrypoint.sh <<'EOF'
+RUN cat > /heiplanet_db/entrypoint.sh <<'EOF'
 #!/bin/bash
 # Execute the requested command
 case "$1" in
 
     "production")
-        exec python -m onehealth_db.production
+        exec python -m heiplanet_db.production
         ;;
     "api")
-        exec uvicorn onehealth_db.main:app --host 0.0.0.0 --port 8000
+        exec uvicorn heiplanet_db.main:app --host 0.0.0.0 --port 8000
         ;;
     *)
         exec "$@"
@@ -45,14 +45,14 @@ esac
 EOF
 
 # Make entrypoint executable and create non-root user
-RUN chmod +x /onehealth_db/entrypoint.sh 
+RUN chmod +x /heiplanet_db/entrypoint.sh
 
 # Set environment variables
-ENV PYTHONPATH=/onehealth_db
-ENV CONFIG_FILE=/onehealth_db/production.yaml
+ENV PYTHONPATH=/heiplanet_db
+ENV CONFIG_FILE=/heiplanet_db/production.yaml
 
 # Expose port for FastAPI
 EXPOSE 8000
 
-ENTRYPOINT ["/onehealth_db/entrypoint.sh"]
+ENTRYPOINT ["/heiplanet_db/entrypoint.sh"]
 CMD ["api"]

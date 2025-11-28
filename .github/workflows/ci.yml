@@ -50,12 +50,12 @@ jobs:
         -d postgis/postgis:17-3.5
         # Wait for the database to be ready instead of using a fixed sleep
         echo "Waiting for database to be ready..."
-        timeout 20s bash -c 'until docker exec $(docker ps -q -f name=my-postgres) pg_isready -U postgres -d onehealth_db; do sleep 1; done'
-        python -m pytest -svv --cov=onehealth_db --cov-report=xml:onehealth_db/coverage_re/coverage.xml
+        timeout 20s bash -c 'until docker exec $(docker ps -q -f name=my-postgres) pg_isready -U postgres -d heiplanet_db; do sleep 1; done'
+        python -m pytest -svv --cov=heiplanet_db --cov-report=xml:heiplanet_db/coverage_re/coverage.xml
         docker stop my-postgres
         docker rm my-postgres
     - name: Upload coverage reports to Codecov
       uses: codecov/codecov-action@v5
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
-        directory: ./onehealth_db/coverage_re/
+        directory: ./heiplanet_db/coverage_re/

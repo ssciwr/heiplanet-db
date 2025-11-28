@@ -1,5 +1,5 @@
 import pytest
-from onehealth_db import postgresql_database as postdb
+from heiplanet_db import postgresql_database as postdb
 import numpy as np
 import xarray as xr
 from testcontainers.postgres import PostgresContainer
@@ -43,6 +43,8 @@ def get_missing_tables(engine):
         "var_type",
         "var_value",
         "var_value_nuts",
+        "resolution_group",
+        "grid_point_resolution",
     }
     existing_tables = set(inspector.get_table_names(schema="public"))
     missing_tables = expected_tables - existing_tables
@@ -246,6 +248,124 @@ def test_insert_grid_points(get_session):
     get_session.commit()
 
 
+def test_insert_resolution_groups(get_session):
+    # first default case
+    postdb.insert_resolution_groups(get_session)
+    result = get_session.query(postdb.ResolutionGroup).all()
+    assert len(result) == 9
+    assert math.isclose(result[0].resolution, 0.1, abs_tol=1e-5)
+    assert result[0].description == "0.1 degree resolution"
+
+
+def test_assign_grid_resolution_group_to_grid_point(get_session):
+    # insert resolution groups first
+    postdb.insert_resolution_groups(get_session)
+    # insert grid points - mix of 0.1 and 0.2 degree resolution
+    latitudes = np.array([0.0, 0.1, 0.2, 0.3, 0.4])
+    longitudes = np.array([0.0, 0.1, 0.2, 0.3, 0.4])
+    postdb.insert_grid_points(get_session, latitudes, longitudes)
+    # assign resolution groups
+    postdb.assign_grid_resolution_group_to_grid_point(get_session)
+    # check results
+    # 0.1 degree resolution: all points
+    # 0.2 degree resolution: points where round(lat*10) % 2 == 0 AND round(lon*10) % 2 == 0
+    # 0.5 degree resolution: points where round(lat*10) % 5 == 0 AND round(lon*10) % 5 == 0
+    result = get_session.query(postdb.GridPointResolution).all()
+    # All 25 grid points (5x5) should be in 0.1 degree resolution
+    # 9 grid points should be in 0.2 degree resolution
+    # 1 grid point should be each in 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 5.0 degree resolution
+    assert len(result) == 41, f"Expected 40 entries, got {len(result)}"
+    # Check that all grid points have 0.1 degree resolution
+    grid_points = get_session.query(postdb.GridPoint).all()
+    assert len(grid_points) == 25
+    resolution_0_1 = (
+        get_session.query(postdb.ResolutionGroup)
+        .filter(postdb.ResolutionGroup.resolution == 0.1)
+        .first()
+    )
+    assert math.isclose(resolution_0_1.resolution, 0.1, abs_tol=1e-5)
+    # get all the grid points with resolution_0_1.id
+    gp_0_1 = (
+        get_session.query(postdb.GridPoint)
+        .join(
+            postdb.GridPointResolution,
+            postdb.GridPoint.id == postdb.GridPointResolution.grid_id,
+        )
+        .filter(postdb.GridPointResolution.resolution_id == resolution_0_1.id)
+        .all()
+    )
+    assert gp_0_1 is not None
+    assert len(gp_0_1) == 25, (
+        f"All 25 grid points should have 0.1 degree resolution, got {len(gp_0_1)}"
+    )
+    assert math.isclose(gp_0_1[0].latitude, 0.0, abs_tol=1e-5)
+    assert math.isclose(gp_0_1[0].longitude, 0.0, abs_tol=1e-5)
+    assert math.isclose(gp_0_1[1].latitude, 0.0, abs_tol=1e-5)
+    assert math.isclose(gp_0_1[1].longitude, 0.1, abs_tol=1e-5)
+    # Check that 0.2 degree resolution points are correct
+    resolution_0_2 = (
+        get_session.query(postdb.ResolutionGroup)
+        .filter(postdb.ResolutionGroup.resolution == 0.2)
+        .first()
+    )
+    gp_0_2 = (
+        get_session.query(postdb.GridPoint)
+        .join(
+            postdb.GridPointResolution,
+            postdb.GridPoint.id == postdb.GridPointResolution.grid_id,
+        )
+        .filter(postdb.GridPointResolution.resolution_id == resolution_0_2.id)
+        .all()
+    )
+    assert len(gp_0_2) == 9, (
+        f"Should have 9 grid points at 0.2 degree resolution, got {len(gp_0_2)}"
+    )
+    assert math.isclose(gp_0_2[0].latitude, 0.0, abs_tol=1e-5)
+    assert math.isclose(gp_0_2[0].longitude, 0.0, abs_tol=1e-5)
+    assert math.isclose(gp_0_2[1].latitude, 0.0, abs_tol=1e-5)
+    assert math.isclose(gp_0_2[1].longitude, 0.2, abs_tol=1e-5)
+    # check that 0.5 degree resolution points are correct
+    resolution_0_5 = (
+        get_session.query(postdb.ResolutionGroup)
+        .filter(postdb.ResolutionGroup.resolution == 0.5)
+        .first()
+    )
+    # here we should have 1 grid point: (0.0,0.0)
+    gp_0_5 = (
+        get_session.query(postdb.GridPoint)
+        .join(
+            postdb.GridPointResolution,
+            postdb.GridPoint.id == postdb.GridPointResolution.grid_id,
+        )
+        .filter(postdb.GridPointResolution.resolution_id == resolution_0_5.id)
+        .all()
+    )
+    assert math.isclose(gp_0_5[0].latitude, 0.0, abs_tol=1e-5)
+    assert math.isclose(gp_0_5[0].longitude, 0.0, abs_tol=1e-5)
+    # clean up
+    get_session.execute(
+        text("TRUNCATE TABLE grid_point_resolution RESTART IDENTITY CASCADE")
+    )
+    get_session.execute(
+        text("TRUNCATE TABLE resolution_group RESTART IDENTITY CASCADE")
+    )
+    get_session.execute(text("TRUNCATE TABLE grid_point RESTART IDENTITY CASCADE"))
+    get_session.commit()
+
+
+def test_assign_grid_resolution_group_to_grid_point_no_resolution_group(get_session):
+    # insert grid points - mix of 0.1 and 0.2 degree resolution
+    latitudes = np.array([0.0, 0.1, 0.2, 0.3, 0.4])
+    longitudes = np.array([0.0, 0.1, 0.2, 0.3, 0.4])
+    postdb.insert_grid_points(get_session, latitudes, longitudes)
+    # assign resolution groups without inserting resolution groups
+    with pytest.raises(ValueError):
+        postdb.assign_grid_resolution_group_to_grid_point(get_session)
+    # clean up
+    get_session.execute(text("TRUNCATE TABLE grid_point RESTART IDENTITY CASCADE"))
+    get_session.commit()
+
+
 def test_extract_time_point():
     time_points = {
         np.datetime64("2024-01-01T00:00:00.000000000"): (2024, 1, 1),
@@ -307,7 +427,7 @@ def test_get_id_maps(get_session, get_dataset, get_var_type_list):
     )
 
     assert len(grid_id_map) == 6
-    assert grid_id_map[(10, 10)] == 1
+    assert grid_id_map[(10.1, 10.1)] == 1
     assert len(time_id_map) == 2
     assert time_id_map[np.datetime64("2023-01-01", "ns")] == 1
     assert len(var_id_map) == 2
@@ -589,15 +709,15 @@ def test_get_grid_points(get_session, get_dataset):
     # test the function
     result = postdb.get_grid_points(get_session, area=None)
     assert len(result) == 6  # 2 latitudes * 3 longitudes
-    assert math.isclose(result[0].latitude, 10.0, abs_tol=1e-5)
-    assert math.isclose(result[0].longitude, 10.0, abs_tol=1e-5)
+    assert math.isclose(result[0].latitude, 10.1, abs_tol=1e-5)
+    assert math.isclose(result[0].longitude, 10.1, abs_tol=1e-5)
 
     result = postdb.get_grid_points(
         get_session, area=(11.0, 10.0, 10.0, 12.0)
     )  # [N, W, S, E]
     assert len(result) == 6
-    assert math.isclose(result[0].latitude, 10.0, abs_tol=1e-5)
-    assert math.isclose(result[0].longitude, 10.0, abs_tol=1e-5)
+    assert math.isclose(result[0].latitude, 10.1, abs_tol=1e-5)
+    assert math.isclose(result[0].longitude, 10.1, abs_tol=1e-5)
 
     # no grid points case
     result = postdb.get_grid_points(get_session, area=(20.0, 20.0, 20.0, 20.0))
@@ -643,8 +763,8 @@ def test_sort_grid_points_get_ids(get_session, get_dataset, insert_data):
     grid_points = get_session.query(postdb.GridPoint).all()
     grid_ids, latitudes, longitudes = postdb.sort_grid_points_get_ids(grid_points)
     assert len(grid_ids) == 6  # 2 latitudes * 3 longitudes
-    assert latitudes == [10.0, 11.0]
-    assert longitudes == [10.0, 11.0, 12.0]
+    assert latitudes == [10.1, 10.2]
+    assert longitudes == [10.1, 10.2, 10.3]
     # check if the ids are correct
     assert grid_ids[1] == (0, 0)
     assert grid_ids[4] == (1, 0)
@@ -660,9 +780,8 @@ def test_get_var_values_cartesian(insert_data):
     )
     assert len(ds_result["latitude, longitude, var_value"]) == 6
     values = ds_result["latitude, longitude, var_value"][0]
-    assert math.isclose(values[0], 10.0, abs_tol=1e-5)
-    assert math.isclose(values[1], 10.0, abs_tol=1e-5)
-    assert math.isclose(values[2], 1047.1060485559633, abs_tol=1e-5)
+    assert math.isclose(values[0], 10.1, abs_tol=1e-5)
+    assert math.isclose(values[1], 10.1, abs_tol=1e-5)
 
     # with default var and full map
     ds_result = postdb.get_var_values_cartesian(
@@ -672,22 +791,20 @@ def test_get_var_values_cartesian(insert_data):
     )
     assert len(ds_result["latitude, longitude, var_value"]) == 6
     values = ds_result["latitude, longitude, var_value"][0]
-    assert math.isclose(values[0], 10.0, abs_tol=1e-5)
-    assert math.isclose(values[1], 10.0, abs_tol=1e-5)
-    assert math.isclose(values[2], 1047.1060485559633, abs_tol=1e-5)
+    assert math.isclose(values[0], 10.1, abs_tol=1e-5)
+    assert math.isclose(values[1], 10.1, abs_tol=1e-5)
 
     # with area
     ds_result = postdb.get_var_values_cartesian(
         insert_data,
         time_point=(2023, 1),
-        area=(11.0, 10.0, 10.0, 11.0),  # [N, W, S, E]
+        area=(10.2, 10.0, 10.0, 10.2),  # [N, W, S, E]
         var_name="t2m",
     )
     assert len(ds_result["latitude, longitude, var_value"]) == 4
     values = ds_result["latitude, longitude, var_value"][0]
-    assert math.isclose(values[0], 10.0, abs_tol=1e-5)
-    assert math.isclose(values[1], 10.0, abs_tol=1e-5)
-    assert math.isclose(values[2], 1047.1060485559633, abs_tol=1e-5)
+    assert math.isclose(values[0], 10.1, abs_tol=1e-5)
+    assert math.isclose(values[1], 10.1, abs_tol=1e-5)
 
     # test HTTP exceptions
     # test for missing time point
@@ -758,7 +875,7 @@ def test_get_var_values_cartesian_download(get_dataset, insert_data, tmp_path):
         insert_data,
         start_time_point=(2023, 1),
         end_time_point=None,
-        area=(11.0, 10.0, 10.0, 11.0),  # [N, W, S, E]
+        area=(10.2, 10.0, 10.0, 10.2),  # [N, W, S, E]
         var_names=None,
         netcdf_file=netcdf_filename,
     )

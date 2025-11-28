@@ -3,10 +3,10 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "onehealth-db"
+name = "heiplanet-db"
 license = {text = "MIT License"}
 readme = "README.md"
-description = "Database scripts for OneHealth project"
+description = "Database for hei-planet project"
 requires-python = ">=3.11"
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -55,8 +55,8 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/ssciwr/onehealth-db"
-Issues = "https://github.com/ssciwr/onehealth-db/issues"
+Homepage = "https://github.com/ssciwr/heiplanet-db"
+Issues = "https://github.com/ssciwr/heiplanet-db/issues"
 
 [tool.setuptools]
-packages = ["onehealth_db","onehealth_db.data"]
+packages = ["heiplanet_db","heiplanet_db.data"]

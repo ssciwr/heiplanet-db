@@ -1,9 +1,11 @@
 from sqlalchemy import (
+    cast,
     create_engine,
     text,
     Float,
     String,
     Integer,
+    Numeric,
     BigInteger,
     Index,
     ForeignKey,
@@ -132,6 +134,10 @@ class VarValue(Base):
     grid_id: Mapped[int] = mapped_column(Integer(), ForeignKey("grid_point.id"))
     time_id: Mapped[int] = mapped_column(Integer(), ForeignKey("time_point.id"))
     var_id: Mapped[int] = mapped_column(Integer(), ForeignKey("var_type.id"))
+    # not sure if we should put resolution id here, since the same grid point
+    # can belong to different resolution groups
+    # so we have a separate many-to-many relationship table between grid points and resolution groups
+    # however, this makes lookup somewhat more complex and maybe slower
     value: Mapped[float] = mapped_column(Float())
 
     __table_args__ = (
@@ -191,6 +197,34 @@ class VarValueNuts(Base):
             name="fk_var_id_nuts",
             ondelete="CASCADE",
         ),
+    )
+
+
+class ResolutionGroup(Base):
+    """Resolution group for the different grid resolutions."""
+
+    # create different grid resolution groups
+    # 0.1, 0.25, 0.5 resolution degree resolution
+    # ideally, we want values at 0.1, 0.25, 0.5, 1, 1.5, 2, 3, 5
+    __tablename__ = "resolution_group"
+
+    id: Mapped[int] = mapped_column(Integer(), primary_key=True, autoincrement=True)
+    resolution: Mapped[float] = mapped_column(
+        Numeric(precision=4, scale=2), unique=True
+    )
+    description: Mapped[str] = mapped_column(String(), nullable=True)
+
+
+class GridPointResolution(Base):
+    """Many-to-many relationship between GridPoint and ResolutionGroup"""
+
+    __tablename__ = "grid_point_resolution"
+
+    grid_id: Mapped[int] = mapped_column(
+        Integer(), ForeignKey("grid_point.id"), primary_key=True
+    )
+    resolution_id: Mapped[int] = mapped_column(
+        Integer(), ForeignKey("resolution_group.id"), primary_key=True
     )
 
 
@@ -275,7 +309,7 @@ def insert_nuts_def(engine: engine.Engine, shapefiles_path: Path):
     Insert NUTS definition data into the database.
     The shapefiles are downloaded from the Eurostat website.
     More details for downloading NUTS shapefiles can be found in
-    [our data page](https://ssciwr.github.io/onehealth-db/data/#eurostats-nuts-definition)
+    [our data page](https://ssciwr.github.io/heiplanet-db/data/#eurostats-nuts-definition)
 
     Five shapefiles are involved in the process:
     - `.shp`: geometry data (e.g. polygons)
@@ -369,6 +403,90 @@ def insert_grid_points(session: Session, latitudes: np.ndarray, longitudes: np.n
     ]
     add_data_list_bulk(session, grid_points, GridPoint)
     print("Grid points inserted.")
+
+
+def insert_resolution_groups(
+    session: Session,
+    resolutions: np.ndarray = np.array([0.1, 0.2, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 5.0]),
+    descriptions: list[str] | None = None,
+) -> None:
+    """Create the resolution groups.
+
+    There are different degrees resolution that can be requested:
+    0.1 degree, 0.2/0.5/1.0/1.5/2.0/2.5/3.0/5.0 degrees.
+    We are currently using 0.2 degree resolution and not 0.25 degree resolution here,
+    since this is a subset of 0.1 degree resolution grid points. Otherwise we would
+    need to create additional grid points for 0.25 degree resolution through interpolation,
+    which has not been defined as to which interpolation method can be used for this.
+
+    Args:
+        session (Session): SQLAlchemy session object.
+        resolutions (np.ndarray): Array of resolutions to insert. Defaults to
+            0.1, 0.2, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 5.0 degree resolution.
+        descriptions (list[str]|None): List of descriptions for each resolution.
+            If None, default descriptions will be used.
+    """
+    if descriptions is None:
+        descriptions = [f"{res} degree resolution" for res in resolutions]
+    # create list of dictionaries for bulk insert
+    resolution_groups = [
+        {
+            "resolution": float(resolution),
+            "description": description,
+        }
+        for resolution, description in zip(resolutions, descriptions)
+    ]
+    add_data_list_bulk(session, resolution_groups, ResolutionGroup)
+    print("Resolution groups inserted:", resolutions)
+
+
+def assign_grid_resolution_group_to_grid_point(session: Session) -> None:
+    """
+    Assign the grid resolution group to each grid point,
+    creating the many-to-many relationship between resolutions and
+    grid points.
+
+    Args:
+        session (Session): SQLAlchemy session object.
+    """
+    # we assume that by multiplying the resolution, and the
+    # lat/long values by 10, we can use the modulo operator to
+    # map the grid points to the resolution groups
+    # also we are using exact equality check since the way it is stored on postgresql
+    # should be exact and not numerically imprecise
+    grid_point_resolutions = []
+    # get the resolution groups from the database
+    resolution_groups = session.query(ResolutionGroup).all()
+    if not resolution_groups:
+        raise ValueError("No resolution groups found in the database.")
+    for resolution_group in resolution_groups:
+        resolution = float(resolution_group.resolution) * 10
+        grid_points = (
+            session.query(GridPoint)
+            .filter(
+                (cast(func.round(GridPoint.latitude * 10), Integer) % resolution == 0)
+                & (
+                    cast(func.round(GridPoint.longitude * 10), Integer) % resolution
+                    == 0
+                )
+            )
+            .all()
+        )
+        if not grid_points:
+            raise ValueError(
+                f"No matching grid points for {resolution / 10} degree resolution found."
+            )
+        grid_point_resolutions.extend(
+            [
+                {
+                    "grid_id": grid_point.id,
+                    "resolution_id": resolution_group.id,
+                }
+                for grid_point in grid_points
+            ]
+        )
+    add_data_list_bulk(session, grid_point_resolutions, GridPointResolution)
+    print("Grid point resolutions assigned.")
 
 
 def extract_time_point(
@@ -772,8 +890,46 @@ def get_time_points(
     )
 
 
+def get_resolution_id(session: Session, resolution: float) -> int | None:
+    """Get the resolution ID for a given resolution value.
+
+    Args:
+        session (Session): SQLAlchemy session object.
+        resolution (float): Resolution value to look up.
+
+    Returns:
+        int | None: Resolution ID if found, None otherwise.
+    """
+    resolution_group = (
+        session.query(ResolutionGroup)
+        .filter(ResolutionGroup.resolution == resolution)
+        .first()
+    )
+    return resolution_group.id if resolution_group else None
+
+
+def get_grid_ids_by_resolution(session: Session, resolution_id: int) -> List[int]:
+    """Get all grid point IDs for a specific resolution.
+
+    Args:
+        session (Session): SQLAlchemy session object.
+        resolution_id (int): Resolution ID to filter by.
+
+    Returns:
+        List[int]: List of grid point IDs belonging to the specified resolution.
+    """
+    grid_point_resolutions = (
+        session.query(GridPointResolution.grid_id)
+        .filter(GridPointResolution.resolution_id == resolution_id)
+        .all()
+    )
+    return [gpr.grid_id for gpr in grid_point_resolutions]
+
+
 def get_grid_points(
-    session: Session, area: None | Tuple[float, float, float, float] = None
+    session: Session,
+    area: None | Tuple[float, float, float, float] = None,
+    resolution_id: int | None = None,
 ) -> List[GridPoint]:
     """Get grid points from the database that fall within a specified area.
     Args:
@@ -781,22 +937,30 @@ def get_grid_points(
         area (None | Tuple[float, float, float, float]):
             Area as (North, West, South, East).
             If None, all grid points are returned.
+        resolution_id (int | None): Resolution ID of the grid points. Defaults to None.
     Returns:
         List[GridPoint]: List of GridPoint objects within the specified area.
     """
-    if area is None:
-        return session.query(GridPoint).all()
-    north, west, south, east = area
-    return (
-        session.query(GridPoint)
-        .filter(
+
+    query = session.query(GridPoint)
+
+    # Filter by resolution if specified
+    if resolution_id is not None:
+        query = query.join(
+            GridPointResolution, GridPoint.id == GridPointResolution.grid_id
+        ).filter(GridPointResolution.resolution_id == resolution_id)
+
+    # Filter by area if specified
+    if area is not None:
+        north, west, south, east = area
+        query = query.filter(
             GridPoint.latitude <= north,
             GridPoint.latitude >= south,
             GridPoint.longitude >= west,
             GridPoint.longitude <= east,
         )
-        .all()
-    )
+
+    return query.all()
 
 
 def get_var_types(
@@ -841,6 +1005,7 @@ def sort_grid_points_get_ids(
 def get_var_values_cartesian(
     session: Session,
     time_point: Tuple[int, int],
+    grid_resolution: float = 0.1,
     area: None | Tuple[float, float, float, float] = None,
     var_name: None | str = None,
 ) -> dict:
@@ -849,6 +1014,7 @@ def get_var_values_cartesian(
     Args:
         session (Session): SQLAlchemy session object.
         time_point (Tuple[int, int]): Date point as (year, month).
+        grid_resolution (float): Resolution of the grid points. Defaults to 0.1 degree.
         area (None | Tuple[float, float, float, float]):
             Area as (North, West, South, East).
             If None, all grid points are used.
@@ -872,13 +1038,24 @@ def get_var_values_cartesian(
     # get time id
     time_id = date_object.id
 
+    # get the resolution id for the targeted resolution
+    resolution_id = get_resolution_id(session=session, resolution=grid_resolution)
+    if not resolution_id:
+        print("No resolution id found for requested resolution.")
+        raise HTTPException(
+            status_code=400, detail="No id found for specified resolution."
+        )
+
     # get the grid points and their ids
-    grid_points = get_grid_points(session, area)
+    grid_points = get_grid_points(session, area, resolution_id)
 
     if not grid_points:
-        print("No grid points found in the specified area.")
+        print(
+            "No grid points found in the specified area or with the specified resolution."
+        )
         raise HTTPException(
-            status_code=400, detail="No grid points found in specified area."
+            status_code=400,
+            detail="No grid points found in specified area or with the specified resolution.",
         )
     # get grid ids for lookup
     grid_ids = [grid_point.id for grid_point in grid_points]
@@ -910,7 +1087,7 @@ def get_var_values_cartesian(
         .order_by(GridPoint.latitude, GridPoint.longitude)  # Ensure consistent ordering
         .all()
     )
-    # Convert directly to list of tuples (much faster)
+    # Convert directly to list of tuples
     values_list = [(lat, lon, val) for lat, lon, val in values]
 
     mydict = {"latitude, longitude, var_value": values_list}
@@ -923,7 +1100,7 @@ def get_var_values_cartesian_for_download(
     end_time_point: Tuple[int, int] | None = None,
     area: None | Tuple[float, float, float, float] = None,
     var_names: None | List[str] = None,
-    netcdf_file: str = "cartesian_grid_data_onehealth.nc",
+    netcdf_file: str = "cartesian_grid_data_heiplanet.nc",
 ) -> dict:
     """Get variable values for a cartesian map.
 

@@ -126,8 +126,8 @@ dmypy.json
 
 # sample data
 data
-!onehealth_db/data
-!onehealth_db/test/data
+!heiplanet_db/data
+!heiplanet_db/test/data
 !docs/index.html
 # keep the folder structure for input/output data below package level
 !data/in/.keep
@@ -136,4 +136,4 @@ data
 # private test data
 pdf_files/*.pdf
 
-.data_onehealth_db
+.data_heiplanet_db

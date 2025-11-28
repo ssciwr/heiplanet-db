@@ -1,5 +1,5 @@
 ---
-title: OneHealth platform deployment
+title: heiplanet platform deployment
 hide:
 - navigation
 ---
@@ -9,12 +9,12 @@ The system is set up using [docker compose](https://docs.docker.com/compose/). T
 
 - The postgresql database. This uses the public `postgis/postgis:17-3.5` image.
 - The frontend. This uses the docker image as pushed to GHCR, `ghcr.io/ssciwr/onehealth-map-frontend:<tag>`, where `<tag>` is replaced by the version number, `latest` or the branch name.
-- The Python backend. This contains both the ORM for the database and API, to process requests to the database from the frontend, but also the data feeding into the database. This uses the docker image as pushed to GHCR, `ghcr.io/ssciwr/onehealth-db:<tag>`, where `<tag>` is replaced by the version number, `latest` or the branch name; or can use a locally built image. The reason to supply a locally built image would be, for example, if one where to provide a changed config for the data feeding into the database, to include more or different data.
+- The Python backend. This contains both the ORM for the database and API, to process requests to the database from the frontend, but also the data feeding into the database. This uses the docker image as pushed to GHCR, `ghcr.io/ssciwr/heiplanet-db:<tag>`, where `<tag>` is replaced by the version number, `latest` or the branch name; or can use a locally built image. The reason to supply a locally built image would be, for example, if one where to provide a changed config for the data feeding into the database, to include more or different data.
 
 
 ## Development environment
 
-To bring up your development environment, add a `.env` file in the `onehealth-db` root directory, that contains the following environment variables:
+To bring up your development environment, add a `.env` file in the `heiplanet-db` root directory, that contains the following environment variables:
 ```
 POSTGRES_USER=<user>
 POSTGRES_PASSWORD=<password>
@@ -50,36 +50,36 @@ Similarly you can expose the database, to test the connectivity from outside of 
 In order to run just the database and the API, if for example you lack Github permissions to get tokens for the Dockercompose to run, you can follow this three step procedure:
 Here are the commands to run the OneHealth DB backend, which the frontend connects to:
 
-From `onehealth-db/` folder:
+From `heiplanet-db/` folder:
 
 ##### 1. Start the database we will connect to:
 
-`docker run -d --name postgres\_onehealth -p 5432:5432 -e POSTGRES\_PASSWORD=postgres -e POSTGRES\_DB=onehealth\_db postgis/postgis:17-3.5`
+`docker run -d --name postgres\_heiplanet -p 5432:5432 -e POSTGRES\_PASSWORD=postgres -e POSTGRES\_DB=heiplanet\_db postgis/postgis:17-3.5`
 
 ##### 2. Start the API using the Dockerfile:
 
-`docker run --name onehealth\_api -p 8000:8000 --link postgres\_onehealth:db -e IP\_ADDRESS=1.1.1.1 -e DB\_URL=postgresql+psycopg2://postgres:postgres@db:5432/onehealth\_db onehealth-db`
+`docker run --name heiplanet\_api -p 8000:8000 --link postgres\_heiplanet:db -e IP\_ADDRESS=1.1.1.1 -e DB\_URL=postgresql+psycopg2://postgres:postgres@db:5432/heiplanet\_db heiplanet-db`
 
 ##### 3. Fill the API with mock data - Run the "production.py" script to generate mock data
 
-`docker exec -it onehealth\_api python3 /onehealth\_db/production.py`
+`docker exec -it heiplanet\_api python3 /heiplanet\_db/production.py`
 
 ### Building the image locally 
 To build the docker image locally, i.e. for a changed database config file, execute
 ```
-docker build -t onehealth-backend .
+docker build -t heiplanet-backend .
 ```
-This will build the image locally. In the `docker-compose.yaml` file, you need to change the line `image: ghcr.io/ssciwr/onehealth-backend:latest` to use your local image. Alternatively, you can also force docker compose to rebuild the image locally by uncommenting the `build: ...` lines in the respective sections. To tag a local image with the correct name so it can be pushed to GHCR, use
+This will build the image locally. In the `docker-compose.yaml` file, you need to change the line `image: ghcr.io/ssciwr/heiplanet-backend:latest` to use your local image. Alternatively, you can also force docker compose to rebuild the image locally by uncommenting the `build: ...` lines in the respective sections. To tag a local image with the correct name so it can be pushed to GHCR, use
 ```
-docker image tag onehealth-backend ghcr.io/ssciwr/onehealth-backend:latest
+docker image tag heiplanet-backend ghcr.io/ssciwr/heiplanet-backend:latest
 ```
 This image can be pushed to GHCR (provided, you have set your `CR_PAT` key in your local environment):
 ```
-docker push ghcr.io/ssciwr/onehealth-backend:latest
+docker push ghcr.io/ssciwr/heiplanet-backend:latest
 ```
 
 ## Production environment
-To run the system in production, change the [database configuration file](../onehealth_db/data/production_config.yml) to include all the data you want to ingest in the database. Then trigger a local build of the docker image ([see above](./deployment.md#building-the-image-locally)) and run the two docker compose commands, to build the tables locally and start the API service and frontend:
+To run the system in production, change the [database configuration file](../heiplanet_db/data/production_config.yml) to include all the data you want to ingest in the database. Then trigger a local build of the docker image ([see above](./deployment.md#building-the-image-locally)) and run the two docker compose commands, to build the tables locally and start the API service and frontend:
 ```
 docker compose up --abort-on-container-exit production-runner
 docker compose up api
