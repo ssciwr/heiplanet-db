@@ -977,7 +977,7 @@ def test_get_nuts_regions_geojson(
     nuts_ids = {feature["properties"]["nuts_id"] for feature in geojson["features"]}
     assert nuts_ids == {"DE11", "DE22"} # IDs copied from above
     # todo: Should we test/note the BA/UA regions which seemed missing during the analysis?
-    
+
 
     filtered_geojson = postdb.get_nuts_regions_geojson(
         get_engine_with_tables, grid_resolution="NUTS1"
