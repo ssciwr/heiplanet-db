@@ -975,9 +975,8 @@ def test_get_nuts_regions_geojson(
     assert geojson["type"] == "FeatureCollection"
     assert len(geojson["features"]) == 2
     nuts_ids = {feature["properties"]["nuts_id"] for feature in geojson["features"]}
-    assert nuts_ids == {"DE11", "DE22"} # IDs copied from above
+    assert nuts_ids == {"DE11", "DE22"}  # IDs copied from above
     # todo: Should we test/note the BA/UA regions which seemed missing during the analysis?
-
 
     filtered_geojson = postdb.get_nuts_regions_geojson(
         get_engine_with_tables, grid_resolution="NUTS1"
@@ -986,9 +985,7 @@ def test_get_nuts_regions_geojson(
     assert filtered_geojson["features"][0]["properties"]["levl_code"] == 1
 
     with pytest.raises(HTTPException):
-        postdb.get_nuts_regions_geojson(
-            get_engine_with_tables, grid_resolution="NUTS4"
-        )
+        postdb.get_nuts_regions_geojson(get_engine_with_tables, grid_resolution="NUTS4")
 
     get_session.execute(text("TRUNCATE TABLE nuts_def RESTART IDENTITY CASCADE"))
     get_session.commit()
