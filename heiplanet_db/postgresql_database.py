@@ -28,6 +28,7 @@ from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Type, Tuple, List
 from fastapi import HTTPException
+import json
 
 
 CRS = 4326
@@ -1221,6 +1222,43 @@ def get_nuts_regions(
         gpd.GeoDataFrame: GeoDataFrame with NUTS region attributes and geometries.
     """
     return gpd.read_postgis("SELECT * FROM nuts_def", engine, geom_col="geometry")
+
+
+def get_nuts_regions_geojson(
+    engine: engine.Engine, grid_resolution: str | None = None
+) -> dict:
+    """Return NUTS regions as GeoJSON, optionally filtered by resolution."""
+    nuts_regions = get_nuts_regions(engine)
+    if nuts_regions.empty:
+        raise HTTPException(
+            status_code=404, detail="No NUTS regions found in the database."
+        )
+
+    if grid_resolution:
+        level_map = {
+            "NUTS0": 0,
+            "NUTS1": 1,
+            "NUTS2": 2,
+            "NUTS3": 3,
+        }
+        if grid_resolution not in level_map:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Invalid grid resolution. Use one of "
+                    "'NUTS0', 'NUTS1', 'NUTS2', 'NUTS3'."
+                ),
+            )
+        nuts_regions = nuts_regions[
+            nuts_regions["levl_code"] == level_map[grid_resolution]
+        ]
+        if nuts_regions.empty:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No NUTS regions found for resolution {grid_resolution}.",
+            )
+
+    return json.loads(nuts_regions.to_json())
 
 
 def get_grid_ids_in_nuts(
