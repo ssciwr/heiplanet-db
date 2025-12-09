@@ -963,6 +963,37 @@ def test_get_nuts_regions(
     get_session.commit()
 
 
+def test_get_nuts_regions_geojson(
+    get_engine_with_tables, get_session, tmp_path, get_nuts_def_data
+):
+    nuts_path = tmp_path / "nuts_def.shp"
+    gdf_nuts_data = get_nuts_def_data
+    gdf_nuts_data.to_file(nuts_path, driver="ESRI Shapefile")
+    postdb.insert_nuts_def(get_engine_with_tables, nuts_path)
+
+    geojson = postdb.get_nuts_regions_geojson(get_engine_with_tables)
+    assert geojson["type"] == "FeatureCollection"
+    assert len(geojson["features"]) == 2
+    nuts_ids = {feature["properties"]["nuts_id"] for feature in geojson["features"]}
+    assert nuts_ids == {"DE11", "DE22"} # IDs copied from above
+    # todo: Should we test/note the BA/UA regions which seemed missing during the analysis?
+    
+
+    filtered_geojson = postdb.get_nuts_regions_geojson(
+        get_engine_with_tables, grid_resolution="NUTS1"
+    )
+    assert len(filtered_geojson["features"]) == 1
+    assert filtered_geojson["features"][0]["properties"]["levl_code"] == 1
+
+    with pytest.raises(HTTPException):
+        postdb.get_nuts_regions_geojson(
+            get_engine_with_tables, grid_resolution="NUTS4"
+        )
+
+    get_session.execute(text("TRUNCATE TABLE nuts_def RESTART IDENTITY CASCADE"))
+    get_session.commit()
+
+
 def test_get_grid_ids_in_nuts(get_engine_with_tables, get_session):
     nuts_regions = gpd.GeoDataFrame(
         {
