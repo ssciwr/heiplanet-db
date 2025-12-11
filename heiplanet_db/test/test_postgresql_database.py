@@ -973,10 +973,10 @@ def test_get_nuts_regions_geojson(
 
     geojson = postdb.get_nuts_regions_geojson(get_engine_with_tables)
     assert geojson["type"] == "FeatureCollection"
-    assert len(geojson["features"]) == 2
+    assert len(geojson["features"]) == 3
     nuts_ids = {feature["properties"]["nuts_id"] for feature in geojson["features"]}
-    assert nuts_ids == {"DE11", "DE22"}  # IDs copied from above
-    # todo: Should we test/note the BA/UA regions which seemed missing during the analysis?
+    assert nuts_ids == {"DE11", "DE22", "DE501"} # IDs copied from above
+
 
     filtered_geojson = postdb.get_nuts_regions_geojson(
         get_engine_with_tables, grid_resolution="NUTS1"
@@ -985,7 +985,19 @@ def test_get_nuts_regions_geojson(
     assert filtered_geojson["features"][0]["properties"]["levl_code"] == 1
 
     with pytest.raises(HTTPException):
-        postdb.get_nuts_regions_geojson(get_engine_with_tables, grid_resolution="NUTS4")
+        postdb.get_nuts_regions_geojson(
+            get_engine_with_tables, grid_resolution="NUTS4"
+        )
+    # Test NUTS 3 all regions for 2024 are there - 1165 regions # cant do this with the conftest mock
+    filtered_geojson = postdb.get_nuts_regions_geojson(
+        get_engine_with_tables, grid_resolution="NUTS3"
+    )
+    # DE501 case.
+    assert len(filtered_geojson["features"]) == 1
+    assert filtered_geojson["features"][0]["properties"]["levl_code"] == 3
+
+
+    assert len(filtered_geojson["features"]) == 1
 
     get_session.execute(text("TRUNCATE TABLE nuts_def RESTART IDENTITY CASCADE"))
     get_session.commit()
@@ -1036,6 +1048,11 @@ def test_filter_nuts_ids_for_resolution():
     # test with no matching nuts ids
     filtered_nuts_ids = postdb.filter_nuts_ids_for_resolution(nuts_ids, "NUTS3")
     assert len(filtered_nuts_ids) == 0
+
+    nuts_3_ids = ["DE501"]
+    filtered_nuts_3_ids = postdb.filter_nuts_ids_for_resolution(nuts_3_ids, "NUTS3")
+    assert len(filtered_nuts_3_ids) == 1
+
 
 
 def test_get_var_values_nuts(
