@@ -975,8 +975,7 @@ def test_get_nuts_regions_geojson(
     assert geojson["type"] == "FeatureCollection"
     assert len(geojson["features"]) == 3
     nuts_ids = {feature["properties"]["nuts_id"] for feature in geojson["features"]}
-    assert nuts_ids == {"DE11", "DE22", "DE501"} # IDs copied from above
-
+    assert nuts_ids == {"DE11", "DE22", "DE501"}  # IDs copied from above
 
     filtered_geojson = postdb.get_nuts_regions_geojson(
         get_engine_with_tables, grid_resolution="NUTS1"
@@ -985,9 +984,7 @@ def test_get_nuts_regions_geojson(
     assert filtered_geojson["features"][0]["properties"]["levl_code"] == 1
 
     with pytest.raises(HTTPException):
-        postdb.get_nuts_regions_geojson(
-            get_engine_with_tables, grid_resolution="NUTS4"
-        )
+        postdb.get_nuts_regions_geojson(get_engine_with_tables, grid_resolution="NUTS4")
     # Test NUTS 3 all regions for 2024 are there - 1165 regions # cant do this with the conftest mock
     filtered_geojson = postdb.get_nuts_regions_geojson(
         get_engine_with_tables, grid_resolution="NUTS3"
@@ -995,7 +992,6 @@ def test_get_nuts_regions_geojson(
     # DE501 case.
     assert len(filtered_geojson["features"]) == 1
     assert filtered_geojson["features"][0]["properties"]["levl_code"] == 3
-
 
     assert len(filtered_geojson["features"]) == 1
 
@@ -1052,7 +1048,6 @@ def test_filter_nuts_ids_for_resolution():
     nuts_3_ids = ["DE501"]
     filtered_nuts_3_ids = postdb.filter_nuts_ids_for_resolution(nuts_3_ids, "NUTS3")
     assert len(filtered_nuts_3_ids) == 1
-
 
 
 def test_get_var_values_nuts(
