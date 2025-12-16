@@ -982,13 +982,10 @@ def test_get_nuts_regions_geojson(
     assert nuts_ids == {"DE11", "DE22", "DE501"}  # IDs copied from above
 
     filtered_geojson = postdb.get_nuts_regions_geojson(
-        get_engine_with_tables, grid_resolution="NUTS1"
+        get_engine_with_tables, grid_resolution="NUTS2"
     )
-    assert len(filtered_geojson["features"]) == 1
-    assert filtered_geojson["features"][0]["properties"]["levl_code"] == 1
-
-    with pytest.raises(HTTPException):
-        postdb.get_nuts_regions_geojson(get_engine_with_tables, grid_resolution="NUTS4")
+    assert len(filtered_geojson["features"]) == 2
+    assert filtered_geojson["features"][0]["properties"]["levl_code"] == 2
     # Test NUTS 3 all regions for 2024 are there - 1165 regions # cant do this with the conftest mock
     filtered_geojson = postdb.get_nuts_regions_geojson(
         get_engine_with_tables, grid_resolution="NUTS3"
@@ -996,9 +993,19 @@ def test_get_nuts_regions_geojson(
     # DE501 case.
     assert len(filtered_geojson["features"]) == 1
     assert filtered_geojson["features"][0]["properties"]["levl_code"] == 3
-
     assert len(filtered_geojson["features"]) == 1
-
+    # test for invalid NUTS resolution
+    with pytest.raises(HTTPException):
+        postdb.get_nuts_regions_geojson(get_engine_with_tables, grid_resolution="NUTS4")
+    # test for valid nuts resolution that does not exist in the db
+    with pytest.raises(HTTPException):
+        postdb.get_nuts_regions_geojson(get_engine_with_tables, grid_resolution="NUTS1")
+    # test for empty nuts regions
+    # remove nuts definitions from the db
+    get_session.execute(text("TRUNCATE TABLE nuts_def RESTART IDENTITY CASCADE"))
+    get_session.commit()
+    with pytest.raises(HTTPException):
+        postdb.get_nuts_regions_geojson(get_engine_with_tables)
     get_session.execute(text("TRUNCATE TABLE nuts_def RESTART IDENTITY CASCADE"))
     get_session.commit()
 

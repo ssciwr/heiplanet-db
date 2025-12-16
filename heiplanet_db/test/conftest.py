@@ -124,7 +124,7 @@ def get_nuts_def_data():
     gdf = gpd.GeoDataFrame(
         {
             "NUTS_ID": ["DE11", "DE22", "DE501"],
-            "LEVL_CODE": [1, 2, 3],
+            "LEVL_CODE": [2, 2, 3],
             "CNTR_CODE": [1, 1, 1],
             "NAME_LATN": ["Test NUTS", "Test NUTS2", "Test NUTS3"],
             "NUTS_NAME": ["Test NUTS", "Test NUTS2", "Test NUTS3"],
