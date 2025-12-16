@@ -1,5 +1,5 @@
 from heiplanet_db import postgresql_database as db
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from sqlalchemy.orm import Session
@@ -10,6 +10,7 @@ import dotenv
 import os
 import logging
 import ipaddress
+import json
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.DEBUG)
@@ -165,3 +166,24 @@ def get_nuts_data(
         return {"result": var_value}
     except Exception as e:
         return {"error": str(e)}
+
+
+@app.get("/nuts_regions")
+def get_nuts_regions(
+    grid_resolution: str | None = None,
+):
+    try:
+        resolution = grid_resolution.upper() if grid_resolution else None
+        geojson = db.get_nuts_regions_geojson(engine, resolution)
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    suffix = f"_{resolution.lower()}" if resolution else ""
+    filename = f"nuts_regions{suffix}.geojson"
+    return Response(
+        content=json.dumps(geojson),
+        media_type="application/geo+json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
