@@ -129,11 +129,13 @@ def test_insert_nuts_def(
     postdb.insert_nuts_def(get_engine_with_tables, nuts_path)
 
     result = get_session.query(postdb.NutsDef).all()
-    assert len(result) == 2
+    assert len(result) == 3
     assert result[0].nuts_id == "DE11"
     assert result[0].name_latn == "Test NUTS"
     assert result[1].nuts_id == "DE22"
     assert result[1].name_latn == "Test NUTS2"
+    assert result[2].nuts_id == "DE501"
+    assert result[2].name_latn == "Test NUTS3"
 
     # clean up
     get_session.execute(text("TRUNCATE TABLE nuts_def RESTART IDENTITY CASCADE"))
@@ -952,11 +954,13 @@ def test_get_nuts_regions(
     # test the function
     # normal case
     result = postdb.get_nuts_regions(get_engine_with_tables)
-    assert len(result) == 2
+    assert len(result) == 3
     assert result.loc[0, "nuts_id"] == "DE11"  # result is a geodataframe
     assert result.loc[0, "name_latn"] == "Test NUTS"
     assert result.loc[1, "nuts_id"] == "DE22"
     assert result.loc[1, "name_latn"] == "Test NUTS2"
+    assert result.loc[2, "nuts_id"] == "DE501"
+    assert result.loc[2, "name_latn"] == "Test NUTS3"
 
     # clean up
     get_session.execute(text("TRUNCATE TABLE nuts_def RESTART IDENTITY CASCADE"))
@@ -1130,7 +1134,7 @@ def test_get_var_values_nuts(
             get_session,
             time_point=(2023, 1),
             var_name="t2m_mean",
-            grid_resolution="NUTS3",
+            grid_resolution="NUTS0",
         )
     #
     # # clean up
@@ -1207,7 +1211,7 @@ def test_insert_var_value_nuts(
     # check if the data is inserted correctly
     session2 = postdb.create_session(get_engine_with_tables)
     result = session2.query(postdb.VarValueNuts).all()
-    assert len(result) == 4
+    assert len(result) == 6
     assert result[0].nuts_id == "DE11"
     assert result[0].time_id == 1
     assert result[0].var_id == 1

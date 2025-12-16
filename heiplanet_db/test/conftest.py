@@ -202,7 +202,7 @@ def get_dataset():
 @pytest.fixture
 def get_varnuts_dataset():
     rng = np.random.default_rng(42)
-    data = rng.random((2, 2)) * 200
+    data = rng.random((3, 2)) * 200
     data_array = xr.DataArray(
         data,
         dims=["NUTS_ID", "time"],
