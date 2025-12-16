@@ -993,7 +993,6 @@ def test_get_nuts_regions_geojson(
     # DE501 case.
     assert len(filtered_geojson["features"]) == 1
     assert filtered_geojson["features"][0]["properties"]["levl_code"] == 3
-    assert len(filtered_geojson["features"]) == 1
     # test for invalid NUTS resolution
     with pytest.raises(HTTPException):
         postdb.get_nuts_regions_geojson(get_engine_with_tables, grid_resolution="NUTS4")
