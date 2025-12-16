@@ -1227,7 +1227,17 @@ def get_nuts_regions(
 def get_nuts_regions_geojson(
     engine: engine.Engine, grid_resolution: str | None = None
 ) -> dict:
-    """Return NUTS regions as GeoJSON, optionally filtered by resolution."""
+    """
+    Return NUTS regions as GeoJSON, optionally filtered by resolution.
+
+    Args:
+        engine (engine.Engine): SQLAlchemy engine object.
+        grid_resolution (str | None, optional): NUTS resolution level to filter by.
+            Must be one of 'NUTS0', 'NUTS1', 'NUTS2', or 'NUTS3'. If None, all levels are returned.
+
+    Returns:
+        dict: GeoJSON representation of the NUTS regions.
+    """
     nuts_regions = get_nuts_regions(engine)
     if nuts_regions.empty:
         raise HTTPException(
