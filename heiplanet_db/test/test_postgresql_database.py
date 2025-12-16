@@ -1005,8 +1005,6 @@ def test_get_nuts_regions_geojson(
     get_session.commit()
     with pytest.raises(HTTPException):
         postdb.get_nuts_regions_geojson(get_engine_with_tables)
-    get_session.execute(text("TRUNCATE TABLE nuts_def RESTART IDENTITY CASCADE"))
-    get_session.commit()
 
 
 def test_get_grid_ids_in_nuts(get_engine_with_tables, get_session):
