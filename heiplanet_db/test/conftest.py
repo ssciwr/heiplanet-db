@@ -120,18 +120,19 @@ def get_nuts_def_data():
     # create a sample NUTS shapefile data
     polygon1 = Polygon([(0, 0), (1, 0), (1, 1), (0, 1)])
     polygon2 = Polygon([(1, 0), (2, 0), (2, 1), (1, 1)])
+    polygon3 = Polygon([(50, 49.5), (50.5, 49.5), (50.5, 50), (50, 50)])
     gdf = gpd.GeoDataFrame(
         {
-            "NUTS_ID": ["DE11", "DE22"],
-            "LEVL_CODE": [1, 2],
-            "CNTR_CODE": [1, 1],
-            "NAME_LATN": ["Test NUTS", "Test NUTS2"],
-            "NUTS_NAME": ["Test NUTS", "Test NUTS2"],
-            "MOUNT_TYPE": [0.0, 0.0],
-            "URBN_TYPE": [1.0, 1.0],
-            "COAST_TYPE": [1.0, 1.0],
+            "NUTS_ID": ["DE11", "DE22", "DE501"],
+            "LEVL_CODE": [2, 2, 3],
+            "CNTR_CODE": [1, 1, 1],
+            "NAME_LATN": ["Test NUTS", "Test NUTS2", "Test NUTS3"],
+            "NUTS_NAME": ["Test NUTS", "Test NUTS2", "Test NUTS3"],
+            "MOUNT_TYPE": [0.0, 0.0, 0.0],
+            "URBN_TYPE": [1.0, 1.0, 1.0],
+            "COAST_TYPE": [1.0, 1.0, 1.0],
         },
-        geometry=[polygon1, polygon2],
+        geometry=[polygon1, polygon2, polygon3],
         crs="EPSG:4326",
     )
     return gdf
@@ -201,12 +202,12 @@ def get_dataset():
 @pytest.fixture
 def get_varnuts_dataset():
     rng = np.random.default_rng(42)
-    data = rng.random((2, 2)) * 200
+    data = rng.random((3, 2)) * 200
     data_array = xr.DataArray(
         data,
         dims=["NUTS_ID", "time"],
         coords={
-            "NUTS_ID": ["DE11", "DE22"],
+            "NUTS_ID": ["DE11", "DE22", "DE501"],
             "time": [
                 np.datetime64("2023-01-01", "ns"),
                 np.datetime64("2024-01-01", "ns"),

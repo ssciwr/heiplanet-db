@@ -129,11 +129,13 @@ def test_insert_nuts_def(
     postdb.insert_nuts_def(get_engine_with_tables, nuts_path)
 
     result = get_session.query(postdb.NutsDef).all()
-    assert len(result) == 2
+    assert len(result) == 3
     assert result[0].nuts_id == "DE11"
     assert result[0].name_latn == "Test NUTS"
     assert result[1].nuts_id == "DE22"
     assert result[1].name_latn == "Test NUTS2"
+    assert result[2].nuts_id == "DE501"
+    assert result[2].name_latn == "Test NUTS3"
 
     # clean up
     get_session.execute(text("TRUNCATE TABLE nuts_def RESTART IDENTITY CASCADE"))
@@ -952,15 +954,56 @@ def test_get_nuts_regions(
     # test the function
     # normal case
     result = postdb.get_nuts_regions(get_engine_with_tables)
-    assert len(result) == 2
+    assert len(result) == 3
     assert result.loc[0, "nuts_id"] == "DE11"  # result is a geodataframe
     assert result.loc[0, "name_latn"] == "Test NUTS"
     assert result.loc[1, "nuts_id"] == "DE22"
     assert result.loc[1, "name_latn"] == "Test NUTS2"
+    assert result.loc[2, "nuts_id"] == "DE501"
+    assert result.loc[2, "name_latn"] == "Test NUTS3"
 
     # clean up
     get_session.execute(text("TRUNCATE TABLE nuts_def RESTART IDENTITY CASCADE"))
     get_session.commit()
+
+
+def test_get_nuts_regions_geojson(
+    get_engine_with_tables, get_session, tmp_path, get_nuts_def_data
+):
+    nuts_path = tmp_path / "nuts_def.shp"
+    gdf_nuts_data = get_nuts_def_data
+    gdf_nuts_data.to_file(nuts_path, driver="ESRI Shapefile")
+    postdb.insert_nuts_def(get_engine_with_tables, nuts_path)
+
+    geojson = postdb.get_nuts_regions_geojson(get_engine_with_tables)
+    assert geojson["type"] == "FeatureCollection"
+    assert len(geojson["features"]) == 3
+    nuts_ids = {feature["properties"]["nuts_id"] for feature in geojson["features"]}
+    assert nuts_ids == {"DE11", "DE22", "DE501"}  # IDs copied from above
+
+    filtered_geojson = postdb.get_nuts_regions_geojson(
+        get_engine_with_tables, grid_resolution="NUTS2"
+    )
+    assert len(filtered_geojson["features"]) == 2
+    assert filtered_geojson["features"][0]["properties"]["levl_code"] == 2
+    filtered_geojson = postdb.get_nuts_regions_geojson(
+        get_engine_with_tables, grid_resolution="NUTS3"
+    )
+    # DE501 case.
+    assert len(filtered_geojson["features"]) == 1
+    assert filtered_geojson["features"][0]["properties"]["levl_code"] == 3
+    # test for invalid NUTS resolution
+    with pytest.raises(HTTPException):
+        postdb.get_nuts_regions_geojson(get_engine_with_tables, grid_resolution="NUTS4")
+    # test for valid nuts resolution that does not exist in the db
+    with pytest.raises(HTTPException):
+        postdb.get_nuts_regions_geojson(get_engine_with_tables, grid_resolution="NUTS1")
+    # test for empty nuts regions
+    # remove nuts definitions from the db
+    get_session.execute(text("TRUNCATE TABLE nuts_def RESTART IDENTITY CASCADE"))
+    get_session.commit()
+    with pytest.raises(HTTPException):
+        postdb.get_nuts_regions_geojson(get_engine_with_tables)
 
 
 def test_get_grid_ids_in_nuts(get_engine_with_tables, get_session):
@@ -1008,6 +1051,10 @@ def test_filter_nuts_ids_for_resolution():
     # test with no matching nuts ids
     filtered_nuts_ids = postdb.filter_nuts_ids_for_resolution(nuts_ids, "NUTS3")
     assert len(filtered_nuts_ids) == 0
+
+    nuts_3_ids = ["DE501"]
+    filtered_nuts_3_ids = postdb.filter_nuts_ids_for_resolution(nuts_3_ids, "NUTS3")
+    assert len(filtered_nuts_3_ids) == 1
 
 
 def test_get_var_values_nuts(
@@ -1090,7 +1137,7 @@ def test_get_var_values_nuts(
             get_session,
             time_point=(2023, 1),
             var_name="t2m_mean",
-            grid_resolution="NUTS3",
+            grid_resolution="NUTS0",
         )
     #
     # # clean up
@@ -1167,7 +1214,7 @@ def test_insert_var_value_nuts(
     # check if the data is inserted correctly
     session2 = postdb.create_session(get_engine_with_tables)
     result = session2.query(postdb.VarValueNuts).all()
-    assert len(result) == 4
+    assert len(result) == 6
     assert result[0].nuts_id == "DE11"
     assert result[0].time_id == 1
     assert result[0].var_id == 1
