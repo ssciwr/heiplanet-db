@@ -986,7 +986,6 @@ def test_get_nuts_regions_geojson(
     )
     assert len(filtered_geojson["features"]) == 2
     assert filtered_geojson["features"][0]["properties"]["levl_code"] == 2
-    # Test NUTS 3 all regions for 2024 are there - 1165 regions # cant do this with the conftest mock
     filtered_geojson = postdb.get_nuts_regions_geojson(
         get_engine_with_tables, grid_resolution="NUTS3"
     )
