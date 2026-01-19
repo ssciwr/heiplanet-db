@@ -19,7 +19,7 @@ services:
     image: postgis/postgis:17-3.5
     restart: always  
     shm_size: "512m"
-    mem_limit: 4g
+    mem_limit: 2g
     command:
       - "postgres"
       - "-c"
@@ -34,10 +34,7 @@ services:
       - "max_wal_size=2GB"
     ports:
       - "5445:5432"
-    environment:
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRES_DB=${POSTGRES_DB}
+    env_file: ./.env
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -59,12 +56,7 @@ services:
         condition: service_healthy
       frontend:
         condition: service_started
-    environment:
-      - DB_URL=${DB_URL}
-      - DB_HOST=${DB_HOST}
-      - DB_PORT=${DB_PORT}
-      - DB_USER=${DB_USER}
-      - WAIT_FOR_DB=${WAIT_FOR_DB}
+    env_file: ./.env
     volumes:
       - ./heiplanet_db/data/production_config.yml:/heiplanet_db/production.yaml
     command: ["api"]  # Run FastAPI server
@@ -74,19 +66,14 @@ services:
     profiles: ["api"]
 
   production-runner:
-    image: ghcr.io/ssciwr/heiplanet-db:main     
+    image: ghcr.io/ssciwr/heiplanet-db:main
     build:
       context: .
       dockerfile: Dockerfile
     depends_on:
       db:
         condition: service_healthy
-    environment:
-      - DB_URL=${DB_URL}
-      - DB_HOST=${DB_HOST}
-      - DB_PORT=${DB_PORT}
-      - DB_USER=${DB_USER}
-      - WAIT_FOR_DB=${WAIT_FOR_DB}
+    env_file: ./.env
     volumes:
       - ./heiplanet_db/data/production_config.yml:/heiplanet_db/production.yaml
     command: ["production"]

@@ -187,10 +187,19 @@ def insert_var_values(
     lat_chunk = int(os.environ.get("R0_LAT_CHUNK", "45"))
     for t0 in range(0, r0_ds.sizes["time"], t_chunk):
         for y0 in range(0, r0_ds.sizes["latitude"], lat_chunk):
+            # Calculate actual slice sizes to avoid empty chunks
+            t_end = min(t0 + t_chunk, r0_ds.sizes["time"])
+            y_end = min(y0 + lat_chunk, r0_ds.sizes["latitude"])
+
             ds_chunk = r0_ds.isel(
-                time=slice(t0, t0 + t_chunk),
-                latitude=slice(y0, y0 + lat_chunk),
+                time=slice(t0, t_end),
+                latitude=slice(y0, y_end),
             )
+
+            # Skip empty chunks
+            if ds_chunk.sizes["time"] == 0 or ds_chunk.sizes["latitude"] == 0:
+                continue
+
             db.insert_var_values(
                 engine, ds_chunk, "R0", grid_id_map, time_id_map, var_type_id_map
             )
