@@ -9,6 +9,7 @@ from heiplanet_db import postgresql_database as db
 import zipfile
 import xarray as xr
 from sqlalchemy import engine
+import gc
 
 
 def read_production_config(dict_path: str | Traversable | Path | None = None) -> dict:
@@ -139,32 +140,63 @@ def insert_var_values(
 ) -> int:
     r0_ds = xr.open_dataset(r0_path, chunks={})
     # rechunk the dataset
-    r0_ds = r0_ds.chunk({"time": 1, "latitude": 180, "longitude": 360})
+    r0_ds = r0_ds.chunk({"time": 1, "latitude": 90, "longitude": 360})
     # add grid points
     grid_point_session = db.create_session(engine)
-    db.insert_grid_points(
-        grid_point_session,
-        latitudes=r0_ds.latitude.to_numpy(),
-        longitudes=r0_ds.longitude.to_numpy(),
-    )
+    lats = r0_ds.latitude.astype("float32").to_numpy()
+    lons = r0_ds.longitude.astype("float32").to_numpy()
+    chunk = int(os.environ.get("GRID_INSERT_CHUNK", "30"))
+    for i, start in enumerate(range(0, lats.size, chunk)):
+        lat_chunk = lats[start : start + chunk]
+        db.insert_grid_points(
+            grid_point_session,
+            latitudes=lat_chunk,
+            longitudes=lons,
+        )
+        try:
+            grid_point_session.commit()
+            grid_point_session.expire_all()
+            if i % 5 == 4:  # recreate session every 5 chunks
+                grid_point_session.close()
+                grid_point_session = db.create_session(engine)
+        except Exception:
+            grid_point_session.rollback()
+            raise
     grid_point_session.close()
-    # add time points
+
+    # add time points in chunks
     time_point_session = db.create_session(engine)
-    db.insert_time_points(
-        time_point_session,
-        time_point_data=[
-            (r0_ds.time.to_numpy(), False),
-        ],
-    )  # True means yearly data
+    times = r0_ds.time.to_numpy()
+    t_chunk = int(os.environ.get("TIME_CHUNK", "365"))
+    for t0 in range(0, times.size, t_chunk):
+        db.insert_time_points(
+            time_point_session,
+            time_point_data=[(times[t0 : t0 + t_chunk], False)],
+        )
+        time_point_session.commit()
+        time_point_session.expire_all()
     time_point_session.close()
+
     # get id maps for grid, time, and variable types
     id_map_session = db.create_session(engine)
     grid_id_map, time_id_map, var_type_id_map = db.get_id_maps(id_map_session)
     id_map_session.close()
-    # add R0 values
-    _, _ = db.insert_var_values(
-        engine, r0_ds, "R0", grid_id_map, time_id_map, var_type_id_map
-    )
+
+    # add R0 values in time x lat chunks (don't load all at once)
+    t_chunk = int(os.environ.get("R0_TIME_CHUNK", "30"))
+    lat_chunk = int(os.environ.get("R0_LAT_CHUNK", "45"))
+    for t0 in range(0, r0_ds.sizes["time"], t_chunk):
+        for y0 in range(0, r0_ds.sizes["latitude"], lat_chunk):
+            ds_chunk = r0_ds.isel(
+                time=slice(t0, t0 + t_chunk),
+                latitude=slice(y0, y0 + lat_chunk),
+            )
+            db.insert_var_values(
+                engine, ds_chunk, "R0", grid_id_map, time_id_map, var_type_id_map
+            )
+            del ds_chunk  # explicit cleanup
+            gc.collect()  # force garbage collection
+
     # assign resolution groups to grid points
     resolution_session = db.create_session(engine)
     db.assign_grid_resolution_group_to_grid_point(resolution_session)
@@ -177,17 +209,21 @@ def insert_var_values_nuts(
     r0_nuts_path: Path | None = None,
 ) -> int:
     check_paths([r0_nuts_path])
-    r0_ds = xr.open_dataset(r0_nuts_path, chunks={})
+    r0_ds = xr.open_dataset(r0_nuts_path, chunks={"time": 1})
     id_map_session = db.create_session(engine)
     _, time_id_map, var_type_id_map = db.get_id_maps(id_map_session)
     id_map_session.close()
-    db.insert_var_value_nuts(
-        engine,
-        r0_ds,
-        var_name="R0",
-        time_id_map=time_id_map,
-        var_id_map=var_type_id_map,
-    )
+
+    t_chunk = int(os.environ.get("NUTS_TIME_CHUNK", "30"))
+    for t0 in range(0, r0_ds.sizes["time"], t_chunk):
+        ds_chunk = r0_ds.isel(time=slice(t0, t0 + t_chunk))
+        db.insert_var_value_nuts(
+            engine,
+            ds_chunk,
+            var_name="R0",
+            time_id_map=time_id_map,
+            var_id_map=var_type_id_map,
+        )
     return 0
 
 

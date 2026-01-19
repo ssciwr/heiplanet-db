@@ -378,6 +378,7 @@ def add_data_list_bulk(session: Session, data_dict_list: list, class_type: Type[
     try:
         session.bulk_insert_mappings(class_type, data_dict_list)
         session.commit()
+        session.expire_all()  # Clear identity map after commit
     except SQLAlchemyError as e:
         session.rollback()
         print(f"Error inserting data: {e}")
@@ -737,7 +738,6 @@ def insert_var_values(
 
     def insert_batch(batch):
         """Insert a batch of data into the database."""
-        # create a new session for each batch
         session = create_session(engine)
         add_data_list_bulk(session, batch, VarValue)
         session.close()
@@ -745,9 +745,13 @@ def insert_var_values(
     print(f"Start inserting {var_name} values in parallel...")
     t_start_insert = time.time()
 
+    # Limit concurrent threads and garbage collect between batches
+    import gc
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = []
         for i in range(0, len(var_values), BATCH_SIZE):
+            gc.collect()  # Force garbage collection before submitting batch
             e_batch = i + BATCH_SIZE
             batch = var_values[i:e_batch]
             futures.append(executor.submit(insert_batch, batch))

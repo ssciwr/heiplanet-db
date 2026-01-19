@@ -1,7 +1,7 @@
 services:
 
   frontend:
-    image: ghcr.io/ssciwr/onehealth-map-frontend:global_map_with_month_selector
+    image: ghcr.io/ssciwr/onehealth-map-frontend:get_region_metadata_from_db_api
     ports:
       - "80:80"
       - "443:443"
@@ -18,6 +18,20 @@ services:
   db:
     image: postgis/postgis:17-3.5
     restart: always  
+    shm_size: "512m"
+    mem_limit: 4g
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=1GB"
+      - "-c"
+      - "work_mem=64MB"
+      - "-c"
+      - "maintenance_work_mem=512MB"
+      - "-c"
+      - "effective_cache_size=2GB"
+      - "-c"
+      - "max_wal_size=2GB"
     ports:
       - "5445:5432"
     environment:
@@ -36,7 +50,7 @@ services:
 
   # FastAPI Application service (Stage 2)
   api:
-    image: ghcr.io/ssciwr/heiplanet-backend:latest
+    image: ghcr.io/ssciwr/heiplanet-db:main
     build:
       context: .
       dockerfile: Dockerfile
@@ -52,8 +66,7 @@ services:
       - DB_USER=${DB_USER}
       - WAIT_FOR_DB=${WAIT_FOR_DB}
     volumes:
-      - ./production.yaml:/heiplanet_db/production.yaml
-      - ./heiplanet_db:/heiplanet_db/heiplanet_db  # For development hot reload
+      - ./heiplanet_db/data/production_config.yml:/heiplanet_db/production.yaml
     command: ["api"]  # Run FastAPI server
     restart: "no"
     networks:
@@ -61,7 +74,7 @@ services:
     profiles: ["api"]
 
   production-runner:
-    image: ghcr.io/ssciwr/heiplanet-backend:latest
+    image: ghcr.io/ssciwr/heiplanet-db:main     
     build:
       context: .
       dockerfile: Dockerfile
@@ -75,7 +88,7 @@ services:
       - DB_USER=${DB_USER}
       - WAIT_FOR_DB=${WAIT_FOR_DB}
     volumes:
-      - ./production.yaml:/heiplanet_db/production.yaml
+      - ./heiplanet_db/data/production_config.yml:/heiplanet_db/production.yaml
     command: ["production"]
     restart: "no"  # Run once
     networks:
