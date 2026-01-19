@@ -55,6 +55,7 @@ def get_production_data(url: str, filename: str, filehash: str, outputdir: Path)
             known_hash=filehash,
             fname=filename,
             path=outputdir,
+            progressbar=True,
         )
     except Exception as e:
         print(f"Error fetching data: {e}")
@@ -191,6 +192,11 @@ def insert_var_values(
                 time=slice(t0, t0 + t_chunk),
                 latitude=slice(y0, y0 + lat_chunk),
             )
+            if (
+                ds_chunk.sizes.get("time", 0) == 0
+                or ds_chunk.sizes.get("latitude", 0) == 0
+            ):
+                continue
             db.insert_var_values(
                 engine, ds_chunk, "R0", grid_id_map, time_id_map, var_type_id_map
             )
@@ -227,6 +233,32 @@ def insert_var_values_nuts(
     return 0
 
 
+def get_data(data: dict, config: dict, data_level: str) -> None:
+    """
+    Fetch data based on the provided configuration.
+
+    Args:
+        data (dict): Dictionary containing data fetching details.
+        config (dict): Configuration dictionary.
+        data_level (str): Level of the data in the data lake.
+    """
+    if "local" in data["host"]:
+        # if the host is local, we can use the local path
+        data["url"] = str(Path(data["url"]).resolve())
+        print(f"Using local path {data['url']} for {data['filename']}")
+    elif "heibox" in data["host"]:
+        print("Downloading data from heibox.")
+        # if the host is heibox, we need to use the heibox URL
+        get_production_data(
+            url=data["url"],
+            filename=data["filename"],
+            filehash=data["filehash"],
+            outputdir=Path(config["datalake"][data_level]),
+        )
+    else:
+        raise ValueError(f"Unknown host {data.get('host')} for data fetching.")
+
+
 def main() -> None:
     """
     Main function to set up the production database and data lake.
@@ -249,38 +281,35 @@ def main() -> None:
         # set the data level, default to bronze if not specified
         data_level = data["var_name"][0].get("level", "bronze")
         # check if the data is already in the data lake
-        path_to_file = Path(config["datalake"][data_level]) / data.get("filename", "")
+        path_root = Path(__file__).parent.parent
+        file_path = Path(config["datalake"][data_level]) / data.get("filename", "")
+        path_to_file = path_root / file_path
         if path_to_file.is_file():
             print(
                 f"File {data['filename']} already exists in the data lake \
                     at level {data_level}, skipping download."
             )
-        elif "local" in data["host"]:
-            # if the host is local, we can use the local path
-            data["url"] = str(Path(data["url"]).resolve())
-            print(f"Using local path {data['url']} for {data['filename']}")
-        elif "heibox" in data["host"]:
-            # if the host is heibox, we need to use the heibox URL
-            get_production_data(
-                url=data["url"],
-                filename=data["filename"],
-                filehash=data["filehash"],
-                outputdir=Path(config["datalake"][data_level]),
-            )
+        else:
+            get_data(data, config, data_level)
+
         if data["var_name"][0]["type"] == "R0":
             # set the path to the R0 data
-            r0_path = Path(config["datalake"][data_level]) / data["filename"]
+            r0_path = (
+                path_root / Path(config["datalake"][data_level]) / data["filename"]
+            )
             print(f"R0 data path: {r0_path}")
         elif data["var_name"][0]["type"] == "R0_nuts":
             # set the path to the R0 nuts data
-            r0_nuts_path = Path(config["datalake"][data_level]) / data["filename"]
+            r0_nuts_path = (
+                path_root / Path(config["datalake"][data_level]) / data["filename"]
+            )
             print(f"R0 NUTS data path: {r0_nuts_path}")
         elif data["var_name"][0]["type"] == "definition":
             # extract file and set the path to the NUTS shapefiles
-            shapefile_path = Path(config["datalake"][data_level])
+            shapefile_path = path_root / Path(config["datalake"][data_level])
             shapefile_path = shapefile_path / data["filename"]
             # make sure the shapefile folder is unzipped
-            shapefile_folder_path = shapefile_path.with_suffix("")
+            shapefile_folder_path = path_root / shapefile_path.with_suffix("")
             with zipfile.ZipFile(shapefile_path, "r") as zip_ref:
                 print("Extracting zip archive to {}.".format(shapefile_folder_path))
                 zip_ref.extractall(shapefile_folder_path)
