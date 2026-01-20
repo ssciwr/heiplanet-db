@@ -32,6 +32,10 @@ services:
       - "effective_cache_size=2GB"
       - "-c"
       - "max_wal_size=2GB"
+      - "-c"
+      - "autovacuum_max_workers=4"
+      - "-c"
+      - "autovacuum_naptime=10s"
     ports:
       - "5445:5432"
     env_file: ./.env

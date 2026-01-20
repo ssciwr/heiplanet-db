@@ -289,7 +289,12 @@ def initialize_database(db_url: str, replace: bool = False):
         replace (bool): Whether to drop and recreate the tables. Defaults to False.
     """
     # create engine
-    engine = create_engine(db_url)  # remove echo=True to show just errors in terminal
+
+    engine = create_engine(
+        db_url,
+        pool_pre_ping=True,
+        connect_args={"connect_timeout": 5},  # fail fast if unreachable
+    )
 
     # install PostGIS extension
     install_postgis(engine)
@@ -712,9 +717,19 @@ def insert_var_values(
     # create vectorized mapping
     # normalize time before mapping as the time in isimip is 12:00:00
     # TODO: find an optimal way to do this
+    if len(time_vals) == 0:
+        print(
+            f"No valid data points found for variable {var_name}. Skipping insertion."
+        )
+        return 0.0, 0.0
     get_time_id = np.vectorize(
         lambda t: time_id_map.get(np.datetime64(pd.Timestamp(t).normalize(), "ns"))
     )
+    if len(lat_vals) == 0 or len(lon_vals) == 0:
+        print(
+            f"No valid lat/lon points found for variable {var_name}. Skipping insertion."
+        )
+        return 0.0, 0.0
     get_grid_id = np.vectorize(lambda lat, lon: grid_id_map.get((lat, lon)))
 
     time_ids = get_time_id(time_vals)

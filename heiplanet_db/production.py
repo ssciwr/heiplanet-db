@@ -55,6 +55,7 @@ def get_production_data(url: str, filename: str, filehash: str, outputdir: Path)
             known_hash=filehash,
             fname=filename,
             path=outputdir,
+            progressbar=True,
         )
     except Exception as e:
         print(f"Error fetching data: {e}")
@@ -83,6 +84,19 @@ def get_engine() -> engine.Engine:
         # Here we drop all existing tables and create a new database
         # make sure this is not run in real production!
         engine = db.initialize_database(db_url, replace=True)
+        # Disable autovacuum during bulk load
+        from sqlalchemy import text
+
+        with engine.begin() as conn:
+            conn.execute(
+                text("ALTER TABLE var_value SET (autovacuum_enabled = false);")
+            )
+            conn.execute(
+                text("ALTER TABLE grid_point SET (autovacuum_enabled = false);")
+            )
+            conn.execute(
+                text("ALTER TABLE time_point SET (autovacuum_enabled = false);")
+            )
     except Exception as e:
         raise ValueError(
             "Could not initialize engine, please check \
@@ -195,11 +209,11 @@ def insert_var_values(
                 time=slice(t0, t_end),
                 latitude=slice(y0, y_end),
             )
-
-            # Skip empty chunks
-            if ds_chunk.sizes["time"] == 0 or ds_chunk.sizes["latitude"] == 0:
+            if (
+                ds_chunk.sizes.get("time", 0) == 0
+                or ds_chunk.sizes.get("latitude", 0) == 0
+            ):
                 continue
-
             db.insert_var_values(
                 engine, ds_chunk, "R0", grid_id_map, time_id_map, var_type_id_map
             )
@@ -236,6 +250,32 @@ def insert_var_values_nuts(
     return 0
 
 
+def get_data(data: dict, config: dict, data_level: str) -> None:
+    """
+    Fetch data based on the provided configuration.
+
+    Args:
+        data (dict): Dictionary containing data fetching details.
+        config (dict): Configuration dictionary.
+        data_level (str): Level of the data in the data lake.
+    """
+    if "local" in data["host"]:
+        # if the host is local, we can use the local path
+        data["url"] = str(Path(data["url"]).resolve())
+        print(f"Using local path {data['url']} for {data['filename']}")
+    elif "heibox" in data["host"]:
+        print("Downloading data from heibox.")
+        # if the host is heibox, we need to use the heibox URL
+        get_production_data(
+            url=data["url"],
+            filename=data["filename"],
+            filehash=data["filehash"],
+            outputdir=Path(config["datalake"][data_level]),
+        )
+    else:
+        raise ValueError(f"Unknown host {data.get('host')} for data fetching.")
+
+
 def main() -> None:
     """
     Main function to set up the production database and data lake.
@@ -264,18 +304,9 @@ def main() -> None:
                 f"File {data['filename']} already exists in the data lake \
                     at level {data_level}, skipping download."
             )
-        elif "local" in data["host"]:
-            # if the host is local, we can use the local path
-            data["url"] = str(Path(data["url"]).resolve())
-            print(f"Using local path {data['url']} for {data['filename']}")
-        elif "heibox" in data["host"]:
-            # if the host is heibox, we need to use the heibox URL
-            get_production_data(
-                url=data["url"],
-                filename=data["filename"],
-                filehash=data["filehash"],
-                outputdir=Path(config["datalake"][data_level]),
-            )
+        else:
+            get_data(data, config, data_level)
+
         if data["var_name"][0]["type"] == "R0":
             # set the path to the R0 data
             r0_path = Path(config["datalake"][data_level]) / data["filename"]
@@ -312,8 +343,17 @@ def main() -> None:
     resolution_session.close()
     # insert the data
     insert_var_values(engine, r0_path=r0_path)
-    # insert the nuts variables data
     insert_var_values_nuts(engine, r0_nuts_path=r0_nuts_path)
+
+    # Re-enable autovacuum and clean up
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE var_value SET (autovacuum_enabled = true);"))
+        conn.execute(text("ALTER TABLE grid_point SET (autovacuum_enabled = true);"))
+        conn.execute(text("ALTER TABLE time_point SET (autovacuum_enabled = true);"))
+        conn.execute(text("VACUUM ANALYZE;"))
+    print("Database vacuumed and ready.")
 
 
 if __name__ == "__main__":
