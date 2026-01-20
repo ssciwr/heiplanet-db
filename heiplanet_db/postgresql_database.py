@@ -289,12 +289,7 @@ def initialize_database(db_url: str, replace: bool = False):
         replace (bool): Whether to drop and recreate the tables. Defaults to False.
     """
     # create engine
-
-    engine = create_engine(
-        db_url,
-        pool_pre_ping=True,
-        connect_args={"connect_timeout": 5},  # fail fast if unreachable
-    )
+    engine = create_engine(db_url)  # remove echo=True to show just errors in terminal
 
     # install PostGIS extension
     install_postgis(engine)
@@ -383,7 +378,6 @@ def add_data_list_bulk(session: Session, data_dict_list: list, class_type: Type[
     try:
         session.bulk_insert_mappings(class_type, data_dict_list)
         session.commit()
-        session.expire_all()  # Clear identity map after commit
     except SQLAlchemyError as e:
         session.rollback()
         print(f"Error inserting data: {e}")
@@ -717,19 +711,9 @@ def insert_var_values(
     # create vectorized mapping
     # normalize time before mapping as the time in isimip is 12:00:00
     # TODO: find an optimal way to do this
-    if len(time_vals) == 0:
-        print(
-            f"No valid data points found for variable {var_name}. Skipping insertion."
-        )
-        return 0.0, 0.0
     get_time_id = np.vectorize(
         lambda t: time_id_map.get(np.datetime64(pd.Timestamp(t).normalize(), "ns"))
     )
-    if len(lat_vals) == 0 or len(lon_vals) == 0:
-        print(
-            f"No valid lat/lon points found for variable {var_name}. Skipping insertion."
-        )
-        return 0.0, 0.0
     get_grid_id = np.vectorize(lambda lat, lon: grid_id_map.get((lat, lon)))
 
     time_ids = get_time_id(time_vals)
@@ -753,6 +737,7 @@ def insert_var_values(
 
     def insert_batch(batch):
         """Insert a batch of data into the database."""
+        # create a new session for each batch
         session = create_session(engine)
         add_data_list_bulk(session, batch, VarValue)
         session.close()
@@ -760,13 +745,9 @@ def insert_var_values(
     print(f"Start inserting {var_name} values in parallel...")
     t_start_insert = time.time()
 
-    # Limit concurrent threads and garbage collect between batches
-    import gc
-
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = []
         for i in range(0, len(var_values), BATCH_SIZE):
-            gc.collect()  # Force garbage collection before submitting batch
             e_batch = i + BATCH_SIZE
             batch = var_values[i:e_batch]
             futures.append(executor.submit(insert_batch, batch))

@@ -9,7 +9,6 @@ from heiplanet_db import postgresql_database as db
 import zipfile
 import xarray as xr
 from sqlalchemy import engine
-import gc
 
 
 def read_production_config(dict_path: str | Traversable | Path | None = None) -> dict:
@@ -55,7 +54,6 @@ def get_production_data(url: str, filename: str, filehash: str, outputdir: Path)
             known_hash=filehash,
             fname=filename,
             path=outputdir,
-            progressbar=True,
         )
     except Exception as e:
         print(f"Error fetching data: {e}")
@@ -84,19 +82,6 @@ def get_engine() -> engine.Engine:
         # Here we drop all existing tables and create a new database
         # make sure this is not run in real production!
         engine = db.initialize_database(db_url, replace=True)
-        # Disable autovacuum during bulk load
-        from sqlalchemy import text
-
-        with engine.begin() as conn:
-            conn.execute(
-                text("ALTER TABLE var_value SET (autovacuum_enabled = false);")
-            )
-            conn.execute(
-                text("ALTER TABLE grid_point SET (autovacuum_enabled = false);")
-            )
-            conn.execute(
-                text("ALTER TABLE time_point SET (autovacuum_enabled = false);")
-            )
     except Exception as e:
         raise ValueError(
             "Could not initialize engine, please check \
@@ -154,72 +139,32 @@ def insert_var_values(
 ) -> int:
     r0_ds = xr.open_dataset(r0_path, chunks={})
     # rechunk the dataset
-    r0_ds = r0_ds.chunk({"time": 1, "latitude": 90, "longitude": 360})
+    r0_ds = r0_ds.chunk({"time": 1, "latitude": 180, "longitude": 360})
     # add grid points
     grid_point_session = db.create_session(engine)
-    lats = r0_ds.latitude.astype("float32").to_numpy()
-    lons = r0_ds.longitude.astype("float32").to_numpy()
-    chunk = int(os.environ.get("GRID_INSERT_CHUNK", "30"))
-    for i, start in enumerate(range(0, lats.size, chunk)):
-        lat_chunk = lats[start : start + chunk]
-        db.insert_grid_points(
-            grid_point_session,
-            latitudes=lat_chunk,
-            longitudes=lons,
-        )
-        try:
-            grid_point_session.commit()
-            grid_point_session.expire_all()
-            if i % 5 == 4:  # recreate session every 5 chunks
-                grid_point_session.close()
-                grid_point_session = db.create_session(engine)
-        except Exception:
-            grid_point_session.rollback()
-            raise
+    db.insert_grid_points(
+        grid_point_session,
+        latitudes=r0_ds.latitude.to_numpy(),
+        longitudes=r0_ds.longitude.to_numpy(),
+    )
     grid_point_session.close()
-
-    # add time points in chunks
+    # add time points
     time_point_session = db.create_session(engine)
-    times = r0_ds.time.to_numpy()
-    t_chunk = int(os.environ.get("TIME_CHUNK", "365"))
-    for t0 in range(0, times.size, t_chunk):
-        db.insert_time_points(
-            time_point_session,
-            time_point_data=[(times[t0 : t0 + t_chunk], False)],
-        )
-        time_point_session.commit()
-        time_point_session.expire_all()
+    db.insert_time_points(
+        time_point_session,
+        time_point_data=[
+            (r0_ds.time.to_numpy(), False),
+        ],
+    )  # True means yearly data
     time_point_session.close()
-
     # get id maps for grid, time, and variable types
     id_map_session = db.create_session(engine)
     grid_id_map, time_id_map, var_type_id_map = db.get_id_maps(id_map_session)
     id_map_session.close()
-
-    # add R0 values in time x lat chunks (don't load all at once)
-    t_chunk = int(os.environ.get("R0_TIME_CHUNK", "30"))
-    lat_chunk = int(os.environ.get("R0_LAT_CHUNK", "45"))
-    for t0 in range(0, r0_ds.sizes["time"], t_chunk):
-        for y0 in range(0, r0_ds.sizes["latitude"], lat_chunk):
-            # Calculate actual slice sizes to avoid empty chunks
-            t_end = min(t0 + t_chunk, r0_ds.sizes["time"])
-            y_end = min(y0 + lat_chunk, r0_ds.sizes["latitude"])
-
-            ds_chunk = r0_ds.isel(
-                time=slice(t0, t_end),
-                latitude=slice(y0, y_end),
-            )
-            if (
-                ds_chunk.sizes.get("time", 0) == 0
-                or ds_chunk.sizes.get("latitude", 0) == 0
-            ):
-                continue
-            db.insert_var_values(
-                engine, ds_chunk, "R0", grid_id_map, time_id_map, var_type_id_map
-            )
-            del ds_chunk  # explicit cleanup
-            gc.collect()  # force garbage collection
-
+    # add R0 values
+    _, _ = db.insert_var_values(
+        engine, r0_ds, "R0", grid_id_map, time_id_map, var_type_id_map
+    )
     # assign resolution groups to grid points
     resolution_session = db.create_session(engine)
     db.assign_grid_resolution_group_to_grid_point(resolution_session)
@@ -232,48 +177,18 @@ def insert_var_values_nuts(
     r0_nuts_path: Path | None = None,
 ) -> int:
     check_paths([r0_nuts_path])
-    r0_ds = xr.open_dataset(r0_nuts_path, chunks={"time": 1})
+    r0_ds = xr.open_dataset(r0_nuts_path, chunks={})
     id_map_session = db.create_session(engine)
     _, time_id_map, var_type_id_map = db.get_id_maps(id_map_session)
     id_map_session.close()
-
-    t_chunk = int(os.environ.get("NUTS_TIME_CHUNK", "30"))
-    for t0 in range(0, r0_ds.sizes["time"], t_chunk):
-        ds_chunk = r0_ds.isel(time=slice(t0, t0 + t_chunk))
-        db.insert_var_value_nuts(
-            engine,
-            ds_chunk,
-            var_name="R0",
-            time_id_map=time_id_map,
-            var_id_map=var_type_id_map,
-        )
+    db.insert_var_value_nuts(
+        engine,
+        r0_ds,
+        var_name="R0",
+        time_id_map=time_id_map,
+        var_id_map=var_type_id_map,
+    )
     return 0
-
-
-def get_data(data: dict, config: dict, data_level: str) -> None:
-    """
-    Fetch data based on the provided configuration.
-
-    Args:
-        data (dict): Dictionary containing data fetching details.
-        config (dict): Configuration dictionary.
-        data_level (str): Level of the data in the data lake.
-    """
-    if "local" in data["host"]:
-        # if the host is local, we can use the local path
-        data["url"] = str(Path(data["url"]).resolve())
-        print(f"Using local path {data['url']} for {data['filename']}")
-    elif "heibox" in data["host"]:
-        print("Downloading data from heibox.")
-        # if the host is heibox, we need to use the heibox URL
-        get_production_data(
-            url=data["url"],
-            filename=data["filename"],
-            filehash=data["filehash"],
-            outputdir=Path(config["datalake"][data_level]),
-        )
-    else:
-        raise ValueError(f"Unknown host {data.get('host')} for data fetching.")
 
 
 def main() -> None:
@@ -304,9 +219,18 @@ def main() -> None:
                 f"File {data['filename']} already exists in the data lake \
                     at level {data_level}, skipping download."
             )
-        else:
-            get_data(data, config, data_level)
-
+        elif "local" in data["host"]:
+            # if the host is local, we can use the local path
+            data["url"] = str(Path(data["url"]).resolve())
+            print(f"Using local path {data['url']} for {data['filename']}")
+        elif "heibox" in data["host"]:
+            # if the host is heibox, we need to use the heibox URL
+            get_production_data(
+                url=data["url"],
+                filename=data["filename"],
+                filehash=data["filehash"],
+                outputdir=Path(config["datalake"][data_level]),
+            )
         if data["var_name"][0]["type"] == "R0":
             # set the path to the R0 data
             r0_path = Path(config["datalake"][data_level]) / data["filename"]
@@ -343,17 +267,8 @@ def main() -> None:
     resolution_session.close()
     # insert the data
     insert_var_values(engine, r0_path=r0_path)
+    # insert the nuts variables data
     insert_var_values_nuts(engine, r0_nuts_path=r0_nuts_path)
-
-    # Re-enable autovacuum and clean up
-    from sqlalchemy import text
-
-    with engine.begin() as conn:
-        conn.execute(text("ALTER TABLE var_value SET (autovacuum_enabled = true);"))
-        conn.execute(text("ALTER TABLE grid_point SET (autovacuum_enabled = true);"))
-        conn.execute(text("ALTER TABLE time_point SET (autovacuum_enabled = true);"))
-        conn.execute(text("VACUUM ANALYZE;"))
-    print("Database vacuumed and ready.")
 
 
 if __name__ == "__main__":
