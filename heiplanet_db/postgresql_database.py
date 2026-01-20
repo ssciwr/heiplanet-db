@@ -24,6 +24,7 @@ import pandas as pd
 import numpy as np
 import xarray as xr
 import time
+import os
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Type, Tuple, List
@@ -392,18 +393,39 @@ def insert_grid_points(session: Session, latitudes: np.ndarray, longitudes: np.n
         latitudes (np.ndarray): Array of latitudes.
         longitudes (np.ndarray): Array of longitudes.
     """
-    # create list of dictionaries for bulk insert
-    grid_points = [
-        {
-            "latitude": float(lat),
-            "longitude": float(lon),
-            "point": STR_POINT.format(str(CRS), float(lon), float(lat)),
-        }
-        for lat in latitudes
-        for lon in longitudes
-    ]
-    add_data_list_bulk(session, grid_points, GridPoint)
-    print("Grid points inserted.")
+    lat_chunk_size = int(os.environ.get("GRID_LAT_CHUNK", "45"))
+    lon_chunk_size = int(os.environ.get("GRID_LON_CHUNK", "360"))
+
+    total_batches = (len(latitudes) // lat_chunk_size + 1) * (
+        len(longitudes) // lon_chunk_size + 1
+    )
+    batch_count = 0
+    for lat_start in range(0, len(latitudes), lat_chunk_size):
+        lat_end = min(lat_start + lat_chunk_size, len(latitudes))
+        lat_slice = latitudes[lat_start:lat_end]
+
+        for lon_start in range(0, len(longitudes), lon_chunk_size):
+            lon_end = min(lon_start + lon_chunk_size, len(longitudes))
+            lon_slice = longitudes[lon_start:lon_end]
+
+            # Build batch
+            grid_points = [
+                {
+                    "latitude": float(lat),
+                    "longitude": float(lon),
+                    "point": STR_POINT.format(str(CRS), float(lon), float(lat)),
+                }
+                for lat in lat_slice
+                for lon in lon_slice
+            ]
+
+            # Insert batch
+            add_data_list_bulk(session, grid_points, GridPoint)
+            session.expire_all()  # clear identity map
+            batch_count += 1
+            print(f"Grid points batch {batch_count}/{total_batches} inserted.")
+
+    print("All grid points inserted.")
 
 
 def insert_resolution_groups(
