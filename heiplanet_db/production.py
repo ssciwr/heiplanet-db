@@ -9,6 +9,7 @@ from heiplanet_db import postgresql_database as db
 import zipfile
 import xarray as xr
 from sqlalchemy import engine
+from sqlalchemy import text
 
 
 def read_production_config(dict_path: str | Traversable | Path | None = None) -> dict:
@@ -254,6 +255,14 @@ def main() -> None:
             "Shapefile path could not be generated from the data to fetch."
         )
     engine = get_engine()
+    # Disable autovacuum globally for all tables during bulk load
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE grid_point SET (autovacuum_enabled = false);"))
+        conn.execute(text("ALTER TABLE time_point SET (autovacuum_enabled = false);"))
+        conn.execute(text("ALTER TABLE var_value SET (autovacuum_enabled = false);"))
+        conn.execute(
+            text("ALTER TABLE var_value_nuts SET (autovacuum_enabled = false);")
+        )
     # insert the NUTS shape data
     insert_data(engine=engine, shapefiles_folder_path=shapefile_folder_path)
     # insert the cartesian variables data
@@ -269,6 +278,16 @@ def main() -> None:
     insert_var_values(engine, r0_path=r0_path)
     # insert the nuts variables data
     insert_var_values_nuts(engine, r0_nuts_path=r0_nuts_path)
+    # Re-enable autovacuum and run VACUUM ANALYZE on all tables
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE grid_point SET (autovacuum_enabled = true);"))
+        conn.execute(text("ALTER TABLE time_point SET (autovacuum_enabled = true);"))
+        conn.execute(text("ALTER TABLE var_value SET (autovacuum_enabled = true);"))
+        conn.execute(
+            text("ALTER TABLE var_value_nuts SET (autovacuum_enabled = true);")
+        )
+        conn.execute(text("VACUUM ANALYZE;"))
+    print("Database vacuumed and ready.")
 
 
 if __name__ == "__main__":

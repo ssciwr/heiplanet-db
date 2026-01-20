@@ -379,6 +379,7 @@ def add_data_list_bulk(session: Session, data_dict_list: list, class_type: Type[
     try:
         session.bulk_insert_mappings(class_type, data_dict_list)
         session.commit()
+        session.expire_all()  # clear identity map
     except SQLAlchemyError as e:
         session.rollback()
         print(f"Error inserting data: {e}")
