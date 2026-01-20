@@ -21,17 +21,6 @@ data_to_fetch:
     host: "heibox"
     url: "https://heibox.uni-heidelberg.de/f/ab419b1d0a624ab48b02/?dl=1"
     filehash: "9081dee67a2e2484c824daff727b3f1350f7c6b5eb86ce4f4bb2998073d28732"
-  - var_name: 
-    - type: "R0_nuts"
-      name: "R0"
-      unit: "1"
-      grid: "NUTS"
-      level: "gold"
-      description: "Transmission suitability for West Nile virus for 2016 and 2017, NUTS grid."
-    filename: "NUTS_RG_20M_2024_4326_agg_jmodel_2016-01-2017-12_ee.nc"
-    host: "heibox"
-    url: "https://heibox.uni-heidelberg.de/f/51dfbe1942ca4ed58750/?dl=1"
-    filehash: "aa91db1628c97f1ccae268cadc478e77e9a5b1e9bd16cf719dcd72648dc19b0f"
 datalake:
   bronze: ".data_heiplanet_db/bronze"
   silver: ".data_heiplanet_db/silver"
