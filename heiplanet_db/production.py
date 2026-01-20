@@ -84,6 +84,19 @@ def get_engine() -> engine.Engine:
         # Here we drop all existing tables and create a new database
         # make sure this is not run in real production!
         engine = db.initialize_database(db_url, replace=True)
+        # Disable autovacuum during bulk load
+        from sqlalchemy import text
+
+        with engine.begin() as conn:
+            conn.execute(
+                text("ALTER TABLE var_value SET (autovacuum_enabled = false);")
+            )
+            conn.execute(
+                text("ALTER TABLE grid_point SET (autovacuum_enabled = false);")
+            )
+            conn.execute(
+                text("ALTER TABLE time_point SET (autovacuum_enabled = false);")
+            )
     except Exception as e:
         raise ValueError(
             "Could not initialize engine, please check \
@@ -281,9 +294,7 @@ def main() -> None:
         # set the data level, default to bronze if not specified
         data_level = data["var_name"][0].get("level", "bronze")
         # check if the data is already in the data lake
-        path_root = Path(__file__).parent.parent
-        file_path = Path(config["datalake"][data_level]) / data.get("filename", "")
-        path_to_file = path_root / file_path
+        path_to_file = Path(config["datalake"][data_level]) / data.get("filename", "")
         if path_to_file.is_file():
             print(
                 f"File {data['filename']} already exists in the data lake \
@@ -294,22 +305,18 @@ def main() -> None:
 
         if data["var_name"][0]["type"] == "R0":
             # set the path to the R0 data
-            r0_path = (
-                path_root / Path(config["datalake"][data_level]) / data["filename"]
-            )
+            r0_path = Path(config["datalake"][data_level]) / data["filename"]
             print(f"R0 data path: {r0_path}")
         elif data["var_name"][0]["type"] == "R0_nuts":
             # set the path to the R0 nuts data
-            r0_nuts_path = (
-                path_root / Path(config["datalake"][data_level]) / data["filename"]
-            )
+            r0_nuts_path = Path(config["datalake"][data_level]) / data["filename"]
             print(f"R0 NUTS data path: {r0_nuts_path}")
         elif data["var_name"][0]["type"] == "definition":
             # extract file and set the path to the NUTS shapefiles
-            shapefile_path = path_root / Path(config["datalake"][data_level])
+            shapefile_path = Path(config["datalake"][data_level])
             shapefile_path = shapefile_path / data["filename"]
             # make sure the shapefile folder is unzipped
-            shapefile_folder_path = path_root / shapefile_path.with_suffix("")
+            shapefile_folder_path = shapefile_path.with_suffix("")
             with zipfile.ZipFile(shapefile_path, "r") as zip_ref:
                 print("Extracting zip archive to {}.".format(shapefile_folder_path))
                 zip_ref.extractall(shapefile_folder_path)
@@ -332,8 +339,17 @@ def main() -> None:
     resolution_session.close()
     # insert the data
     insert_var_values(engine, r0_path=r0_path)
-    # insert the nuts variables data
     insert_var_values_nuts(engine, r0_nuts_path=r0_nuts_path)
+
+    # Re-enable autovacuum and clean up
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE var_value SET (autovacuum_enabled = true);"))
+        conn.execute(text("ALTER TABLE grid_point SET (autovacuum_enabled = true);"))
+        conn.execute(text("ALTER TABLE time_point SET (autovacuum_enabled = true);"))
+        conn.execute(text("VACUUM ANALYZE;"))
+    print("Database vacuumed and ready.")
 
 
 if __name__ == "__main__":
