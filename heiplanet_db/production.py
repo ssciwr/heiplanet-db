@@ -55,6 +55,7 @@ def get_production_data(url: str, filename: str, filehash: str, outputdir: Path)
             known_hash=filehash,
             fname=filename,
             path=outputdir,
+            progressbar=True,
         )
     except Exception as e:
         print(f"Error fetching data: {e}")
@@ -159,9 +160,11 @@ def insert_var_values(
     )  # True means yearly data
     time_point_session.close()
     # get id maps for grid, time, and variable types
+    print("Getting id maps for grid, time, and variable types.")
     id_map_session = db.create_session(engine)
     grid_id_map, time_id_map, var_type_id_map = db.get_id_maps(id_map_session)
     id_map_session.close()
+    print("Inserting variable values into the database.")
     # add R0 values
     _, _ = db.insert_var_values(
         engine, r0_ds, "R0", grid_id_map, time_id_map, var_type_id_map
@@ -192,6 +195,23 @@ def insert_var_values_nuts(
     return 0
 
 
+def get_data_files(data: dict, config: dict, data_level: str) -> None:
+    if "local" in data["host"]:
+        # if the host is local, we can use the local path
+        data["url"] = str(Path(data["url"]).resolve())
+        print(f"Using local path {data['url']} for {data['filename']}")
+    elif "heibox" in data["host"]:
+        # if the host is heibox, we need to use the heibox URL
+        get_production_data(
+            url=data["url"],
+            filename=data["filename"],
+            filehash=data["filehash"],
+            outputdir=Path(config["datalake"][data_level]),
+        )
+    else:
+        raise ValueError(f"Unknown host {data['host']} for data {data['filename']}")
+
+
 def main() -> None:
     """
     Main function to set up the production database and data lake.
@@ -220,18 +240,9 @@ def main() -> None:
                 f"File {data['filename']} already exists in the data lake \
                     at level {data_level}, skipping download."
             )
-        elif "local" in data["host"]:
-            # if the host is local, we can use the local path
-            data["url"] = str(Path(data["url"]).resolve())
-            print(f"Using local path {data['url']} for {data['filename']}")
-        elif "heibox" in data["host"]:
-            # if the host is heibox, we need to use the heibox URL
-            get_production_data(
-                url=data["url"],
-                filename=data["filename"],
-                filehash=data["filehash"],
-                outputdir=Path(config["datalake"][data_level]),
-            )
+        else:
+            get_data_files(data, config, data_level)
+
         if data["var_name"][0]["type"] == "R0":
             # set the path to the R0 data
             r0_path = Path(config["datalake"][data_level]) / data["filename"]
@@ -286,6 +297,10 @@ def main() -> None:
         conn.execute(
             text("ALTER TABLE var_value_nuts SET (autovacuum_enabled = true);")
         )
+
+    # Run VACUUM in autocommit mode (outside transaction)
+    with engine.connect() as conn:
+        conn = conn.execution_options(isolation_level="AUTOCOMMIT")
         conn.execute(text("VACUUM ANALYZE;"))
     print("Database vacuumed and ready.")
 
