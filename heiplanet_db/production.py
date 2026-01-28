@@ -234,7 +234,9 @@ def main() -> None:
         # set the data level, default to bronze if not specified
         data_level = data["var_name"][0].get("level", "bronze")
         # check if the data is already in the data lake
-        path_to_file = Path(config["datalake"][data_level]) / data.get("filename", "")
+        path_to_file = (
+            Path(config["datalake"][data_level]) / data.get("filename", "")
+        ).resolve()
         if path_to_file.is_file():
             print(
                 f"File {data['filename']} already exists in the data lake \
@@ -245,16 +247,15 @@ def main() -> None:
 
         if data["var_name"][0]["type"] == "R0":
             # set the path to the R0 data
-            r0_path = Path(config["datalake"][data_level]) / data["filename"]
+            r0_path = path_to_file
             print(f"R0 data path: {r0_path}")
         elif data["var_name"][0]["type"] == "R0_nuts":
             # set the path to the R0 nuts data
-            r0_nuts_path = Path(config["datalake"][data_level]) / data["filename"]
+            r0_nuts_path = path_to_file
             print(f"R0 NUTS data path: {r0_nuts_path}")
         elif data["var_name"][0]["type"] == "definition":
             # extract file and set the path to the NUTS shapefiles
-            shapefile_path = Path(config["datalake"][data_level])
-            shapefile_path = shapefile_path / data["filename"]
+            shapefile_path = path_to_file
             # make sure the shapefile folder is unzipped
             shapefile_folder_path = shapefile_path.with_suffix("")
             with zipfile.ZipFile(shapefile_path, "r") as zip_ref:

@@ -626,6 +626,7 @@ def insert_var_types(session: Session, var_types: list[dict]):
 def get_id_maps(session: Session) -> tuple[dict, dict, dict]:
     """
     Get ID maps for grid points, time points, and variable types.
+    Uses streaming to avoid loading all data into memory at once.
 
     Args:
         session (Session): SQLAlchemy session object.
@@ -636,19 +637,50 @@ def get_id_maps(session: Session) -> tuple[dict, dict, dict]:
             - time_id_map: Mapping of datetime64 to time point ID.\n
             - var_id_map: Mapping of variable name to variable type ID.
     """
-    grid_points = session.query(
-        GridPoint.id, GridPoint.latitude, GridPoint.longitude
-    ).all()
-    grid_id_map = {(lat, lon): grid_id for grid_id, lat, lon in grid_points}
+    grid_id_map = {}
+    time_id_map = {}
+    var_id_map = {}
 
-    time_id_map = {
-        np.datetime64(pd.to_datetime(f"{row.year}-{row.month}-{row.day}"), "ns"): row.id
-        for row in session.query(TimePoint).all()
-    }
+    # Stream grid points in batches
+    grid_point_batch_size = 100000
+    for offset in range(0, session.query(GridPoint).count(), grid_point_batch_size):
+        grid_points = (
+            session.query(GridPoint.id, GridPoint.latitude, GridPoint.longitude)
+            .offset(offset)
+            .limit(grid_point_batch_size)
+            .all()
+        )
 
-    var_id_map = {row.name: row.id for row in session.query(VarType).all()}
+        for grid_id, lat, lon in grid_points:
+            grid_id_map[(lat, lon)] = grid_id
 
-    session.close()
+        session.expire_all()  # Clear session cache
+
+    # Stream time points in batches
+    time_point_batch_size = 10000
+    for offset in range(0, session.query(TimePoint).count(), time_point_batch_size):
+        time_points = (
+            session.query(TimePoint).offset(offset).limit(time_point_batch_size).all()
+        )
+
+        for row in time_points:
+            time_id_map[
+                np.datetime64(pd.to_datetime(f"{row.year}-{row.month}-{row.day}"), "ns")
+            ] = row.id
+
+        session.expire_all()
+
+    # Stream variable types in batches
+    var_type_batch_size = 1000
+    for offset in range(0, session.query(VarType).count(), var_type_batch_size):
+        var_types = (
+            session.query(VarType).offset(offset).limit(var_type_batch_size).all()
+        )
+
+        for row in var_types:
+            var_id_map[row.name] = row.id
+
+        session.expire_all()
 
     return grid_id_map, time_id_map, var_id_map
 
