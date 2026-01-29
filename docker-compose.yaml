@@ -1,7 +1,7 @@
 services:
 
   frontend:
-    image: ghcr.io/ssciwr/onehealth-map-frontend:get_region_metadata_from_db_api
+    image: ghcr.io/ssciwr/onehealth-map-frontend:today-fixups-from-main
     ports:
       - "80:80"
       - "443:443"
@@ -51,7 +51,7 @@ services:
 
   # FastAPI Application service (Stage 2)
   api:
-    image: ghcr.io/ssciwr/heiplanet-db:main
+    image: heiplanet-db
     build:
       context: .
       dockerfile: Dockerfile
@@ -70,7 +70,7 @@ services:
     profiles: ["api"]
 
   production-runner:
-    image: ghcr.io/ssciwr/heiplanet-db:main
+    image: heiplanet-db
     build:
       context: .
       dockerfile: Dockerfile

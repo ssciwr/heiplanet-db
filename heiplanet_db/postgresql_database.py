@@ -31,12 +31,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Type, Tuple, List
 from fastapi import HTTPException
 import json
-
+import gc
 
 CRS = 4326
 STR_POINT = "SRID={};POINT({} {})"
 BATCH_SIZE = 10000
 MAX_WORKERS = 4
+VAR_TIME_CHUNK = 6
+VAR_LAT_CHUNK = 45
+VAR_LON_CHUNK = 90
 
 
 # Base declarative class
@@ -713,6 +716,15 @@ def convert_yearly_to_monthly(ds: xr.Dataset) -> xr.Dataset:
     return ds.reindex(time=new_time_points, method="ffill")
 
 
+def insert_batch(batch: list[VarValue], engine: engine.Engine, VarClass: Type[Base]):
+    session = create_session(engine)
+    try:
+        add_data_list_bulk(session, batch, VarClass)
+        session.commit()
+    finally:
+        session.close()
+
+
 def insert_var_values(
     engine: engine.Engine,
     ds: xr.Dataset,
@@ -723,103 +735,113 @@ def insert_var_values(
     to_monthly: bool = False,
 ) -> tuple[float, float]:
     """Insert variable values into the database in streaming chunks."""
+
     if to_monthly:
         print(f"Converting {var_name} data from yearly to monthly...")
         ds = convert_yearly_to_monthly(ds)
     t_yearly_to_monthly = time.time()
 
     print(f"Prepare inserting {var_name} values...")
+
     var_id = var_id_map.get(var_name)
     if var_id is None:
         raise ValueError(f"Variable {var_name} not found in var_type table.")
 
-    # Vectorized mappers
-    def get_time_id_safe(t):
-        if len(np.atleast_1d(t)) == 0:
-            return []
-        return np.vectorize(
-            lambda tv: time_id_map.get(
-                np.datetime64(pd.Timestamp(tv).normalize(), "ns")
-            )
-        )(t)
-
-    def get_grid_id_safe(lats, lons):
-        if len(lats) == 0 or len(lons) == 0:
-            return []
-        return np.vectorize(lambda lat, lon: grid_id_map.get((lat, lon)))(lats, lons)
-
-    def insert_batch(batch):
-        session = create_session(engine)
-        add_data_list_bulk(session, batch, VarValue)
-        session.close()
-
     print(f"Start inserting {var_name} values in streaming chunks...")
     t_start_insert = time.time()
 
-    # Stream by time and latitude chunks to reduce peak memory
-    t_chunk = int(os.environ.get("VAR_TIME_CHUNK", "12"))
-    lat_chunk = int(os.environ.get("VAR_LAT_CHUNK", "90"))
+    t_chunk = int(os.environ.get("VAR_TIME_CHUNK", VAR_TIME_CHUNK))
+    lat_chunk = int(os.environ.get("VAR_LAT_CHUNK", VAR_LAT_CHUNK))
+    lon_chunk = int(os.environ.get("VAR_LON_CHUNK", VAR_LON_CHUNK))
 
     futures = []
+    total_values_inserted = 0
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         for t_idx in range(0, ds.sizes["time"], t_chunk):
             for lat_idx in range(0, ds.sizes["latitude"], lat_chunk):
-                # Load only this chunk
-                ds_chunk = ds.isel(
-                    time=slice(t_idx, min(t_idx + t_chunk, ds.sizes["time"])),
-                    latitude=slice(
-                        lat_idx, min(lat_idx + lat_chunk, ds.sizes["latitude"])
-                    ),
-                )
+                for lon_idx in range(0, ds.sizes["longitude"], lon_chunk):
+                    t_end = min(t_idx + t_chunk, ds.sizes["time"])
+                    lat_end = min(lat_idx + lat_chunk, ds.sizes["latitude"])
+                    lon_end = min(lon_idx + lon_chunk, ds.sizes["longitude"])
 
-                var_data = ds_chunk[var_name].load()
-                var_data = var_data.dropna(dim="latitude", how="all")
+                    ds_chunk = ds.isel(
+                        time=slice(t_idx, t_end),
+                        latitude=slice(lat_idx, lat_end),
+                        longitude=slice(lon_idx, lon_end),
+                    )
+                    var_data = ds_chunk[var_name].load()
+                    var_data = var_data.dropna(dim="latitude", how="all")
 
-                if var_data.size == 0:
-                    continue
+                    if var_data.size == 0:
+                        continue
 
-                # Stack and extract
-                stacked = var_data.stack(points=("time", "latitude", "longitude"))
-                stacked = stacked.dropna("points")
+                    times = var_data.time.values.astype("datetime64[ns]")
+                    lats = var_data.latitude.values
+                    lons = var_data.longitude.values
+                    values = var_data.values
 
-                time_vals = stacked["time"].values.astype("datetime64[ns]")
-                lat_vals = stacked["latitude"].values
-                lon_vals = stacked["longitude"].values
-                values = stacked.values.astype(float)
+                    if values.ndim != 3:
+                        continue
 
-                if len(time_vals) == 0:
-                    continue
+                    var_values = []
+                    # Loop order matches data dimensions: (lat, lon, time)
+                    for lat_i in range(len(lats)):
+                        lat_val = float(lats[lat_i])
+                        for lon_i in range(len(lons)):
+                            lon_val = float(lons[lon_i])
+                            for t_i in range(len(times)):
+                                t_val = times[t_i]
+                                ts = pd.Timestamp(t_val)
+                                time_key = np.datetime64(
+                                    pd.to_datetime(f"{ts.year}-{ts.month}-{ts.day}"),
+                                    "ns",
+                                )
 
-                # Map IDs
-                time_ids = get_time_id_safe(time_vals)
-                grid_ids = get_grid_id_safe(lat_vals, lon_vals)
+                                time_id = time_id_map.get(time_key)
+                                if time_id is None:
+                                    continue
 
-                # Build batch
-                var_values = [
-                    {
-                        "grid_id": int(gid),
-                        "time_id": int(tid),
-                        "var_id": int(var_id),
-                        "value": float(val),
-                    }
-                    for gid, tid, val in zip(grid_ids, time_ids, values)
-                    if not np.isnan(val) and (gid is not None) and (tid is not None)
-                ]
+                                val = float(
+                                    values[lat_i, lon_i, t_i]
+                                )  # Index matches loop order
 
-                if var_values:
-                    futures.append(executor.submit(insert_batch, var_values))
+                                if np.isnan(val):
+                                    continue
 
-                # Explicit cleanup
-                del var_data, stacked, time_vals, lat_vals, lon_vals, values
-                import gc
+                                grid_id = grid_id_map.get((lat_val, lon_val))
+                                if grid_id is not None:
+                                    var_values.append(
+                                        {
+                                            "grid_id": int(grid_id),
+                                            "time_id": int(time_id),
+                                            "var_id": int(var_id),
+                                            "value": float(val),
+                                        }
+                                    )
 
-                gc.collect()
+                    if var_values:
+                        for i in range(0, len(var_values), BATCH_SIZE // 2):
+                            batch = var_values[i : i + BATCH_SIZE // 2]
+                            future = executor.submit(
+                                insert_batch, batch, engine, VarValue
+                            )
+                            futures.append(future)
+                            total_values_inserted += len(batch)
 
-        # Wait for all futures
-        for _ in tqdm(as_completed(futures), total=len(futures)):
-            pass
+                    del var_data, var_values, times, lats, lons, values
+                    gc.collect()
 
-    print(f"Values of {var_name} inserted.")
+        # Wait for all futures to complete with timeout
+        print(f"Waiting for {len(futures)} batches to complete...")
+        for future in tqdm(as_completed(futures, timeout=300), total=len(futures)):
+            try:
+                future.result()  # Ensure exceptions are raised
+            except Exception as e:
+                print(f"Error in batch: {e}")
+                raise
+
+    print(f"Values of {var_name} inserted. Total: {total_values_inserted}")
     return t_yearly_to_monthly, t_start_insert
 
 
@@ -1534,13 +1556,6 @@ def insert_var_value_nuts(
         if mask and (nuts_id is not None) and (time_id is not None)
     ]
 
-    def insert_batch(batch):
-        """Insert a batch of data into the database."""
-        # create a new session for each batch
-        session = create_session(engine)
-        add_data_list_bulk(session, batch, VarValueNuts)
-        session.close()
-
     print(f"Start inserting {var_name} values for NUTS in parallel...")
     t_start_insert = time.time()
 
@@ -1549,7 +1564,7 @@ def insert_var_value_nuts(
         for i in range(0, len(var_values), BATCH_SIZE):
             e_batch = i + BATCH_SIZE
             batch = var_values[i:e_batch]
-            futures.append(executor.submit(insert_batch, batch))
+            futures.append(executor.submit(insert_batch, batch, engine, VarValueNuts))
 
         for _ in tqdm(as_completed(futures), total=len(futures)):
             pass

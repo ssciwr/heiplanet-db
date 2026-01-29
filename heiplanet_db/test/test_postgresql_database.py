@@ -549,7 +549,11 @@ def test_insert_var_values_to_monthly(get_engine_with_tables, get_dataset):
 
     # check if the data is inserted correctly
     session2 = postdb.create_session(get_engine_with_tables)
-    result = session2.query(postdb.VarValue).all()
+    result = (
+        session2.query(postdb.VarValue)
+        .order_by(postdb.VarValue.grid_id, postdb.VarValue.time_id)
+        .all()
+    )
     assert len(result) == 144
     assert result[0].grid_id == 1
     assert result[0].time_id == 1
