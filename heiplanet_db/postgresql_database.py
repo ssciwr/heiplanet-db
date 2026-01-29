@@ -785,26 +785,27 @@ def insert_var_values(
                         continue
 
                     var_values = []
-                    # Loop order matches data dimensions: (lat, lon, time)
-                    for lat_i in range(len(lats)):
-                        lat_val = float(lats[lat_i])
-                        for lon_i in range(len(lons)):
-                            lon_val = float(lons[lon_i])
-                            for t_i in range(len(times)):
-                                t_val = times[t_i]
-                                ts = pd.Timestamp(t_val)
-                                time_key = np.datetime64(
-                                    pd.to_datetime(f"{ts.year}-{ts.month}-{ts.day}"),
-                                    "ns",
-                                )
+                    # Loop order: time, lat, lon to match xarray dimension order (time, latitude, longitude)
+                    for t_i in range(len(times)):
+                        t_val = times[t_i]
+                        ts = pd.Timestamp(t_val)
+                        time_key = np.datetime64(
+                            pd.to_datetime(f"{ts.year}-{ts.month}-{ts.day}"),
+                            "ns",
+                        )
 
-                                time_id = time_id_map.get(time_key)
-                                if time_id is None:
-                                    continue
+                        time_id = time_id_map.get(time_key)
+                        if time_id is None:
+                            continue
+
+                        for lat_i in range(len(lats)):
+                            lat_val = float(lats[lat_i])
+                            for lon_i in range(len(lons)):
+                                lon_val = float(lons[lon_i])
 
                                 val = float(
-                                    values[lat_i, lon_i, t_i]
-                                )  # Index matches loop order
+                                    values[t_i, lat_i, lon_i]
+                                )  # Correct indexing order
 
                                 if np.isnan(val):
                                     continue
