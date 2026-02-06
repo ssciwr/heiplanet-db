@@ -754,10 +754,49 @@ def insert_var_values(
     lat_chunk = int(os.environ.get("VAR_LAT_CHUNK", VAR_LAT_CHUNK))
     lon_chunk = int(os.environ.get("VAR_LON_CHUNK", VAR_LON_CHUNK))
 
+    generate_threaded_inserts(
+        t_chunk,
+        lat_chunk,
+        lon_chunk,
+        ds,
+        var_name,
+        grid_id_map,
+        time_id_map,
+        var_id,
+        engine,
+    )
+
+    return t_yearly_to_monthly, t_start_insert
+
+
+def generate_threaded_inserts(
+    t_chunk: int,
+    lat_chunk: int,
+    lon_chunk: int,
+    ds: xr.Dataset,
+    var_name: str,
+    grid_id_map: dict,
+    time_id_map: dict,
+    var_id: int,
+    engine: engine.Engine,
+) -> int:
+    """Generate threaded inserts for variable values.
+
+    Args:
+        t_chunk (int): Time chunk size.
+        lat_chunk (int): Latitude chunk size.
+        lon_chunk (int): Longitude chunk size.
+        ds (xr.Dataset): xarray dataset.
+        var_name (str): Variable name.
+        grid_id_map (dict): Grid ID map.
+        time_id_map (dict): Time ID map.
+        var_id (int): Variable ID.
+        engine (engine.Engine): SQLAlchemy engine object.
+    """
     futures = []
     total_values_inserted = 0
-
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # the dimenson is (time, latitude, longitude)
         for t_idx in range(0, ds.sizes["time"], t_chunk):
             for lat_idx in range(0, ds.sizes["latitude"], lat_chunk):
                 for lon_idx in range(0, ds.sizes["longitude"], lon_chunk):
@@ -771,56 +810,27 @@ def insert_var_values(
                         longitude=slice(lon_idx, lon_end),
                     )
                     var_data = ds_chunk[var_name].load()
+                    # drop all empty latitude rows
                     var_data = var_data.dropna(dim="latitude", how="all")
-
+                    # skip inserting if the chunk is empty
                     if var_data.size == 0:
                         continue
 
+                    # make sure time has the correct format for db insertion
+                    # so that values can be requested correctly later
                     times = var_data.time.values.astype("datetime64[ns]")
                     lats = var_data.latitude.values
                     lons = var_data.longitude.values
                     values = var_data.values
 
+                    # skip insertion if chunk is somehow corrupted
+                    # I think this case should not happen
+                    # maybe this is where the values go missing
                     if values.ndim != 3:
                         continue
-
-                    var_values = []
-                    # Loop order: time, lat, lon to match xarray dimension order (time, latitude, longitude)
-                    for t_i in range(len(times)):
-                        t_val = times[t_i]
-                        ts = pd.Timestamp(t_val)
-                        time_key = np.datetime64(
-                            pd.to_datetime(f"{ts.year}-{ts.month}-{ts.day}"),
-                            "ns",
-                        )
-
-                        time_id = time_id_map.get(time_key)
-                        if time_id is None:
-                            continue
-
-                        for lat_i in range(len(lats)):
-                            lat_val = float(lats[lat_i])
-                            for lon_i in range(len(lons)):
-                                lon_val = float(lons[lon_i])
-
-                                val = float(
-                                    values[t_i, lat_i, lon_i]
-                                )  # Correct indexing order
-
-                                if np.isnan(val):
-                                    continue
-
-                                grid_id = grid_id_map.get((lat_val, lon_val))
-                                if grid_id is not None:
-                                    var_values.append(
-                                        {
-                                            "grid_id": int(grid_id),
-                                            "time_id": int(time_id),
-                                            "var_id": int(var_id),
-                                            "value": float(val),
-                                        }
-                                    )
-
+                    var_values = get_var_values_mapping(
+                        times, time_id_map, grid_id_map, var_id, lats, lons, values
+                    )
                     if var_values:
                         for i in range(0, len(var_values), BATCH_SIZE // 2):
                             batch = var_values[i : i + BATCH_SIZE // 2]
@@ -843,7 +853,63 @@ def insert_var_values(
                 raise
 
     print(f"Values of {var_name} inserted. Total: {total_values_inserted}")
-    return t_yearly_to_monthly, t_start_insert
+
+
+def get_var_values_mapping(
+    times: np.ndarray,
+    time_id_map: dict,
+    grid_id_map: dict,
+    var_id: int,
+    lats: np.ndarray,
+    lons: np.ndarray,
+    values: np.ndarray,
+) -> list[dict]:
+    """Get variable values mapping for database insertion.
+
+    Args:
+        times (np.ndarray): Array of time points.
+        time_id_map (dict): Mapping of datetime64 to time point ID.
+        grid_id_map (dict): Mapping of (latitude, longitude) to grid point ID.
+        var_id (int): Variable type ID.
+        lats (np.ndarray): Array of latitudes.
+        lons (np.ndarray): Array of longitudes.
+        values (np.ndarray): Array of variable values.
+    Returns:
+        list[dict]: List of variable values mapping for database insertion.
+    """
+    var_values = []
+    # Loop order: time, lat, lon to match xarray dimension order (time, latitude, longitude)
+    for t_i in range(len(times)):
+        t_val = times[t_i]
+        ts = pd.Timestamp(t_val)
+        time_key = np.datetime64(pd.to_datetime(f"{ts.year}-{ts.month}-{ts.day}"), "ns")
+        print(
+            f"Missing time_id for {time_key}. Available keys sample: {list(time_id_map.keys())[:5]}"
+        )
+        time_id = time_id_map.get(time_key)
+        if time_id is None:
+            continue
+        for lat_i in range(len(lats)):
+            lat_val = float(lats[lat_i])
+            for lon_i in range(len(lons)):
+                lon_val = float(lons[lon_i])
+                val = float(values[t_i, lat_i, lon_i])  # Correct indexing order
+                if np.isnan(val):
+                    continue
+                grid_id = grid_id_map.get((lat_val, lon_val))
+                if grid_id is None:
+                    print(f"Missing grid_id for ({lat_val}, {lon_val})")
+
+                if grid_id is not None:
+                    var_values.append(
+                        {
+                            "grid_id": int(grid_id),
+                            "time_id": int(time_id),
+                            "var_id": int(var_id),
+                            "value": float(val),
+                        }
+                    )
+    return var_values
 
 
 def get_var_value(
