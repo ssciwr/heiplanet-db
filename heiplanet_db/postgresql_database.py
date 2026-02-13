@@ -806,6 +806,8 @@ def generate_threaded_inserts(
         time_id_map (dict): Time ID map.
         var_id (int): Variable ID.
         engine (engine.Engine): SQLAlchemy engine object.
+    Returns:
+        int: Total number of variable values inserted.
     """
     futures = []
     total_values_inserted = 0
@@ -871,6 +873,7 @@ def generate_threaded_inserts(
                 raise
 
     print(f"Values of {var_name} inserted. Total: {total_values_inserted}")
+    return total_values_inserted
 
 
 def get_var_values_mapping(

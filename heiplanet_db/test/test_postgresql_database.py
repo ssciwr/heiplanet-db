@@ -10,6 +10,7 @@ from shapely.geometry import Polygon
 import math
 from fastapi import HTTPException
 from conftest import cleanup
+import pandas as pd
 
 
 # for local docker desktop,
@@ -528,6 +529,137 @@ def test_insert_var_values_to_monthly(get_engine_with_tables, get_dataset, get_s
     assert result[0].time_id == 1
     assert result[0].var_id == 1
     assert result[0].value == result[6].value  # same year, different month
+
+
+def _build_cartesian_ds(var_name: str = "t2m", fill_nan: bool = False) -> xr.Dataset:
+    times = np.array(["2023-01-01", "2023-02-01"], dtype="datetime64[ns]")
+    lats = np.array([10.1, 10.2], dtype=float)
+    lons = np.array([10.1, 10.2, 10.3], dtype=float)
+
+    if fill_nan:
+        values = np.full((2, 2, 3), np.nan, dtype=float)
+    else:
+        values = np.arange(12, dtype=float).reshape(2, 2, 3)
+
+    return xr.Dataset(
+        {var_name: (("time", "latitude", "longitude"), values)},
+        coords={"time": times, "latitude": lats, "longitude": lons},
+    )
+
+
+def _build_maps():
+    # (2 lats * 3 lons) grid
+    grid_id_map = {}
+    gid = 1
+    for lat in [10.1, 10.2]:
+        for lon in [10.1, 10.2, 10.3]:
+            grid_id_map[(round(lat, 4), round(lon, 4))] = gid
+            gid += 1
+
+    time_id_map = {
+        np.datetime64(pd.Timestamp("2023-01-01"), "ns"): 1,
+        np.datetime64(pd.Timestamp("2023-02-01"), "ns"): 2,
+    }
+    return grid_id_map, time_id_map
+
+
+def test_generate_threaded_inserts_success(monkeypatch):
+    ds = _build_cartesian_ds()
+    grid_id_map, time_id_map = _build_maps()
+
+    calls = []
+
+    def _fake_insert_batch(batch, engine, var_cls):
+        calls.append(len(batch))
+
+    monkeypatch.setattr(postdb, "insert_batch", _fake_insert_batch)
+    monkeypatch.setattr(postdb, "tqdm", lambda it, total=None: it)
+    monkeypatch.setattr(postdb, "BATCH_SIZE", 4)  # internal uses BATCH_SIZE//2 => 2
+
+    total = postdb.generate_threaded_inserts(
+        t_chunk=10,
+        lat_chunk=10,
+        lon_chunk=10,
+        ds=ds,
+        var_name="t2m",
+        grid_id_map=grid_id_map,
+        time_id_map=time_id_map,
+        var_id=1,
+        engine=object(),
+    )
+
+    assert total == 12
+    assert sum(calls) == 12
+    assert len(calls) == 6  # 12 rows in batches of 2
+
+
+def test_generate_threaded_inserts_edge_empty_chunk(monkeypatch):
+    ds = _build_cartesian_ds(fill_nan=True)
+    grid_id_map, time_id_map = _build_maps()
+
+    called = {"n": 0}
+
+    def _fake_insert_batch(batch, engine, var_cls):
+        called["n"] += 1
+
+    monkeypatch.setattr(postdb, "insert_batch", _fake_insert_batch)
+    monkeypatch.setattr(postdb, "tqdm", lambda it, total=None: it)
+
+    total = postdb.generate_threaded_inserts(
+        t_chunk=10,
+        lat_chunk=10,
+        lon_chunk=10,
+        ds=ds,
+        var_name="t2m",
+        grid_id_map=grid_id_map,
+        time_id_map=time_id_map,
+        var_id=1,
+        engine=object(),
+    )
+
+    assert total == 0
+    assert called["n"] == 0
+
+
+def test_generate_threaded_inserts_edge_missing_ids_and_worker_error(monkeypatch):
+    ds = _build_cartesian_ds()
+    grid_id_map, time_id_map = _build_maps()
+
+    # missing IDs -> no inserts
+    monkeypatch.setattr(postdb, "insert_batch", lambda batch, engine, var_cls: None)
+    monkeypatch.setattr(postdb, "tqdm", lambda it, total=None: it)
+
+    total = postdb.generate_threaded_inserts(
+        t_chunk=10,
+        lat_chunk=10,
+        lon_chunk=10,
+        ds=ds,
+        var_name="t2m",
+        grid_id_map={},  # missing all grid ids
+        time_id_map={},  # missing all time ids
+        var_id=1,
+        engine=object(),
+    )
+    assert total == 0
+
+    # worker failure should propagate
+    def _raise_insert_batch(batch, engine, var_cls):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(postdb, "insert_batch", _raise_insert_batch)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        postdb.generate_threaded_inserts(
+            t_chunk=10,
+            lat_chunk=10,
+            lon_chunk=10,
+            ds=ds,
+            var_name="t2m",
+            grid_id_map=grid_id_map,
+            time_id_map=time_id_map,
+            var_id=1,
+            engine=object(),
+        )
 
 
 def test_get_var_value(get_session):
