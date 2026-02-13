@@ -9,7 +9,7 @@ import geopandas as gpd
 from shapely.geometry import Polygon
 import math
 from fastapi import HTTPException
-from conftest import cleanup, retrieve_id_maps
+from conftest import cleanup
 
 
 # for local docker desktop,
@@ -218,16 +218,15 @@ def test_add_data_list_bulk_empty(get_session):
 def test_add_data_list_bulk_invalid(get_session, capsys):
     # non unique name
     data_list = [{"name": "test_var", "unit": "1"}, {"name": "test_var", "unit": "1"}]
-    postdb.add_data_list_bulk(get_session, data_list, postdb.VarType)
-    captured = capsys.readouterr()
-    assert "Error inserting data:" in captured.out
+    with pytest.raises(RuntimeError):
+        postdb.add_data_list_bulk(get_session, data_list, postdb.VarType)
+    assert get_session.query(postdb.VarType).count() == 0
 
     # missing required fields
     data_list = [{"name": "test_var"}]
-    postdb.add_data_list_bulk(get_session, data_list, postdb.VarType)
-    captured = capsys.readouterr()
-    assert "Error inserting data:" in captured.out
-
+    with pytest.raises(RuntimeError):
+        postdb.add_data_list_bulk(get_session, data_list, postdb.VarType)
+    assert get_session.query(postdb.VarType).count() == 0
     # invalid data type
     # there is no exception raised for this case
     # TODO check it again
@@ -422,18 +421,15 @@ def test_insert_var_types(get_session, get_var_type_list):
     get_session.commit()
 
 
-def test_get_id_maps(get_session, get_dataset, get_var_type_list):
-    # get the id maps
-    grid_id_map, time_id_map, var_id_map = retrieve_id_maps(
-        get_session, get_dataset, get_var_type_list
-    )
+def test_get_id_maps(get_session, insert_data):
+    grid_id_map, time_id_map, var_id_map = postdb.get_id_maps(get_session)
 
     assert len(grid_id_map) == 6
     assert grid_id_map[(10.1, 10.1)] == 1
     assert len(time_id_map) == 2
     assert time_id_map[np.datetime64("2023-01-01", "ns")] == 1
-    assert len(var_id_map) == 2
-    assert var_id_map["test_var"] == 1
+    assert len(var_id_map) == 1
+    assert var_id_map["t2m"] == 1
 
     # clean up
     get_session.execute(text("TRUNCATE TABLE grid_point RESTART IDENTITY CASCADE"))
@@ -443,31 +439,22 @@ def test_get_id_maps(get_session, get_dataset, get_var_type_list):
 
 
 def test_convert_monthly_to_yearly(get_dataset):
-    assert get_dataset.sizes == {"latitude": 2, "longitude": 3, "time": 2}
+    assert get_dataset.sizes == {"time": 2, "latitude": 2, "longitude": 3}
     monthly_dataset = postdb.convert_yearly_to_monthly(get_dataset)
-    assert monthly_dataset.sizes == {"latitude": 2, "longitude": 3, "time": 24}
-    assert monthly_dataset.t2m.shape == (2, 3, 24)
+    assert monthly_dataset.sizes == {"time": 24, "latitude": 2, "longitude": 3}
+    assert monthly_dataset.t2m.shape == (24, 2, 3)
     assert monthly_dataset.t2m[0, 0, 0] == get_dataset.t2m[0, 0, 0]
-    assert monthly_dataset.t2m[0, 0, 1] == get_dataset.t2m[0, 0, 0]
-    assert monthly_dataset.t2m[0, 0, 2] == get_dataset.t2m[0, 0, 0]
-    assert monthly_dataset.t2m[0, 0, 11] == get_dataset.t2m[0, 0, 0]
-    assert monthly_dataset.t2m[0, 0, 12] == get_dataset.t2m[0, 0, 1]
+    assert monthly_dataset.t2m[1, 0, 0] == get_dataset.t2m[0, 0, 0]
+    assert monthly_dataset.t2m[2, 0, 0] == get_dataset.t2m[0, 0, 0]
+    assert monthly_dataset.t2m[11, 0, 0] == get_dataset.t2m[0, 0, 0]
+    assert monthly_dataset.t2m[12, 0, 0] == get_dataset.t2m[1, 0, 0]
 
 
-def test_insert_var_values_no_to_monthly(get_engine_with_tables, get_dataset):
-    var_type_data = [
-        {
-            "name": "t2m",
-            "unit": "K",
-            "description": "2m temperature",
-        }
-    ]
+def test_insert_var_values_no_to_monthly(
+    get_session, get_engine_with_tables, get_dataset, seed_base_data
+):
     # get the id maps
-    session1 = postdb.create_session(get_engine_with_tables)
-    grid_id_map, time_id_map, var_id_map = retrieve_id_maps(
-        session1, get_dataset, var_type_data
-    )
-    session1.close()
+    grid_id_map, time_id_map, var_id_map = postdb.get_id_maps(get_session)
 
     # insert var values
     postdb.insert_var_values(
@@ -489,53 +476,36 @@ def test_insert_var_values_no_to_monthly(get_engine_with_tables, get_dataset):
     assert result[0].var_id == 1
     session2.close()
 
-    # clean up
-    postdb.Base.metadata.drop_all(get_engine_with_tables)
-    postdb.Base.metadata.create_all(get_engine_with_tables)
-
 
 def test_insert_var_values_no_to_monthly_no_var(
-    get_engine_with_tables, get_dataset, get_var_type_list
+    get_engine_with_tables, get_dataset, get_session, seed_base_data
 ):
     # get the id maps
-    session1 = postdb.create_session(get_engine_with_tables)
-    grid_id_map, time_id_map, var_id_map = retrieve_id_maps(
-        session1, get_dataset, get_var_type_list
-    )
-    session1.close()
+    grid_id_map, time_id_map, var_id_map = postdb.get_id_maps(get_session)
 
-    # error due to no t2m var type
+    # error due to no test_var var type
     with pytest.raises(ValueError):
         postdb.insert_var_values(
             get_engine_with_tables,
             get_dataset,
-            "t2m",
+            "test_var",
             grid_id_map,
             time_id_map,
             var_id_map,
             to_monthly=False,
         )
 
-    # clean up
-    postdb.Base.metadata.drop_all(get_engine_with_tables)
-    postdb.Base.metadata.create_all(get_engine_with_tables)
 
-
-def test_insert_var_values_to_monthly(get_engine_with_tables, get_dataset):
-    var_type_data = [
-        {
-            "name": "t2m",
-            "unit": "K",
-            "description": "2m temperature",
-        }
-    ]
-    # get the id maps
-    session1 = postdb.create_session(get_engine_with_tables)
-    grid_id_map, time_id_map, var_id_map = retrieve_id_maps(
-        session1, get_dataset, var_type_data, to_monthly=True
+def test_insert_var_values_to_monthly(get_engine_with_tables, get_dataset, get_session):
+    postdb.insert_var_types(
+        get_session, [{"name": "t2m", "unit": "K", "description": "2m temperature"}]
     )
-    session1.close()
-
+    postdb.insert_grid_points(
+        get_session, get_dataset.latitude.values, get_dataset.longitude.values
+    )
+    postdb.insert_time_points(get_session, [(get_dataset.time.values, True)])
+    # get the id maps
+    grid_id_map, time_id_map, var_id_map = postdb.get_id_maps(get_session)
     # insert var values
     postdb.insert_var_values(
         get_engine_with_tables,
@@ -548,9 +518,8 @@ def test_insert_var_values_to_monthly(get_engine_with_tables, get_dataset):
     )
 
     # check if the data is inserted correctly
-    session2 = postdb.create_session(get_engine_with_tables)
     result = (
-        session2.query(postdb.VarValue)
+        get_session.query(postdb.VarValue)
         .order_by(postdb.VarValue.grid_id, postdb.VarValue.time_id)
         .all()
     )
@@ -559,11 +528,6 @@ def test_insert_var_values_to_monthly(get_engine_with_tables, get_dataset):
     assert result[0].time_id == 1
     assert result[0].var_id == 1
     assert result[0].value == result[6].value  # same year, different month
-    session2.close()
-
-    # clean up
-    postdb.Base.metadata.drop_all(get_engine_with_tables)
-    postdb.Base.metadata.create_all(get_engine_with_tables)
 
 
 def test_get_var_value(get_session):
@@ -606,13 +570,6 @@ def test_get_var_value(get_session):
         time_point.day,
     )
     assert result is None
-
-    # clean up
-    get_session.execute(text("TRUNCATE TABLE var_value RESTART IDENTITY CASCADE"))
-    get_session.execute(text("TRUNCATE TABLE var_type RESTART IDENTITY CASCADE"))
-    get_session.execute(text("TRUNCATE TABLE time_point RESTART IDENTITY CASCADE"))
-    get_session.execute(text("TRUNCATE TABLE grid_point RESTART IDENTITY CASCADE"))
-    get_session.commit()
 
 
 def test_get_var_value_nuts(
@@ -667,13 +624,6 @@ def test_get_var_value_nuts(
     )
     assert result is None
 
-    # clean up
-    get_session.execute(text("TRUNCATE TABLE var_value RESTART IDENTITY CASCADE"))
-    get_session.execute(text("TRUNCATE TABLE var_type RESTART IDENTITY CASCADE"))
-    get_session.execute(text("TRUNCATE TABLE time_point RESTART IDENTITY CASCADE"))
-    get_session.execute(text("TRUNCATE TABLE nuts_def RESTART IDENTITY CASCADE"))
-    get_session.commit()
-
 
 def test_get_time_points(get_session, get_dataset):
     # insert time points
@@ -700,9 +650,6 @@ def test_get_time_points(get_session, get_dataset):
     # test with no time points
     result = postdb.get_time_points(get_session, start_time_point=(2025, 1))
     assert len(result) == 0
-
-    # clean up
-    get_session.execute(text("TRUNCATE TABLE time_point RESTART IDENTITY CASCADE"))
     get_session.commit()
 
 
@@ -728,10 +675,6 @@ def test_get_grid_points(get_session, get_dataset):
     # no grid points case
     result = postdb.get_grid_points(get_session, area=(20.0, 20.0, 20.0, 20.0))
     assert len(result) == 0
-
-    # clean up
-    get_session.execute(text("TRUNCATE TABLE grid_point RESTART IDENTITY CASCADE"))
-    get_session.commit()
 
 
 def test_get_var_types(get_session):
@@ -760,17 +703,19 @@ def test_get_var_types(get_session):
     result = postdb.get_var_types(get_session, var_names=["non_existing_var"])
     assert len(result) == 0
 
-    # clean up
-    get_session.execute(text("TRUNCATE TABLE var_type RESTART IDENTITY CASCADE"))
-    get_session.commit()
-
 
 def test_sort_grid_points_get_ids(get_session, get_dataset, insert_data):
     grid_points = get_session.query(postdb.GridPoint).all()
     grid_ids, latitudes, longitudes = postdb.sort_grid_points_get_ids(grid_points)
     assert len(grid_ids) == 6  # 2 latitudes * 3 longitudes
-    assert latitudes == [10.1, 10.2]
-    assert longitudes == [10.1, 10.2, 10.3]
+    assert all(
+        math.isclose(lat, ref, abs_tol=1e-5)
+        for lat, ref in zip(latitudes, [10.1000, 10.2000])
+    )
+    assert all(
+        math.isclose(lon, ref, abs_tol=1e-5)
+        for lon, ref in zip(longitudes, [10.1000, 10.2000, 10.3000])
+    )
     # check if the ids are correct
     assert grid_ids[1] == (0, 0)
     assert grid_ids[4] == (1, 0)
@@ -786,8 +731,8 @@ def test_get_var_values_cartesian(insert_data):
     )
     assert len(ds_result["latitude, longitude, var_value"]) == 6
     values = ds_result["latitude, longitude, var_value"][0]
-    assert math.isclose(values[0], 10.1, abs_tol=1e-5)
-    assert math.isclose(values[1], 10.1, abs_tol=1e-5)
+    assert math.isclose(values[0], 10.1000, abs_tol=1e-5)
+    assert math.isclose(values[1], 10.1000, abs_tol=1e-5)
 
     # with default var and full map
     ds_result = postdb.get_var_values_cartesian(
@@ -854,8 +799,9 @@ def test_get_var_values_cartesian_download(get_dataset, insert_data, tmp_path):
     assert len(ds_result.longitude) == 3
     assert len(ds_result.time) == 1
     assert ds_result.t2m.shape == (1, 2, 3)
+    print(ds_result.t2m[0, 0, 0], get_dataset.t2m[0, 0, 0])
     assert math.isclose(ds_result.t2m[0, 0, 0], get_dataset.t2m[0, 0, 0], abs_tol=1e-5)
-    assert math.isclose(ds_result.t2m[0, 1, 1], get_dataset.t2m[1, 1, 0], abs_tol=1e-5)
+    assert math.isclose(ds_result.t2m[0, 1, 1], get_dataset.t2m[0, 1, 1], abs_tol=1e-5)
     # remove the file after test
     netcdf_filename.unlink()
     # with end point
@@ -966,10 +912,6 @@ def test_get_nuts_regions(
     assert result.loc[2, "nuts_id"] == "DE501"
     assert result.loc[2, "name_latn"] == "Test NUTS3"
 
-    # clean up
-    get_session.execute(text("TRUNCATE TABLE nuts_def RESTART IDENTITY CASCADE"))
-    get_session.commit()
-
 
 def test_get_nuts_regions_geojson(
     get_engine_with_tables, get_session, tmp_path, get_nuts_def_data
@@ -1038,10 +980,6 @@ def test_get_grid_ids_in_nuts(get_engine_with_tables, get_session):
     )
     assert len(grid_ids) == 0
 
-    # clean up
-    get_session.execute(text("TRUNCATE TABLE grid_point RESTART IDENTITY CASCADE"))
-    get_session.commit()
-
 
 def test_filter_nuts_ids_for_resolution():
     nuts_ids = ["DE", "DE11", "DE1", "TR2", "TR22"]
@@ -1066,7 +1004,6 @@ def test_get_var_values_nuts(
     get_session,
     tmp_path,
     get_nuts_def_data,
-    get_dataset,
     get_varnuts_dataset,
 ):
     # create a sample NUTS shapefile
@@ -1084,11 +1021,13 @@ def test_get_var_values_nuts(
             "description": "2m temperature",
         }
     ]
+    # insert the time points
+    postdb.insert_time_points(get_session, [(get_varnuts_dataset.time.values, False)])
+    # insert the var type
+    postdb.insert_var_types(get_session, var_type_data)
 
     # get the id maps
-    session1 = postdb.create_session(get_engine_with_tables)
-    _, time_id_map, var_id_map = retrieve_id_maps(session1, get_dataset, var_type_data)
-    session1.close()
+    _, time_id_map, var_id_map = postdb.get_id_maps(get_session)
 
     # insert var value
     postdb.insert_var_value_nuts(
@@ -1144,24 +1083,20 @@ def test_get_var_values_nuts(
             grid_resolution="NUTS0",
         )
     #
-    # # clean up
-    get_session.execute(text("TRUNCATE TABLE var_value RESTART IDENTITY CASCADE"))
-    get_session.execute(text("TRUNCATE TABLE var_type RESTART IDENTITY CASCADE"))
-    get_session.execute(text("TRUNCATE TABLE time_point RESTART IDENTITY CASCADE"))
-    get_session.execute(text("TRUNCATE TABLE grid_point RESTART IDENTITY CASCADE"))
-    get_session.execute(text("TRUNCATE TABLE nuts_def RESTART IDENTITY CASCADE"))
-    get_session.commit()
 
 
 def test_insert_var_value_nuts_no_var(
-    get_engine_with_tables, get_var_type_list, get_dataset, get_varnuts_dataset
+    get_engine_with_tables,
+    get_session,
+    get_varnuts_dataset,
+    tmp_path,
+    get_nuts_def_data,
 ):
+    # insert the time points
+    postdb.insert_time_points(get_session, [(get_varnuts_dataset.time.values, False)])
+
     # get the id maps
-    session1 = postdb.create_session(get_engine_with_tables)
-    _, time_id_map, var_id_map = retrieve_id_maps(
-        session1, get_dataset, get_var_type_list
-    )
-    session1.close()
+    _, time_id_map, var_id_map = postdb.get_id_maps(get_session)
 
     # error due to no t2m var type
     with pytest.raises(ValueError):
@@ -1173,17 +1108,14 @@ def test_insert_var_value_nuts_no_var(
             var_id_map=var_id_map,
         )
 
-    # clean up
-    postdb.Base.metadata.drop_all(get_engine_with_tables)
-    postdb.Base.metadata.create_all(get_engine_with_tables)
-
 
 def test_insert_var_value_nuts(
     get_engine_with_tables,
-    get_dataset,
+    get_session,
     get_varnuts_dataset,
     get_nuts_def_data,
     tmp_path,
+    seed_base_data,
 ):
     # create a sample NUTS shapefile
     nuts_path = tmp_path / "nuts_def.shp"
@@ -1193,40 +1125,22 @@ def test_insert_var_value_nuts(
     # insert NUTS definitions
     postdb.insert_nuts_def(get_engine_with_tables, nuts_path)
 
-    var_type_data = [
-        {
-            "name": "t2m_mean",
-            "unit": "K",
-            "description": "2m temperature",
-        }
-    ]
-
     # get the id maps
-    session1 = postdb.create_session(get_engine_with_tables)
-    _, time_id_map, var_id_map = retrieve_id_maps(session1, get_dataset, var_type_data)
-    session1.close()
+    _, time_id_map, var_id_map = postdb.get_id_maps(get_session)
 
     # insert var value
     postdb.insert_var_value_nuts(
         get_engine_with_tables,
         get_varnuts_dataset,
-        var_name="t2m_mean",
+        var_name="t2m",
         time_id_map=time_id_map,
         var_id_map=var_id_map,
     )
 
     # check if the data is inserted correctly
-    session2 = postdb.create_session(get_engine_with_tables)
-    result = session2.query(postdb.VarValueNuts).all()
+    result = get_session.query(postdb.VarValueNuts).all()
     assert len(result) == 6
     assert result[0].nuts_id == "DE11"
     assert result[0].time_id == 1
     assert result[0].var_id == 1
-    assert math.isclose(
-        result[0].value, get_varnuts_dataset.t2m_mean[0, 0], abs_tol=1e-5
-    )
-    session2.close()
-
-    # clean up
-    postdb.Base.metadata.drop_all(get_engine_with_tables)
-    postdb.Base.metadata.create_all(get_engine_with_tables)
+    assert math.isclose(result[0].value, get_varnuts_dataset.t2m[0, 0], abs_tol=1e-5)

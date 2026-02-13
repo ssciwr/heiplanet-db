@@ -391,7 +391,7 @@ def add_data_list_bulk(session: Session, data_dict_list: list, class_type: Type[
         session.expire_all()  # clear identity map
     except SQLAlchemyError as e:
         session.rollback()
-        print(f"Error inserting data: {e}")
+        raise RuntimeError(f"Error inserting data: {e}")
 
 
 def insert_grid_points(session: Session, latitudes: np.ndarray, longitudes: np.ndarray):
@@ -1162,8 +1162,8 @@ def sort_grid_points_get_ids(
     grid_points: List[GridPoint],
 ) -> tuple[dict, list[float], list[float]]:
     # Sort and deduplicate latitudes and longitudes
-    latitudes = sorted({gp.latitude for gp in grid_points})
-    longitudes = sorted({gp.longitude for gp in grid_points})
+    latitudes = sorted({_q(gp.latitude) for gp in grid_points})
+    longitudes = sorted({_q(gp.longitude) for gp in grid_points})
 
     # Create fast index maps for latitude and longitude
     lat_to_index = {lat: i for i, lat in enumerate(latitudes)}
@@ -1171,7 +1171,7 @@ def sort_grid_points_get_ids(
 
     # Map grid_id to (lat_index, lon_index)
     grid_ids = {
-        gp.id: (lat_to_index[gp.latitude], lon_to_index[gp.longitude])
+        gp.id: (lat_to_index[_q(gp.latitude)], lon_to_index[_q(gp.longitude)])
         for gp in grid_points
     }
     return grid_ids, latitudes, longitudes
@@ -1323,6 +1323,11 @@ def get_var_values_cartesian_for_download(
     # Sort and deduplicate latitudes and longitudes
     grid_ids, latitudes, longitudes = sort_grid_points_get_ids(grid_points)
 
+    # Force netCDF-safe coordinate dtypes
+    time_values = np.asarray(time_values, dtype="datetime64[ns]")
+    latitudes = np.asarray(latitudes, dtype=np.float64)
+    longitudes = np.asarray(longitudes, dtype=np.float64)
+
     # get variable types and their ids
     var_types = get_var_types(session, var_names)
     if not var_types:
@@ -1355,7 +1360,9 @@ def get_var_values_cartesian_for_download(
 
         # dummy values array
         values_array = np.full(
-            (len(time_values), len(latitudes), len(longitudes)), np.nan
+            (len(time_values), len(latitudes), len(longitudes)),
+            np.nan,
+            dtype=np.float64,
         )
 
         # fill the values array with the variable values
