@@ -40,6 +40,11 @@ MAX_WORKERS = 4
 VAR_TIME_CHUNK = 6
 VAR_LAT_CHUNK = 45
 VAR_LON_CHUNK = 90
+ROUND_DIGITS = 4
+
+
+def _q(x: float) -> float:
+    return round(float(x), ROUND_DIGITS)
 
 
 # Base declarative class
@@ -76,8 +81,8 @@ class GridPoint(Base):
     __tablename__ = "grid_point"
 
     id: Mapped[int] = mapped_column(Integer(), primary_key=True, autoincrement=True)
-    latitude: Mapped[float] = mapped_column(Float())
-    longitude: Mapped[float] = mapped_column(Float())
+    latitude: Mapped[float] = mapped_column(Numeric(precision=8, scale=4))
+    longitude: Mapped[float] = mapped_column(Numeric(precision=8, scale=4))
 
     # Geometry column for PostGIS
     point: Mapped[Geometry] = mapped_column(Geometry("POINT", srid=CRS), nullable=True)
@@ -415,9 +420,9 @@ def insert_grid_points(session: Session, latitudes: np.ndarray, longitudes: np.n
             # Build batch
             grid_points = [
                 {
-                    "latitude": float(lat),
-                    "longitude": float(lon),
-                    "point": STR_POINT.format(str(CRS), float(lon), float(lat)),
+                    "latitude": _q(lat),
+                    "longitude": _q(lon),
+                    "point": STR_POINT.format(str(CRS), _q(lon), _q(lat)),
                 }
                 for lat in lat_slice
                 for lon in lon_slice
@@ -649,13 +654,14 @@ def get_id_maps(session: Session) -> tuple[dict, dict, dict]:
     for offset in range(0, session.query(GridPoint).count(), grid_point_batch_size):
         grid_points = (
             session.query(GridPoint.id, GridPoint.latitude, GridPoint.longitude)
+            .order_by(GridPoint.id)
             .offset(offset)
             .limit(grid_point_batch_size)
             .all()
         )
 
         for grid_id, lat, lon in grid_points:
-            grid_id_map[(lat, lon)] = grid_id
+            grid_id_map[(_q(lat), _q(lon))] = grid_id
 
         session.expire_all()  # Clear session cache
 
@@ -663,7 +669,11 @@ def get_id_maps(session: Session) -> tuple[dict, dict, dict]:
     time_point_batch_size = 10000
     for offset in range(0, session.query(TimePoint).count(), time_point_batch_size):
         time_points = (
-            session.query(TimePoint).offset(offset).limit(time_point_batch_size).all()
+            session.query(TimePoint)
+            .order_by(TimePoint.id)
+            .offset(offset)
+            .limit(time_point_batch_size)
+            .all()
         )
 
         for row in time_points:
@@ -677,7 +687,11 @@ def get_id_maps(session: Session) -> tuple[dict, dict, dict]:
     var_type_batch_size = 1000
     for offset in range(0, session.query(VarType).count(), var_type_batch_size):
         var_types = (
-            session.query(VarType).offset(offset).limit(var_type_batch_size).all()
+            session.query(VarType)
+            .order_by(VarType.id)
+            .offset(offset)
+            .limit(var_type_batch_size)
+            .all()
         )
 
         for row in var_types:
@@ -823,6 +837,10 @@ def generate_threaded_inserts(
                     lons = var_data.longitude.values
                     values = var_data.values
 
+                    # skip inserting if the chunk is empty
+                    if var_data.size == 0:
+                        continue
+
                     # skip insertion if chunk is somehow corrupted
                     # I think this case should not happen
                     # maybe this is where the values go missing
@@ -883,16 +901,16 @@ def get_var_values_mapping(
         t_val = times[t_i]
         ts = pd.Timestamp(t_val)
         time_key = np.datetime64(pd.to_datetime(f"{ts.year}-{ts.month}-{ts.day}"), "ns")
-        print(
-            f"Missing time_id for {time_key}. Available keys sample: {list(time_id_map.keys())[:5]}"
-        )
         time_id = time_id_map.get(time_key)
         if time_id is None:
+            print(
+                f"Missing time_id for {time_key}. Available keys sample: {list(time_id_map.keys())[:5]}"
+            )
             continue
         for lat_i in range(len(lats)):
-            lat_val = float(lats[lat_i])
+            lat_val = _q(lats[lat_i])
             for lon_i in range(len(lons)):
-                lon_val = float(lons[lon_i])
+                lon_val = _q(lons[lon_i])
                 val = float(values[t_i, lat_i, lon_i])  # Correct indexing order
                 if np.isnan(val):
                     continue
@@ -942,6 +960,9 @@ def get_var_value(
             "Retieving data for the first day of the month..."
         )
         day = 1
+
+    lat = _q(lat)
+    lon = _q(lon)
 
     result = (
         session.query(VarValue)
