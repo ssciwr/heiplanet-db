@@ -24,7 +24,9 @@ def read_production_config(dict_path: str | Traversable | Path | None = None) ->
             production database.
     """
     if dict_path is None:
-        dict_path = resources.files("heiplanet_db") / "data" / "production_config.yml"
+        dict_path = (
+            resources.files("heiplanet_db") / "data" / "production_config_small.yml"
+        )
     # check if the file exists
     if isinstance(dict_path, str):
         dict_path = Path(dict_path)
@@ -149,6 +151,7 @@ def insert_var_values(
         latitudes=r0_ds.latitude.to_numpy(),
         longitudes=r0_ds.longitude.to_numpy(),
     )
+    grid_point_session.commit()
     grid_point_session.close()
     # add time points
     time_point_session = db.create_session(engine)
@@ -158,6 +161,7 @@ def insert_var_values(
             (r0_ds.time.to_numpy(), False),
         ],
     )  # True means yearly data
+    time_point_session.commit()
     time_point_session.close()
     # get id maps for grid, time, and variable types
     print("Getting id maps for grid, time, and variable types.")
@@ -172,6 +176,7 @@ def insert_var_values(
     # assign resolution groups to grid points
     resolution_session = db.create_session(engine)
     db.assign_grid_resolution_group_to_grid_point(resolution_session)
+    resolution_session.commit()
     resolution_session.close()
     return 0
 
