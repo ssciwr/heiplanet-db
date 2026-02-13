@@ -1005,6 +1005,7 @@ def test_get_var_values_nuts(
     tmp_path,
     get_nuts_def_data,
     get_varnuts_dataset,
+    seed_base_data,
 ):
     # create a sample NUTS shapefile
     nuts_path = tmp_path / "nuts_def.shp"
@@ -1014,18 +1015,6 @@ def test_get_var_values_nuts(
     # insert NUTS definitions
     postdb.insert_nuts_def(get_engine_with_tables, nuts_path)
 
-    var_type_data = [
-        {
-            "name": "t2m_mean",
-            "unit": "K",
-            "description": "2m temperature",
-        }
-    ]
-    # insert the time points
-    postdb.insert_time_points(get_session, [(get_varnuts_dataset.time.values, False)])
-    # insert the var type
-    postdb.insert_var_types(get_session, var_type_data)
-
     # get the id maps
     _, time_id_map, var_id_map = postdb.get_id_maps(get_session)
 
@@ -1033,7 +1022,7 @@ def test_get_var_values_nuts(
     postdb.insert_var_value_nuts(
         get_engine_with_tables,
         get_varnuts_dataset,
-        var_name="t2m_mean",
+        var_name="t2m",
         time_id_map=time_id_map,
         var_id_map=var_id_map,
     )
@@ -1043,11 +1032,11 @@ def test_get_var_values_nuts(
     result_dict = postdb.get_var_values_nuts(
         get_session,
         time_point=(2023, 1),
-        var_name="t2m_mean",
+        var_name="t2m",
     )
     assert len(result_dict) == 2
-    assert result_dict["DE11"] == get_varnuts_dataset["t2m_mean"][0, 0]
-    assert result_dict["DE22"] == get_varnuts_dataset["t2m_mean"][1, 0]
+    assert result_dict["DE11"] == get_varnuts_dataset["t2m"][0, 0]
+    assert result_dict["DE22"] == get_varnuts_dataset["t2m"][1, 0]
     # none cases
     # no time points
     with pytest.raises(HTTPException):
@@ -1064,7 +1053,7 @@ def test_get_var_values_nuts(
             var_name="non_existing_var",
         )
     # no var values
-    get_session.execute(text("TRUNCATE TABLE var_value RESTART IDENTITY CASCADE"))
+    get_session.execute(text("TRUNCATE TABLE var_value_nuts RESTART IDENTITY CASCADE"))
     get_session.commit()
     with pytest.raises(HTTPException):
         postdb.get_var_values_nuts(
@@ -1073,13 +1062,13 @@ def test_get_var_values_nuts(
             var_name=None,
         )
     # no values for selected resolution
-    get_session.execute(text("TRUNCATE TABLE var_value RESTART IDENTITY CASCADE"))
+    get_session.execute(text("TRUNCATE TABLE var_value_nuts RESTART IDENTITY CASCADE"))
     get_session.commit()
     with pytest.raises(HTTPException):
         postdb.get_var_values_nuts(
             get_session,
             time_point=(2023, 1),
-            var_name="t2m_mean",
+            var_name="t2m",
             grid_resolution="NUTS0",
         )
     #
