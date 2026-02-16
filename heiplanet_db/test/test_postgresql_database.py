@@ -931,7 +931,6 @@ def test_get_var_values_cartesian_download(get_dataset, insert_data, tmp_path):
     assert len(ds_result.longitude) == 3
     assert len(ds_result.time) == 1
     assert ds_result.t2m.shape == (1, 2, 3)
-    print(ds_result.t2m[0, 0, 0], get_dataset.t2m[0, 0, 0])
     assert math.isclose(ds_result.t2m[0, 0, 0], get_dataset.t2m[0, 0, 0], abs_tol=1e-5)
     assert math.isclose(ds_result.t2m[0, 1, 1], get_dataset.t2m[0, 1, 1], abs_tol=1e-5)
     # remove the file after test

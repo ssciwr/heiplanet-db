@@ -17,19 +17,19 @@ services:
       - heiplanet-network
   db:
     image: postgis/postgis:17-3.5
-    restart: always  
+    restart: always
     shm_size: "512m"
     mem_limit: 2g
     command:
       - "postgres"
       - "-c"
-      - "shared_buffers=1GB"
+      - "shared_buffers=512MB"
       - "-c"
       - "work_mem=64MB"
       - "-c"
       - "maintenance_work_mem=512MB"
       - "-c"
-      - "effective_cache_size=2GB"
+      - "effective_cache_size=1536MB"
       - "-c"
       - "max_wal_size=2GB"
       - "-c"
@@ -42,7 +42,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d heiplanet_db"]
+      test: [ "CMD-SHELL", "pg_isready -U postgres -d heiplanet_db" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -63,11 +63,11 @@ services:
     env_file: ./.env
     volumes:
       - ./heiplanet_db/data/production_config.yml:/heiplanet_db/production.yaml
-    command: ["api"]  # Run FastAPI server
+    command: [ "api" ] # Run FastAPI server
     restart: "no"
     networks:
       - heiplanet-network
-    profiles: ["api"]
+    profiles: [ "api" ]
 
   production-runner:
     image: heiplanet-db
@@ -80,14 +80,15 @@ services:
     env_file: ./.env
     volumes:
       - ./heiplanet_db/data/production_config.yml:/heiplanet_db/production.yaml
-    command: ["production"]
-    restart: "no"  # Run once
+    command: [ "production" ]
+    restart: "no" # Run once
     networks:
       - heiplanet-network
-    profiles: ["init"]
+    profiles: [ "init" ]
 
 volumes:
   postgres_data:
+
 
 networks:
   heiplanet-network:

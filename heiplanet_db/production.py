@@ -272,37 +272,70 @@ def main() -> None:
             "Shapefile path could not be generated from the data to fetch."
         )
     engine = get_engine()
-    # Disable autovacuum globally for all tables during bulk load
-    with engine.begin() as conn:
-        conn.execute(text("ALTER TABLE grid_point SET (autovacuum_enabled = false);"))
-        conn.execute(text("ALTER TABLE time_point SET (autovacuum_enabled = false);"))
-        conn.execute(text("ALTER TABLE var_value SET (autovacuum_enabled = false);"))
-        conn.execute(
-            text("ALTER TABLE var_value_nuts SET (autovacuum_enabled = false);")
-        )
     # insert the NUTS shape data
     insert_data(engine=engine, shapefiles_folder_path=shapefile_folder_path)
+
     # insert the cartesian variables data
     var_type_session = db.create_session(engine)
     var_types = get_var_types_from_config(config=config["data_to_fetch"])
     db.insert_var_types(var_type_session, var_types)
     var_type_session.close()
+
     # insert the resolution groups
     resolution_session = db.create_session(engine)
     db.insert_resolution_groups(resolution_session)
     resolution_session.close()
-    # insert the data
-    insert_var_values(engine, r0_path=r0_path)
-    # insert the nuts variables data
-    insert_var_values_nuts(engine, r0_nuts_path=r0_nuts_path)
-    # Re-enable autovacuum and run VACUUM ANALYZE on all tables
-    with engine.begin() as conn:
-        conn.execute(text("ALTER TABLE grid_point SET (autovacuum_enabled = true);"))
-        conn.execute(text("ALTER TABLE time_point SET (autovacuum_enabled = true);"))
-        conn.execute(text("ALTER TABLE var_value SET (autovacuum_enabled = true);"))
-        conn.execute(
-            text("ALTER TABLE var_value_nuts SET (autovacuum_enabled = true);")
-        )
+
+    # load data with optimization
+    load_data_with_optimization(engine, r0_path, r0_nuts_path)
+
+
+def load_data_with_optimization(
+    engine: engine.Engine,
+    r0_path: Path | None = None,
+    r0_nuts_path: Path | None = None,
+) -> None:
+    """
+    Load data into the database with autovacuum disabled for performance.
+    Ensures autovacuum is re-enabled even if an error occurs.
+    """
+    try:
+        # Disable autovacuum globally for all tables during bulk load
+        with engine.begin() as conn:
+            conn.execute(
+                text("ALTER TABLE grid_point SET (autovacuum_enabled = false);")
+            )
+            conn.execute(
+                text("ALTER TABLE time_point SET (autovacuum_enabled = false);")
+            )
+            conn.execute(
+                text("ALTER TABLE var_value SET (autovacuum_enabled = false);")
+            )
+            conn.execute(
+                text("ALTER TABLE var_value_nuts SET (autovacuum_enabled = false);")
+            )
+
+        # insert the data
+        if r0_path:
+            insert_var_values(engine, r0_path=r0_path)
+        # insert the nuts variables data
+        if r0_nuts_path:
+            insert_var_values_nuts(engine, r0_nuts_path=r0_nuts_path)
+
+    finally:
+        # Re-enable autovacuum and run VACUUM ANALYZE on all tables
+        # This block is executed even if an error occurs in the try block
+        with engine.begin() as conn:
+            conn.execute(
+                text("ALTER TABLE grid_point SET (autovacuum_enabled = true);")
+            )
+            conn.execute(
+                text("ALTER TABLE time_point SET (autovacuum_enabled = true);")
+            )
+            conn.execute(text("ALTER TABLE var_value SET (autovacuum_enabled = true);"))
+            conn.execute(
+                text("ALTER TABLE var_value_nuts SET (autovacuum_enabled = true);")
+            )
 
     # Run VACUUM in autocommit mode (outside transaction)
     with engine.connect() as conn:

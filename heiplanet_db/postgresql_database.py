@@ -35,12 +35,13 @@ import gc
 
 CRS = 4326
 STR_POINT = "SRID={};POINT({} {})"
-BATCH_SIZE = 10000
-MAX_WORKERS = 4
-VAR_TIME_CHUNK = 6
-VAR_LAT_CHUNK = 45
-VAR_LON_CHUNK = 90
-ROUND_DIGITS = 4
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", 10000))
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", 4))
+VAR_TIME_CHUNK = int(os.environ.get("VAR_TIME_CHUNK", 6))
+GRID_LAT_CHUNK = int(os.environ.get("GRID_LAT_CHUNK", 45))
+GRID_LON_CHUNK = int(os.environ.get("GRID_LON_CHUNK", 90))
+ROUND_DIGITS = int(os.environ.get("ROUND_DIGITS", 4))
+TIMEOUT = int(os.environ.get("TIMEOUT", 300))
 
 
 def _q(x: float) -> float:
@@ -403,18 +404,16 @@ def insert_grid_points(session: Session, latitudes: np.ndarray, longitudes: np.n
         latitudes (np.ndarray): Array of latitudes.
         longitudes (np.ndarray): Array of longitudes.
     """
-    lat_chunk_size = int(os.environ.get("GRID_LAT_CHUNK", "45"))
-    lon_chunk_size = int(os.environ.get("GRID_LON_CHUNK", "360"))
-    total_batches = math.ceil(len(latitudes) / lat_chunk_size) * math.ceil(
-        len(longitudes) / lon_chunk_size
+    total_batches = math.ceil(len(latitudes) / GRID_LAT_CHUNK) * math.ceil(
+        len(longitudes) / GRID_LON_CHUNK
     )
     batch_count = 0
-    for lat_start in range(0, len(latitudes), lat_chunk_size):
-        lat_end = min(lat_start + lat_chunk_size, len(latitudes))
+    for lat_start in range(0, len(latitudes), GRID_LAT_CHUNK):
+        lat_end = min(lat_start + GRID_LAT_CHUNK, len(latitudes))
         lat_slice = latitudes[lat_start:lat_end]
 
-        for lon_start in range(0, len(longitudes), lon_chunk_size):
-            lon_end = min(lon_start + lon_chunk_size, len(longitudes))
+        for lon_start in range(0, len(longitudes), GRID_LON_CHUNK):
+            lon_end = min(lon_start + GRID_LON_CHUNK, len(longitudes))
             lon_slice = longitudes[lon_start:lon_end]
 
             # Build batch
@@ -764,14 +763,10 @@ def insert_var_values(
     print(f"Start inserting {var_name} values in streaming chunks...")
     t_start_insert = time.time()
 
-    t_chunk = int(os.environ.get("VAR_TIME_CHUNK", VAR_TIME_CHUNK))
-    lat_chunk = int(os.environ.get("VAR_LAT_CHUNK", VAR_LAT_CHUNK))
-    lon_chunk = int(os.environ.get("VAR_LON_CHUNK", VAR_LON_CHUNK))
-
     generate_threaded_inserts(
-        t_chunk,
-        lat_chunk,
-        lon_chunk,
+        VAR_TIME_CHUNK,
+        GRID_LAT_CHUNK,
+        GRID_LON_CHUNK,
         ds,
         var_name,
         grid_id_map,
@@ -812,7 +807,7 @@ def generate_threaded_inserts(
     futures = []
     total_values_inserted = 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        # the dimenson is (time, latitude, longitude)
+        # the dimension is (time, latitude, longitude)
         for t_idx in range(0, ds.sizes["time"], t_chunk):
             for lat_idx in range(0, ds.sizes["latitude"], lat_chunk):
                 for lon_idx in range(0, ds.sizes["longitude"], lon_chunk):
@@ -839,10 +834,6 @@ def generate_threaded_inserts(
                     lons = var_data.longitude.values
                     values = var_data.values
 
-                    # skip inserting if the chunk is empty
-                    if var_data.size == 0:
-                        continue
-
                     # skip insertion if chunk is somehow corrupted
                     # I think this case should not happen
                     # maybe this is where the values go missing
@@ -865,7 +856,7 @@ def generate_threaded_inserts(
 
         # Wait for all futures to complete with timeout
         print(f"Waiting for {len(futures)} batches to complete...")
-        for future in tqdm(as_completed(futures, timeout=300), total=len(futures)):
+        for future in tqdm(as_completed(futures, timeout=TIMEOUT), total=len(futures)):
             try:
                 future.result()  # Ensure exceptions are raised
             except Exception as e:
