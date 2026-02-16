@@ -39,7 +39,7 @@ BATCH_SIZE = int(os.environ.get("BATCH_SIZE", 10000))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", 4))
 VAR_TIME_CHUNK = int(os.environ.get("VAR_TIME_CHUNK", 6))
 GRID_LAT_CHUNK = int(os.environ.get("GRID_LAT_CHUNK", 45))
-GRID_LON_CHUNK = int(os.environ.get("GRID_LON_CHUNK", 90))
+GRID_LON_CHUNK = int(os.environ.get("GRID_LON_CHUNK", 360))
 ROUND_DIGITS = int(os.environ.get("ROUND_DIGITS", 4))
 TIMEOUT = int(os.environ.get("TIMEOUT", 300))
 
@@ -807,52 +807,20 @@ def generate_threaded_inserts(
     futures = []
     total_values_inserted = 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        # the dimension is (time, latitude, longitude)
-        for t_idx in range(0, ds.sizes["time"], t_chunk):
-            for lat_idx in range(0, ds.sizes["latitude"], lat_chunk):
-                for lon_idx in range(0, ds.sizes["longitude"], lon_chunk):
-                    t_end = min(t_idx + t_chunk, ds.sizes["time"])
-                    lat_end = min(lat_idx + lat_chunk, ds.sizes["latitude"])
-                    lon_end = min(lon_idx + lon_chunk, ds.sizes["longitude"])
+        for ds_chunk in _yield_chunks(ds, t_chunk, lat_chunk, lon_chunk):
+            var_values = _process_chunk(
+                ds_chunk, var_name, grid_id_map, time_id_map, var_id
+            )
+            if not var_values:
+                continue
 
-                    ds_chunk = ds.isel(
-                        time=slice(t_idx, t_end),
-                        latitude=slice(lat_idx, lat_end),
-                        longitude=slice(lon_idx, lon_end),
-                    )
-                    var_data = ds_chunk[var_name].load()
-                    # drop all empty latitude rows
-                    var_data = var_data.dropna(dim="latitude", how="all")
-                    # skip inserting if the chunk is empty
-                    if var_data.size == 0:
-                        continue
-
-                    # make sure time has the correct format for db insertion
-                    # so that values can be requested correctly later
-                    times = var_data.time.values.astype("datetime64[ns]")
-                    lats = var_data.latitude.values
-                    lons = var_data.longitude.values
-                    values = var_data.values
-
-                    # skip insertion if chunk is somehow corrupted
-                    # I think this case should not happen
-                    # maybe this is where the values go missing
-                    if values.ndim != 3:
-                        continue
-                    var_values = get_var_values_mapping(
-                        times, time_id_map, grid_id_map, var_id, lats, lons, values
-                    )
-                    if var_values:
-                        for i in range(0, len(var_values), BATCH_SIZE // 2):
-                            batch = var_values[i : i + BATCH_SIZE // 2]
-                            future = executor.submit(
-                                insert_batch, batch, engine, VarValue
-                            )
-                            futures.append(future)
-                            total_values_inserted += len(batch)
-
-                    del var_data, var_values, times, lats, lons, values
-                    gc.collect()
+            for i in range(0, len(var_values), BATCH_SIZE // 2):
+                batch = var_values[i : i + BATCH_SIZE // 2]
+                future = executor.submit(insert_batch, batch, engine, VarValue)
+                futures.append(future)
+                total_values_inserted += len(batch)
+            del var_values
+            gc.collect()
 
         # Wait for all futures to complete with timeout
         print(f"Waiting for {len(futures)} batches to complete...")
@@ -865,6 +833,58 @@ def generate_threaded_inserts(
 
     print(f"Values of {var_name} inserted. Total: {total_values_inserted}")
     return total_values_inserted
+
+
+def _yield_chunks(
+    ds: xr.Dataset, t_chunk: int, lat_chunk: int, lon_chunk: int
+) -> xr.Dataset:
+    """Yield chunks of the dataset."""
+    # the dimension is (time, latitude, longitude)
+    for t_idx in range(0, ds.sizes["time"], t_chunk):
+        for lat_idx in range(0, ds.sizes["latitude"], lat_chunk):
+            for lon_idx in range(0, ds.sizes["longitude"], lon_chunk):
+                t_end = min(t_idx + t_chunk, ds.sizes["time"])
+                lat_end = min(lat_idx + lat_chunk, ds.sizes["latitude"])
+                lon_end = min(lon_idx + lon_chunk, ds.sizes["longitude"])
+
+                yield ds.isel(
+                    time=slice(t_idx, t_end),
+                    latitude=slice(lat_idx, lat_end),
+                    longitude=slice(lon_idx, lon_end),
+                )
+
+
+def _process_chunk(
+    ds_chunk: xr.Dataset,
+    var_name: str,
+    grid_id_map: dict,
+    time_id_map: dict,
+    var_id: int,
+) -> list[dict]:
+    """Process a chunk of the dataset and return variable values for insertion."""
+    var_data = ds_chunk[var_name].load()
+    # drop all empty latitude rows
+    var_data = var_data.dropna(dim="latitude", how="all")
+    # skip inserting if the chunk is empty
+    if var_data.size == 0:
+        return []
+
+    # make sure time has the correct format for db insertion
+    # so that values can be requested correctly later
+    times = var_data.time.values.astype("datetime64[ns]")
+    lats = var_data.latitude.values
+    lons = var_data.longitude.values
+    values = var_data.values
+
+    # skip insertion if chunk is somehow corrupted
+    # I think this case should not happen
+    # maybe this is where the values go missing
+    if values.ndim != 3:
+        return []
+
+    return get_var_values_mapping(
+        times, time_id_map, grid_id_map, var_id, lats, lons, values
+    )
 
 
 def get_var_values_mapping(
@@ -921,6 +941,8 @@ def get_var_values_mapping(
                             "value": float(val),
                         }
                     )
+    del var_id, times, lats, lons, values
+    gc.collect()
     return var_values
 
 
