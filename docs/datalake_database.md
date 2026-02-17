@@ -6,6 +6,10 @@ hide:
 
 # Data Lake & Database Backend
 
+# Data lake
+
+TBU.
+
 ## Data model
 Downloaded and (pre)processed data is stored in the database as follows:
 ![onehealth_data_model.jpg](source/_static/onehealth_data_model.jpg)

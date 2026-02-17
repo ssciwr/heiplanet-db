@@ -1,5 +1,5 @@
 <!--intro-start-->
-# heiplanet platform
+# heiplanet-db: Database deployment for the Heiplanet surveillance platform
 
 [![pre-commit.ci status](https://results.pre-commit.ci/badge/github/ssciwr/heiplanet-db/main.svg)](https://results.pre-commit.ci/latest/github/ssciwr/heiplanet-db/main)
 ![License: MIT](https://img.shields.io/github/license/ssciwr/heiplanet-db)
@@ -9,14 +9,14 @@
 ![Language](https://img.shields.io/github/languages/top/ssciwr/heiplanet-db)
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/ssciwr/heiplanet-db/blob/main/docs/source/notebooks/insert_data.ipynb)
 
-A surveillance platform displaying statistical information on mosquito-borne diseases across European regions.
+A Python package for deploying the database of the Heiplanet platform, a surveillance platform displaying statistical information on mosquito-borne diseases across European regions. Please visit the [documentation](https://ssciwr.github.io/heiplanet-db/) for further information.
 
-The platform includes four main components: [webserver/frontend](https://github.com/ssciwr/onehealth-map-frontend), [model backend](https://github.com/ssciwr/onehealth-model-backend), and [data lake & database backend](https://github.com/ssciwr/heiplanet-db), [data preprocessor](https://github.com/ssciwr/heiplanet-data).
+Heiplanet platform includes four main components: [webserver/frontend](https://github.com/ssciwr/heiplanet-frontend), [model backend](https://github.com/ssciwr/onehealth-model-backend), and [data lake & database backend](https://github.com/ssciwr/heiplanet-db), [data preprocessor](https://github.com/ssciwr/heiplanet-data).
 
 **Further information:**
 
 * [About](docs/about.md): Information about the project, research group, and development group
-* [Data Lake & Database](docs/datalake_database.md): How data is preprocessed, processed and stored in the database
+* [Data Lake & Database](docs/datalake_database.md): How data is processed and stored in the database
 * [Database deployment](docs/deployment.md): How the complete system is deployed in development and in production
 * [Issues](docs/issues.md): Some notes for running the package and further issues
 * [Contact](docs/contact.md): Contact information of relevant groups
