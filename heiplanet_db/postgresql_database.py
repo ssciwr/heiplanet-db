@@ -28,7 +28,7 @@ import os
 import math
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Type, Tuple, List
+from typing import Generator, Type, Tuple, List
 from fastapi import HTTPException
 import json
 import gc
@@ -861,7 +861,7 @@ def generate_threaded_inserts(
 
 def _yield_chunks(
     ds: xr.Dataset, t_chunk: int, lat_chunk: int, lon_chunk: int
-) -> xr.Dataset:
+) -> Generator[xr.Dataset, None, None]:
     """Yield chunks of the dataset."""
     # the dimension is (time, latitude, longitude)
     for t_idx in range(0, ds.sizes["time"], t_chunk):
