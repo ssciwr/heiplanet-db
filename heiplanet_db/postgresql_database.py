@@ -24,17 +24,49 @@ import pandas as pd
 import numpy as np
 import xarray as xr
 import time
+import os
+import math
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Type, Tuple, List
+from typing import Generator, Type, Tuple, List
 from fastapi import HTTPException
 import json
-
+import gc
 
 CRS = 4326
 STR_POINT = "SRID={};POINT({} {})"
-BATCH_SIZE = 10000
-MAX_WORKERS = 4
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", 10000))
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", 4))
+VAR_TIME_CHUNK = int(os.environ.get("VAR_TIME_CHUNK", 6))
+GRID_LAT_CHUNK = int(os.environ.get("GRID_LAT_CHUNK", 45))
+GRID_LON_CHUNK = int(os.environ.get("GRID_LON_CHUNK", 360))
+ROUND_DIGITS = int(os.environ.get("ROUND_DIGITS", 4))
+TIMEOUT = int(os.environ.get("TIMEOUT", 300))
+
+
+def _q(value):
+    """Round a float coordinate to ROUND_DIGITS precision.
+
+    Ensures consistent rounding behavior for both Python floats and NumPy scalars.
+    Returns a Python float for reliable dictionary key lookups.
+    """
+    # Convert NumPy scalars to Python float first
+    if isinstance(value, (np.floating, np.integer)):
+        value = float(value)
+    return round(value, ROUND_DIGITS)
+
+
+def _normalize_time_key(t_val: np.datetime64) -> np.datetime64:
+    """Normalize a datetime64 value to a date-only key for time_id_map lookup.
+
+    Args:
+        t_val: datetime64 value (may include time components).
+
+    Returns:
+        datetime64[ns] normalized to midnight of the date.
+    """
+    ts = pd.Timestamp(t_val)
+    return np.datetime64(pd.to_datetime(f"{ts.year}-{ts.month}-{ts.day}"), "ns")
 
 
 # Base declarative class
@@ -71,8 +103,8 @@ class GridPoint(Base):
     __tablename__ = "grid_point"
 
     id: Mapped[int] = mapped_column(Integer(), primary_key=True, autoincrement=True)
-    latitude: Mapped[float] = mapped_column(Float())
-    longitude: Mapped[float] = mapped_column(Float())
+    latitude: Mapped[float] = mapped_column(Numeric(precision=8, scale=4))
+    longitude: Mapped[float] = mapped_column(Numeric(precision=8, scale=4))
 
     # Geometry column for PostGIS
     point: Mapped[Geometry] = mapped_column(Geometry("POINT", srid=CRS), nullable=True)
@@ -378,9 +410,10 @@ def add_data_list_bulk(session: Session, data_dict_list: list, class_type: Type[
     try:
         session.bulk_insert_mappings(class_type, data_dict_list)
         session.commit()
+        session.expire_all()  # clear identity map
     except SQLAlchemyError as e:
         session.rollback()
-        print(f"Error inserting data: {e}")
+        raise RuntimeError(f"Error inserting data: {e}")
 
 
 def insert_grid_points(session: Session, latitudes: np.ndarray, longitudes: np.ndarray):
@@ -392,18 +425,36 @@ def insert_grid_points(session: Session, latitudes: np.ndarray, longitudes: np.n
         latitudes (np.ndarray): Array of latitudes.
         longitudes (np.ndarray): Array of longitudes.
     """
-    # create list of dictionaries for bulk insert
-    grid_points = [
-        {
-            "latitude": float(lat),
-            "longitude": float(lon),
-            "point": STR_POINT.format(str(CRS), float(lon), float(lat)),
-        }
-        for lat in latitudes
-        for lon in longitudes
-    ]
-    add_data_list_bulk(session, grid_points, GridPoint)
-    print("Grid points inserted.")
+    total_batches = math.ceil(len(latitudes) / GRID_LAT_CHUNK) * math.ceil(
+        len(longitudes) / GRID_LON_CHUNK
+    )
+    batch_count = 0
+    for lat_start in range(0, len(latitudes), GRID_LAT_CHUNK):
+        lat_end = min(lat_start + GRID_LAT_CHUNK, len(latitudes))
+        lat_slice = latitudes[lat_start:lat_end]
+
+        for lon_start in range(0, len(longitudes), GRID_LON_CHUNK):
+            lon_end = min(lon_start + GRID_LON_CHUNK, len(longitudes))
+            lon_slice = longitudes[lon_start:lon_end]
+
+            # Build batch
+            grid_points = [
+                {
+                    "latitude": _q(lat),
+                    "longitude": _q(lon),
+                    "point": STR_POINT.format(str(CRS), _q(lon), _q(lat)),
+                }
+                for lat in lat_slice
+                for lon in lon_slice
+            ]
+
+            # Insert batch
+            add_data_list_bulk(session, grid_points, GridPoint)
+            session.expire_all()  # clear identity map
+            batch_count += 1
+            print(f"Grid points batch {batch_count}/{total_batches} inserted.")
+
+    print("All grid points inserted.")
 
 
 def insert_resolution_groups(
@@ -603,6 +654,7 @@ def insert_var_types(session: Session, var_types: list[dict]):
 def get_id_maps(session: Session) -> tuple[dict, dict, dict]:
     """
     Get ID maps for grid points, time points, and variable types.
+    Uses streaming to avoid loading all data into memory at once.
 
     Args:
         session (Session): SQLAlchemy session object.
@@ -613,19 +665,62 @@ def get_id_maps(session: Session) -> tuple[dict, dict, dict]:
             - time_id_map: Mapping of datetime64 to time point ID.\n
             - var_id_map: Mapping of variable name to variable type ID.
     """
-    grid_points = session.query(
-        GridPoint.id, GridPoint.latitude, GridPoint.longitude
-    ).all()
-    grid_id_map = {(lat, lon): grid_id for grid_id, lat, lon in grid_points}
+    grid_id_map = {}
+    time_id_map = {}
+    var_id_map = {}
 
-    time_id_map = {
-        np.datetime64(pd.to_datetime(f"{row.year}-{row.month}-{row.day}"), "ns"): row.id
-        for row in session.query(TimePoint).all()
-    }
+    # Stream grid points in batches
+    grid_point_batch_size = 100000
+    for offset in range(0, session.query(GridPoint).count(), grid_point_batch_size):
+        grid_points = (
+            session.query(GridPoint.id, GridPoint.latitude, GridPoint.longitude)
+            .order_by(GridPoint.id)
+            .offset(offset)
+            .limit(grid_point_batch_size)
+            .all()
+        )
 
-    var_id_map = {row.name: row.id for row in session.query(VarType).all()}
+        for grid_id, lat, lon in grid_points:
+            # Convert to Python float first, then apply _q() for consistent rounding
+            lat_float = float(lat)
+            lon_float = float(lon)
+            grid_id_map[(_q(lat_float), _q(lon_float))] = grid_id
 
-    session.close()
+        session.expire_all()  # Clear session cache
+
+    # Stream time points in batches
+    time_point_batch_size = 10000
+    for offset in range(0, session.query(TimePoint).count(), time_point_batch_size):
+        time_points = (
+            session.query(TimePoint)
+            .order_by(TimePoint.id)
+            .offset(offset)
+            .limit(time_point_batch_size)
+            .all()
+        )
+
+        for row in time_points:
+            time_id_map[
+                np.datetime64(pd.to_datetime(f"{row.year}-{row.month}-{row.day}"), "ns")
+            ] = row.id
+
+        session.expire_all()
+
+    # Stream variable types in batches
+    var_type_batch_size = 1000
+    for offset in range(0, session.query(VarType).count(), var_type_batch_size):
+        var_types = (
+            session.query(VarType)
+            .order_by(VarType.id)
+            .offset(offset)
+            .limit(var_type_batch_size)
+            .all()
+        )
+
+        for row in var_types:
+            var_id_map[row.name] = row.id
+
+        session.expire_all()
 
     return grid_id_map, time_id_map, var_id_map
 
@@ -658,6 +753,15 @@ def convert_yearly_to_monthly(ds: xr.Dataset) -> xr.Dataset:
     return ds.reindex(time=new_time_points, method="ffill")
 
 
+def insert_batch(batch: list[VarValue], engine: engine.Engine, VarClass: Type[Base]):
+    session = create_session(engine)
+    try:
+        add_data_list_bulk(session, batch, VarClass)
+        session.commit()
+    finally:
+        session.close()
+
+
 def insert_var_values(
     engine: engine.Engine,
     ds: xr.Dataset,
@@ -667,96 +771,254 @@ def insert_var_values(
     var_id_map: dict,
     to_monthly: bool = False,
 ) -> tuple[float, float]:
-    """Insert variable values into the database.
+    """Insert variable values into the database in streaming chunks."""
 
-    Args:
-        engine (engine.Engine): SQLAlchemy engine object.
-        ds (xr.Dataset): xarray dataset with variable data.
-        var_name (str): Name of the variable to insert.
-        grid_id_map (dict): Mapping of grid points to IDs.
-        time_id_map (dict): Mapping of time points to IDs.
-        var_id_map (dict): Mapping of variable types to IDs.
-        to_monthly (bool): Whether to convert yearly data to monthly data. Defaults to False.
-    Returns:
-        tuple: A tuple containing the time taken to convert yearly data to monthly data,
-            and the time taken to insert the variable values.
-    """
     if to_monthly:
-        # convert yearly data to monthly data
         print(f"Converting {var_name} data from yearly to monthly...")
         ds = convert_yearly_to_monthly(ds)
     t_yearly_to_monthly = time.time()
 
     print(f"Prepare inserting {var_name} values...")
-    # values of the variable
-    var_data = ds[var_name]
-    var_data = var_data.dropna(
-        dim="latitude", how="all"
-    ).load()  # load data into memory
 
-    # get the variable id
     var_id = var_id_map.get(var_name)
     if var_id is None:
         raise ValueError(f"Variable {var_name} not found in var_type table.")
 
-    # using stack() from xarray to vectorize the data
-    stacked_var_data = var_data.stack(points=("time", "latitude", "longitude"))
-    stacked_var_data = stacked_var_data.dropna("points")
-
-    # get id for each dim
-    time_vals = stacked_var_data["time"].values.astype("datetime64[ns]")
-    lat_vals = stacked_var_data["latitude"].values
-    lon_vals = stacked_var_data["longitude"].values
-
-    # create vectorized mapping
-    # normalize time before mapping as the time in isimip is 12:00:00
-    # TODO: find an optimal way to do this
-    get_time_id = np.vectorize(
-        lambda t: time_id_map.get(np.datetime64(pd.Timestamp(t).normalize(), "ns"))
-    )
-    get_grid_id = np.vectorize(lambda lat, lon: grid_id_map.get((lat, lon)))
-
-    time_ids = get_time_id(time_vals)
-    grid_ids = get_grid_id(lat_vals, lon_vals)
-    values = stacked_var_data.values.astype(float)
-
-    # create a mask for valid values
-    masks = ~np.isnan(values)
-
-    # create bulk data for insertion
-    var_values = [
-        {
-            "grid_id": int(grid_id),
-            "time_id": int(time_id),
-            "var_id": int(var_id),
-            "value": float(value),
-        }
-        for grid_id, time_id, value, mask in zip(grid_ids, time_ids, values, masks)
-        if mask and (grid_id is not None) and (time_id is not None)
-    ]
-
-    def insert_batch(batch):
-        """Insert a batch of data into the database."""
-        # create a new session for each batch
-        session = create_session(engine)
-        add_data_list_bulk(session, batch, VarValue)
-        session.close()
-
-    print(f"Start inserting {var_name} values in parallel...")
+    print(f"Start inserting {var_name} values in streaming chunks...")
     t_start_insert = time.time()
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = []
-        for i in range(0, len(var_values), BATCH_SIZE):
-            e_batch = i + BATCH_SIZE
-            batch = var_values[i:e_batch]
-            futures.append(executor.submit(insert_batch, batch))
+    generate_threaded_inserts(
+        VAR_TIME_CHUNK,
+        GRID_LAT_CHUNK,
+        GRID_LON_CHUNK,
+        ds,
+        var_name,
+        grid_id_map,
+        time_id_map,
+        var_id,
+        engine,
+    )
 
-        for _ in tqdm(as_completed(futures), total=len(futures)):
-            pass
-
-    print(f"Values of {var_name} inserted.")
     return t_yearly_to_monthly, t_start_insert
+
+
+def generate_threaded_inserts(
+    t_chunk: int,
+    lat_chunk: int,
+    lon_chunk: int,
+    ds: xr.Dataset,
+    var_name: str,
+    grid_id_map: dict,
+    time_id_map: dict,
+    var_id: int,
+    engine: engine.Engine,
+) -> int:
+    """Generate threaded inserts for variable values.
+
+    Args:
+        t_chunk (int): Time chunk size.
+        lat_chunk (int): Latitude chunk size.
+        lon_chunk (int): Longitude chunk size.
+        ds (xr.Dataset): xarray dataset.
+        var_name (str): Variable name.
+        grid_id_map (dict): Grid ID map.
+        time_id_map (dict): Time ID map.
+        var_id (int): Variable ID.
+        engine (engine.Engine): SQLAlchemy engine object.
+    Returns:
+        int: Total number of variable values inserted.
+    """
+    futures = []
+    total_values_inserted = 0
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        for ds_chunk in _yield_chunks(ds, t_chunk, lat_chunk, lon_chunk):
+            var_values = _process_chunk(
+                ds_chunk, var_name, grid_id_map, time_id_map, var_id
+            )
+            if not var_values:
+                continue
+
+            for i in range(0, len(var_values), BATCH_SIZE // 2):
+                batch = var_values[i : i + BATCH_SIZE // 2]
+                future = executor.submit(insert_batch, batch, engine, VarValue)
+                futures.append(future)
+                total_values_inserted += len(batch)
+            del var_values
+            gc.collect()
+
+        # Wait for all futures to complete with timeout
+        print(f"Waiting for {len(futures)} batches to complete...")
+        for future in tqdm(as_completed(futures, timeout=TIMEOUT), total=len(futures)):
+            try:
+                future.result()  # Ensure exceptions are raised
+            except Exception as e:
+                print(f"Error in batch: {e}")
+                raise
+
+    print(f"Values of {var_name} inserted. Total: {total_values_inserted}")
+    return total_values_inserted
+
+
+def _yield_chunks(
+    ds: xr.Dataset, t_chunk: int, lat_chunk: int, lon_chunk: int
+) -> Generator[xr.Dataset, None, None]:
+    """Yield chunks of the dataset."""
+    # the dimension is (time, latitude, longitude)
+    for t_idx in range(0, ds.sizes["time"], t_chunk):
+        for lat_idx in range(0, ds.sizes["latitude"], lat_chunk):
+            for lon_idx in range(0, ds.sizes["longitude"], lon_chunk):
+                t_end = min(t_idx + t_chunk, ds.sizes["time"])
+                lat_end = min(lat_idx + lat_chunk, ds.sizes["latitude"])
+                lon_end = min(lon_idx + lon_chunk, ds.sizes["longitude"])
+
+                yield ds.isel(
+                    time=slice(t_idx, t_end),
+                    latitude=slice(lat_idx, lat_end),
+                    longitude=slice(lon_idx, lon_end),
+                )
+
+
+def _process_chunk(
+    ds_chunk: xr.Dataset,
+    var_name: str,
+    grid_id_map: dict,
+    time_id_map: dict,
+    var_id: int,
+) -> list[dict]:
+    """Process a chunk of the dataset and return variable values for insertion."""
+    var_data = ds_chunk[var_name].load()
+    # drop all empty latitude rows
+    var_data = var_data.dropna(dim="latitude", how="all")
+    # skip inserting if the chunk is empty
+    if var_data.size == 0:
+        return []
+
+    # make sure time has the correct format for db insertion
+    # so that values can be requested correctly later
+    times = var_data.time.values.astype("datetime64[ns]")
+    lats = var_data.latitude.values
+    lons = var_data.longitude.values
+    values = var_data.values
+
+    # skip insertion if chunk is somehow corrupted
+    # I think this case should not happen
+    # maybe this is where the values go missing
+    if values.ndim != 3:
+        return []
+
+    return get_var_values_mapping(
+        times, time_id_map, grid_id_map, var_id, lats, lons, values
+    )
+
+
+def _build_var_value_entry(
+    grid_id: int, time_id: int, var_id: int, value: float
+) -> dict:
+    """Build a single variable value entry dictionary for database insertion.
+
+    Args:
+        grid_id: Grid point ID.
+        time_id: Time point ID.
+        var_id: Variable type ID.
+        value: Variable value.
+
+    Returns:
+        Dictionary with keys: grid_id, time_id, var_id, value.
+    """
+    return {
+        "grid_id": int(grid_id),
+        "time_id": int(time_id),
+        "var_id": int(var_id),
+        "value": float(value),
+    }
+
+
+def _process_time_point(
+    t_i: int,
+    t_val: np.datetime64,
+    time_id_map: dict,
+    grid_id_map: dict,
+    var_id: int,
+    lats: np.ndarray,
+    lons: np.ndarray,
+    values: np.ndarray,
+) -> list[dict]:
+    """Process a single time point and return variable value entries.
+
+    Args:
+        t_i: Time index.
+        t_val: Time value (datetime64).
+        time_id_map: Mapping of datetime64 to time point ID.
+        grid_id_map: Mapping of (latitude, longitude) to grid point ID.
+        var_id: Variable type ID.
+        lats: Array of latitudes.
+        lons: Array of longitudes.
+        values: 3D array of variable values (time, lat, lon).
+
+    Returns:
+        List of variable value entry dictionaries.
+    """
+    time_key = _normalize_time_key(t_val)
+    time_id = time_id_map.get(time_key)
+    if time_id is None:
+        print(
+            f"Missing time_id for {time_key}. Available keys sample: {list(time_id_map.keys())[:5]}"
+        )
+        return []
+
+    var_values = []
+    for lat_i in range(len(lats)):
+        lat_val = _q(lats[lat_i])
+        for lon_i in range(len(lons)):
+            lon_val = _q(lons[lon_i])
+            val = float(values[t_i, lat_i, lon_i])
+
+            if np.isnan(val):
+                continue
+
+            grid_id = grid_id_map.get((lat_val, lon_val))
+            if grid_id is None:
+                print(f"Missing grid_id for ({lat_val}, {lon_val})")
+                continue
+
+            var_values.append(_build_var_value_entry(grid_id, time_id, var_id, val))
+
+    return var_values
+
+
+def get_var_values_mapping(
+    times: np.ndarray,
+    time_id_map: dict,
+    grid_id_map: dict,
+    var_id: int,
+    lats: np.ndarray,
+    lons: np.ndarray,
+    values: np.ndarray,
+) -> list[dict]:
+    """Get variable values mapping for database insertion.
+
+    Args:
+        times (np.ndarray): Array of time points.
+        time_id_map (dict): Mapping of datetime64 to time point ID.
+        grid_id_map (dict): Mapping of (latitude, longitude) to grid point ID.
+        var_id (int): Variable type ID.
+        lats (np.ndarray): Array of latitudes.
+        lons (np.ndarray): Array of longitudes.
+        values (np.ndarray): Array of variable values.
+    Returns:
+        list[dict]: List of variable values mapping for database insertion.
+    """
+    var_values = []
+    # Loop order: time, lat, lon to match xarray dimension order (time, latitude, longitude)
+    for t_i in range(len(times)):
+        entries = _process_time_point(
+            t_i, times[t_i], time_id_map, grid_id_map, var_id, lats, lons, values
+        )
+        var_values.extend(entries)
+
+    del var_id, times, lats, lons, values
+    gc.collect()
+    return var_values
 
 
 def get_var_value(
@@ -789,6 +1051,9 @@ def get_var_value(
             "Retieving data for the first day of the month..."
         )
         day = 1
+
+    lat = _q(lat)
+    lon = _q(lon)
 
     result = (
         session.query(VarValue)
@@ -988,8 +1253,8 @@ def sort_grid_points_get_ids(
     grid_points: List[GridPoint],
 ) -> tuple[dict, list[float], list[float]]:
     # Sort and deduplicate latitudes and longitudes
-    latitudes = sorted({gp.latitude for gp in grid_points})
-    longitudes = sorted({gp.longitude for gp in grid_points})
+    latitudes = sorted({_q(gp.latitude) for gp in grid_points})
+    longitudes = sorted({_q(gp.longitude) for gp in grid_points})
 
     # Create fast index maps for latitude and longitude
     lat_to_index = {lat: i for i, lat in enumerate(latitudes)}
@@ -997,7 +1262,7 @@ def sort_grid_points_get_ids(
 
     # Map grid_id to (lat_index, lon_index)
     grid_ids = {
-        gp.id: (lat_to_index[gp.latitude], lon_to_index[gp.longitude])
+        gp.id: (lat_to_index[_q(gp.latitude)], lon_to_index[_q(gp.longitude)])
         for gp in grid_points
     }
     return grid_ids, latitudes, longitudes
@@ -1089,7 +1354,7 @@ def get_var_values_cartesian(
         .all()
     )
     # Convert directly to list of tuples
-    values_list = [(lat, lon, val) for lat, lon, val in values]
+    values_list = [(np.float64(lat), np.float64(lon), val) for lat, lon, val in values]
 
     mydict = {"latitude, longitude, var_value": values_list}
     return mydict
@@ -1149,6 +1414,11 @@ def get_var_values_cartesian_for_download(
     # Sort and deduplicate latitudes and longitudes
     grid_ids, latitudes, longitudes = sort_grid_points_get_ids(grid_points)
 
+    # Force netCDF-safe coordinate dtypes
+    time_values = np.asarray(time_values, dtype="datetime64[ns]")
+    latitudes = np.asarray(latitudes, dtype=np.float64)
+    longitudes = np.asarray(longitudes, dtype=np.float64)
+
     # get variable types and their ids
     var_types = get_var_types(session, var_names)
     if not var_types:
@@ -1181,7 +1451,9 @@ def get_var_values_cartesian_for_download(
 
         # dummy values array
         values_array = np.full(
-            (len(time_values), len(latitudes), len(longitudes)), np.nan
+            (len(time_values), len(latitudes), len(longitudes)),
+            np.nan,
+            dtype=np.float64,
         )
 
         # fill the values array with the variable values
@@ -1470,13 +1742,6 @@ def insert_var_value_nuts(
         if mask and (nuts_id is not None) and (time_id is not None)
     ]
 
-    def insert_batch(batch):
-        """Insert a batch of data into the database."""
-        # create a new session for each batch
-        session = create_session(engine)
-        add_data_list_bulk(session, batch, VarValueNuts)
-        session.close()
-
     print(f"Start inserting {var_name} values for NUTS in parallel...")
     t_start_insert = time.time()
 
@@ -1485,7 +1750,7 @@ def insert_var_value_nuts(
         for i in range(0, len(var_values), BATCH_SIZE):
             e_batch = i + BATCH_SIZE
             batch = var_values[i:e_batch]
-            futures.append(executor.submit(insert_batch, batch))
+            futures.append(executor.submit(insert_batch, batch, engine, VarValueNuts))
 
         for _ in tqdm(as_completed(futures), total=len(futures)):
             pass

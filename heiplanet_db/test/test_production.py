@@ -3,6 +3,8 @@ import pytest
 from pathlib import Path
 from importlib import resources
 from importlib.resources.abc import Traversable
+from unittest.mock import patch
+from sqlalchemy import text
 
 
 @pytest.fixture(scope="module")
@@ -25,7 +27,10 @@ def test_read_production_config(production_config: Traversable):
     assert dict1["var_name"][0]["description"]
     dict2 = config_dict["data_to_fetch"][1]
     assert dict2["var_name"][0]["name"] == "R0"
-    assert dict2["filename"] == "output_JModel_global_ts20251120.nc"
+    assert (
+        dict2["filename"]
+        == "era5_data_2025_07_2t_monthly_unicoords_adjlon_celsius_output_JModel_global.nc"
+    )
     assert dict2["host"] == "heibox"
     # read another config file
     config_dict = prod.read_production_config(production_config)
@@ -159,3 +164,58 @@ def test_main():
         prod.main()
     except Exception as e:
         pytest.fail(f"Main function raised an exception: {e}")
+
+
+def test_autovacuum_restoration_on_failure(get_engine_with_tables):
+    engine = get_engine_with_tables
+
+    # Mock insert_var_values to raise an exception
+    with patch(
+        "heiplanet_db.production.insert_var_values",
+        side_effect=RuntimeError("Insertion failed"),
+    ):
+        with pytest.raises(RuntimeError, match="Insertion failed"):
+            prod.load_data_with_optimization(engine, r0_path=Path("dummy.nc"))
+
+    # Verify autovacuum is enabled for all tables
+    with engine.connect() as conn:
+        for table in ["grid_point", "time_point", "var_value", "var_value_nuts"]:
+            result = conn.execute(
+                text(f"SELECT reloptions FROM pg_class WHERE relname = '{table}'")
+            )
+            row = result.fetchone()
+            # If autovacuum was disabled and NOT re-enabled, it would likely show up in reloptions.
+            # Postgres doesn't always clear the option when set to true, it might show 'autovacuum_enabled=true'.
+            # Or if it was reset, it might be None.
+            # IMPORTANT: The code explicitly sets it to true.
+            reloptions = row[0] if row else []
+            if reloptions:
+                opts = {k: v for k, v in (x.split("=") for x in reloptions)}
+                assert opts.get("autovacuum_enabled") == "true", (
+                    f"Autovacuum not enabled for {table}: {reloptions}"
+                )
+
+
+def test_autovacuum_restoration_on_success(get_engine_with_tables):
+    engine = get_engine_with_tables
+
+    # Mock inserts to do nothing
+    with (
+        patch("heiplanet_db.production.insert_var_values"),
+        patch("heiplanet_db.production.insert_var_values_nuts"),
+    ):
+        prod.load_data_with_optimization(engine, r0_path=Path("dummy.nc"))
+
+    # Verify autovacuum is enabled
+    with engine.connect() as conn:
+        for table in ["grid_point", "time_point", "var_value", "var_value_nuts"]:
+            result = conn.execute(
+                text(f"SELECT reloptions FROM pg_class WHERE relname = '{table}'")
+            )
+            row = result.fetchone()
+            reloptions = row[0] if row else []
+            if reloptions:
+                opts = {k: v for k, v in (x.split("=") for x in reloptions)}
+                assert opts.get("autovacuum_enabled") == "true", (
+                    f"Autovacuum not enabled for {table}: {reloptions}"
+                )
