@@ -1,7 +1,7 @@
 services:
 
   frontend:
-    image: ghcr.io/ssciwr/onehealth-map-frontend:today-fixups-from-main
+    image: ghcr.io/ssciwr/heiplanet-frontend:global_map_with_month_selector # this should also change to main soon
     ports:
       - "80:80"
       - "443:443"
