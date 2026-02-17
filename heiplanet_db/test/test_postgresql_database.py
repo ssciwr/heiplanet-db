@@ -547,6 +547,16 @@ def _build_cartesian_ds(var_name: str = "t2m", fill_nan: bool = False) -> xr.Dat
     )
 
 
+def _build_time_key(date_str):
+    """Build a time key using the same method as get_var_values_mapping.
+
+    This ensures test time_id_map keys match exactly how the function constructs
+    lookup keys: np.datetime64(pd.to_datetime(f"{ts.year}-{ts.month}-{ts.day}"), "ns")
+    """
+    ts = pd.Timestamp(date_str)
+    return np.datetime64(pd.to_datetime(f"{ts.year}-{ts.month}-{ts.day}"), "ns")
+
+
 def _build_maps():
     # (2 lats * 3 lons) grid
     grid_id_map = {}
@@ -557,12 +567,13 @@ def _build_maps():
             gid += 1
 
     time_id_map = {
-        np.datetime64(pd.Timestamp("2023-01-01"), "ns"): 1,
-        np.datetime64(pd.Timestamp("2023-02-01"), "ns"): 2,
+        _build_time_key("2023-01-01"): 1,
+        _build_time_key("2023-02-01"): 2,
     }
     return grid_id_map, time_id_map
 
 
+# Test successful threaded inserts with proper batching
 def test_generate_threaded_inserts_success(monkeypatch):
     ds = _build_cartesian_ds()
     grid_id_map, time_id_map = _build_maps()
@@ -593,6 +604,7 @@ def test_generate_threaded_inserts_success(monkeypatch):
     assert len(calls) == 6  # 12 rows in batches of 2
 
 
+# Test that empty chunks (all NaNs) are skipped and produce zero batches
 def test_generate_threaded_inserts_edge_empty_chunk(monkeypatch):
     ds = _build_cartesian_ds(fill_nan=True)
     grid_id_map, time_id_map = _build_maps()
@@ -621,6 +633,7 @@ def test_generate_threaded_inserts_edge_empty_chunk(monkeypatch):
     assert called["n"] == 0
 
 
+# Test missing ID maps result in zero inserts, and worker exceptions propagate
 def test_generate_threaded_inserts_edge_missing_ids_and_worker_error(monkeypatch):
     ds = _build_cartesian_ds()
     grid_id_map, time_id_map = _build_maps()
@@ -660,6 +673,341 @@ def test_generate_threaded_inserts_edge_missing_ids_and_worker_error(monkeypatch
             var_id=1,
             engine=object(),
         )
+
+
+# ============================================================================
+# Unit tests for generate_threaded_inserts helper functions
+# ============================================================================
+
+
+def test__q_respects_round_digits(monkeypatch):
+    """Test that _q rounds floats according to ROUND_DIGITS setting."""
+    # Test with ROUND_DIGITS=2
+    monkeypatch.setattr(postdb, "ROUND_DIGITS", 2)
+    assert postdb._q(10.12345) == 10.12
+    assert postdb._q(10.126) == 10.13
+    assert postdb._q(-5.6789) == -5.68
+    assert postdb._q(0.001) == 0.0
+
+    # Test with ROUND_DIGITS=4 (default)
+    monkeypatch.setattr(postdb, "ROUND_DIGITS", 4)
+    assert postdb._q(10.12345) == 10.1235
+    assert postdb._q(10.123456789) == 10.1235
+    assert postdb._q(-5.67891234) == -5.6789
+
+    # Test type conversion for NumPy scalars
+    assert postdb._q(np.float64(10.12345)) == 10.1235
+    assert isinstance(postdb._q(np.float64(10.12345)), float)
+
+
+def test__yield_chunks_full_cover_and_counts():
+    """Test that _yield_chunks produces correct number of chunks and covers all data."""
+    # Create dataset with sizes that exercise chunk boundaries
+    times = np.array(
+        ["2023-01-01", "2023-02-01", "2023-03-01", "2023-04-01"], dtype="datetime64[ns]"
+    )
+    lats = np.array([10.1, 10.2, 10.3], dtype=float)
+    lons = np.array([10.1, 10.2, 10.3, 10.4, 10.5], dtype=float)
+    values = np.arange(60, dtype=float).reshape(4, 3, 5)
+
+    ds = xr.Dataset(
+        {"t2m": (("time", "latitude", "longitude"), values)},
+        coords={"time": times, "latitude": lats, "longitude": lons},
+    )
+
+    # Chunk sizes: t_chunk=2, lat_chunk=2, lon_chunk=3
+    # Expected chunks: ceil(4/2) * ceil(3/2) * ceil(5/3) = 2 * 2 * 2 = 8 chunks
+    chunks = list(postdb._yield_chunks(ds, t_chunk=2, lat_chunk=2, lon_chunk=3))
+    assert len(chunks) == 8
+
+    # Verify each chunk has correct sizes
+    for chunk in chunks:
+        assert chunk.sizes["time"] <= 2
+        assert chunk.sizes["latitude"] <= 2
+        assert chunk.sizes["longitude"] <= 3
+
+    # Verify all coordinates are covered (de-duplicate and check)
+    all_times = []
+    all_lats = []
+    all_lons = []
+    for chunk in chunks:
+        all_times.extend(chunk.time.values)
+        all_lats.extend(chunk.latitude.values)
+        all_lons.extend(chunk.longitude.values)
+
+    assert len(set(all_times)) == 4  # All 4 time points covered
+    assert len(set(all_lats)) == 3  # All 3 latitudes covered
+    assert len(set(all_lons)) == 5  # All 5 longitudes covered
+
+
+def test__yield_chunks_single_large_chunk():
+    """Test that chunk sizes larger than dataset yield a single chunk."""
+    ds = _build_cartesian_ds()
+
+    # Chunk sizes larger than dataset dimensions
+    chunks = list(postdb._yield_chunks(ds, t_chunk=100, lat_chunk=100, lon_chunk=100))
+    assert len(chunks) == 1
+
+    # Single chunk should match original dataset sizes
+    chunk = chunks[0]
+    assert chunk.sizes["time"] == ds.sizes["time"]
+    assert chunk.sizes["latitude"] == ds.sizes["latitude"]
+    assert chunk.sizes["longitude"] == ds.sizes["longitude"]
+
+
+def test__process_chunk_drops_all_nan_latitudes():
+    """Test that _process_chunk drops latitude rows that are all NaN."""
+    # Create dataset where one latitude row is all NaN
+    times = np.array(["2023-01-01"], dtype="datetime64[ns]")
+    lats = np.array([10.1, 10.2, 10.3], dtype=float)
+    lons = np.array([10.1, 10.2], dtype=float)
+    values = np.array(
+        [
+            [[1.0, 2.0], [np.nan, np.nan], [3.0, 4.0]]  # middle lat row is all NaN
+        ]
+    )
+
+    ds_chunk = xr.Dataset(
+        {"t2m": (("time", "latitude", "longitude"), values)},
+        coords={"time": times, "latitude": lats, "longitude": lons},
+    )
+
+    grid_id_map = {
+        (10.1, 10.1): 1,
+        (10.1, 10.2): 2,
+        (10.2, 10.1): 3,
+        (10.2, 10.2): 4,
+        (10.3, 10.1): 5,
+        (10.3, 10.2): 6,
+    }
+    time_id_map = {_build_time_key("2023-01-01"): 1}
+    var_id = 1
+
+    result = postdb._process_chunk(ds_chunk, "t2m", grid_id_map, time_id_map, var_id)
+
+    # Should have 4 entries (2 for lat=10.1, 2 for lat=10.3), skipping lat=10.2
+    assert len(result) == 4
+    # Verify no entries for lat=10.2
+    grid_ids_in_result = {r["grid_id"] for r in result}
+    assert 3 not in grid_ids_in_result  # grid_id 3 corresponds to (10.2, 10.1)
+    assert 4 not in grid_ids_in_result  # grid_id 4 corresponds to (10.2, 10.2)
+
+
+def test__process_chunk_returns_empty_for_all_nan():
+    """Test that _process_chunk returns empty list for all-NaN datasets."""
+    ds_chunk = _build_cartesian_ds(fill_nan=True)
+    grid_id_map, time_id_map = _build_maps()
+
+    result = postdb._process_chunk(ds_chunk, "t2m", grid_id_map, time_id_map, var_id=1)
+    assert result == []
+
+
+def test__process_chunk_returns_empty_for_invalid_ndim(monkeypatch):
+    """Test that _process_chunk returns empty list for corrupted data (wrong ndim)."""
+    # Create a normal 3D dataset
+    ds_chunk = _build_cartesian_ds()
+    grid_id_map, time_id_map = _build_maps()
+
+    # Monkeypatch the DataArray.values property to return a 2D array
+    # This simulates the corruption scenario that the guard is meant to catch
+    class MockDataArray:
+        def __init__(self, original_da):
+            self._original = original_da
+            self.time = original_da.time
+            self.latitude = original_da.latitude
+            self.longitude = original_da.longitude
+            self.sizes = original_da.sizes
+
+        def load(self):
+            return self
+
+        def dropna(self, dim, how):
+            return self
+
+        @property
+        def size(self):
+            return self._original.size
+
+        @property
+        def values(self):
+            # Return 2D array instead of 3D to trigger the guard
+            orig_values = self._original.values
+            return orig_values.reshape(orig_values.shape[0], -1)
+
+    original_getitem = xr.Dataset.__getitem__
+
+    def _mock_getitem(self, key):
+        result = original_getitem(self, key)
+        if key == "t2m":
+            return MockDataArray(result)
+        return result
+
+    monkeypatch.setattr(xr.Dataset, "__getitem__", _mock_getitem)
+
+    result = postdb._process_chunk(ds_chunk, "t2m", grid_id_map, time_id_map, var_id=1)
+    # Should return empty list due to ndim != 3 guard
+    assert result == []
+
+
+def test__process_chunk_forwards_to_get_var_values_mapping(monkeypatch):
+    """Test that _process_chunk correctly forwards data to get_var_values_mapping."""
+    ds_chunk = _build_cartesian_ds()
+    grid_id_map, time_id_map = _build_maps()
+
+    captured_args = {}
+
+    def _capture_get_var_values_mapping(
+        times, time_id_map, grid_id_map, var_id, lats, lons, values
+    ):
+        captured_args["times"] = times
+        captured_args["time_id_map"] = time_id_map
+        captured_args["grid_id_map"] = grid_id_map
+        captured_args["var_id"] = var_id
+        captured_args["lats"] = lats
+        captured_args["lons"] = lons
+        captured_args["values"] = values
+        return [{"grid_id": 1, "time_id": 1, "var_id": 99, "value": 1.0}]  # sentinel
+
+    monkeypatch.setattr(
+        postdb, "get_var_values_mapping", _capture_get_var_values_mapping
+    )
+
+    result = postdb._process_chunk(ds_chunk, "t2m", grid_id_map, time_id_map, var_id=99)
+
+    # Verify forwarding
+    assert len(result) == 1
+    assert result[0]["var_id"] == 99
+    assert captured_args["var_id"] == 99
+    assert captured_args["times"].shape == (2,)  # 2 time points
+    assert captured_args["lats"].shape == (2,)  # 2 latitudes
+    assert captured_args["lons"].shape == (3,)  # 3 longitudes
+    assert captured_args["values"].shape == (2, 2, 3)  # (time, lat, lon)
+
+
+def test_get_var_values_mapping_happy_path(monkeypatch):
+    """Test get_var_values_mapping with complete ID maps and no NaNs."""
+    monkeypatch.setattr(postdb, "ROUND_DIGITS", 4)
+
+    times = np.array(
+        ["2023-01-01T00:00:00", "2023-02-01T12:30:00"], dtype="datetime64[ns]"
+    )
+    lats = np.array([10.12345, 10.23456], dtype=float)
+    lons = np.array([10.11111, 10.22222, 10.33333], dtype=float)
+    values = np.arange(12, dtype=float).reshape(2, 2, 3)
+
+    # Build maps with rounded keys
+    grid_id_map = {
+        (round(10.12345, 4), round(10.11111, 4)): 1,
+        (round(10.12345, 4), round(10.22222, 4)): 2,
+        (round(10.12345, 4), round(10.33333, 4)): 3,
+        (round(10.23456, 4), round(10.11111, 4)): 4,
+        (round(10.23456, 4), round(10.22222, 4)): 5,
+        (round(10.23456, 4), round(10.33333, 4)): 6,
+    }
+    time_id_map = {
+        _build_time_key("2023-01-01"): 1,
+        _build_time_key("2023-02-01"): 2,
+    }
+    var_id = 42
+
+    result = postdb.get_var_values_mapping(
+        times, time_id_map, grid_id_map, var_id, lats, lons, values
+    )
+
+    # Should have 12 entries (2 * 2 * 3)
+    assert len(result) == 12
+
+    # Verify structure of first entry
+    assert "grid_id" in result[0]
+    assert "time_id" in result[0]
+    assert "var_id" in result[0]
+    assert "value" in result[0]
+    assert result[0]["var_id"] == 42
+
+    # Verify values match
+    assert result[0]["value"] == 0.0  # values[0, 0, 0]
+    assert result[11]["value"] == 11.0  # values[1, 1, 2]
+
+
+def test_get_var_values_mapping_skips_missing_ids_and_nans(monkeypatch):
+    """Test that get_var_values_mapping skips NaNs and missing ID mappings."""
+    monkeypatch.setattr(postdb, "ROUND_DIGITS", 4)
+
+    times = np.array(["2023-01-01", "2023-02-01"], dtype="datetime64[ns]")
+    lats = np.array([10.1, 10.2], dtype=float)
+    lons = np.array([10.1, 10.2, 10.3], dtype=float)
+    values = np.array(
+        [
+            [[1.0, np.nan, 3.0], [4.0, 5.0, 6.0]],  # one NaN in first time slice
+            [[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]],
+        ]
+    )
+
+    # Missing some grid IDs and time IDs
+    grid_id_map = {
+        (10.1, 10.1): 1,
+        (10.1, 10.3): 3,  # missing (10.1, 10.2)
+        (10.2, 10.1): 4,
+        (10.2, 10.2): 5,
+        # missing (10.2, 10.3)
+    }
+    time_id_map = {
+        _build_time_key("2023-01-01"): 1,
+        # missing 2023-02-01
+    }
+    var_id = 1
+
+    result = postdb.get_var_values_mapping(
+        times, time_id_map, grid_id_map, var_id, lats, lons, values
+    )
+
+    # Expected: only entries for time=2023-01-01, non-NaN values, and existing grid IDs
+    # time=0: (10.1,10.1)=1.0, (10.1,10.3)=3.0, (10.2,10.1)=4.0, (10.2,10.2)=5.0 = 4 entries
+    # time=1: skipped (missing time_id)
+    assert len(result) == 4
+
+    # Verify no NaN values
+    for entry in result:
+        assert not np.isnan(entry["value"])
+
+    # Verify all entries have valid IDs
+    for entry in result:
+        assert entry["time_id"] == 1  # only first time point
+        assert entry["grid_id"] in [1, 3, 4, 5]  # only existing grid IDs
+
+
+def test_get_var_values_mapping_time_key_normalization(monkeypatch):
+    """Test that get_var_values_mapping normalizes time keys correctly."""
+    monkeypatch.setattr(postdb, "ROUND_DIGITS", 4)
+
+    # Times with full precision (hours/minutes)
+    times = np.array(
+        [
+            "2023-01-01T14:30:00",
+            "2023-02-01T23:59:59",
+        ],
+        dtype="datetime64[ns]",
+    )
+    lats = np.array([10.1], dtype=float)
+    lons = np.array([10.1], dtype=float)
+    values = np.array([[[1.0]], [[2.0]]])
+
+    # Map uses normalized midnight dates
+    time_id_map = {
+        _build_time_key("2023-01-01"): 1,
+        _build_time_key("2023-02-01"): 2,
+    }
+    grid_id_map = {(10.1, 10.1): 1}
+    var_id = 1
+
+    result = postdb.get_var_values_mapping(
+        times, time_id_map, grid_id_map, var_id, lats, lons, values
+    )
+
+    # Should find both time IDs despite different hour/minute precision
+    assert len(result) == 2
+    assert {r["time_id"] for r in result} == {1, 2}
+    assert {r["value"] for r in result} == {1.0, 2.0}
 
 
 def test_get_var_value(get_session):
