@@ -190,7 +190,7 @@ def test_autovacuum_restoration_on_failure(get_engine_with_tables):
             # IMPORTANT: The code explicitly sets it to true.
             reloptions = row[0] if row else []
             if reloptions:
-                opts = dict(x.split("=") for x in reloptions)
+                opts = {k: v for k, v in (x.split("=") for x in reloptions)}
                 assert opts.get("autovacuum_enabled") == "true", (
                     f"Autovacuum not enabled for {table}: {reloptions}"
                 )
@@ -215,7 +215,7 @@ def test_autovacuum_restoration_on_success(get_engine_with_tables):
             row = result.fetchone()
             reloptions = row[0] if row else []
             if reloptions:
-                opts = dict(x.split("=") for x in reloptions)
+                opts = {k: v for k, v in (x.split("=") for x in reloptions)}
                 assert opts.get("autovacuum_enabled") == "true", (
                     f"Autovacuum not enabled for {table}: {reloptions}"
                 )

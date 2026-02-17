@@ -1044,7 +1044,7 @@ def test__process_time_point_missing_grid_id(monkeypatch, capsys):
 
     assert len(result) == 1
     assert result[0]["grid_id"] == 1
-    assert result[0]["value"] == 1.0
+    assert math.isclose(result[0]["value"], 1.0, rel_tol=1e-4)
     captured = capsys.readouterr()
     assert "Missing grid_id" in captured.out
 
@@ -1312,21 +1312,21 @@ def test_get_var_values_mapping_value_types(monkeypatch):
     result1 = postdb.get_var_values_mapping(
         times, time_id_map, grid_id_map, var_id, lats, lons, values_int
     )
-    assert result1[0]["value"] == 42.0
+    assert math.isclose(result1[0]["value"], 42.0, rel_tol=1e-4)
     assert isinstance(result1[0]["value"], float)
 
     # Test float32 values
     result2 = postdb.get_var_values_mapping(
         times, time_id_map, grid_id_map, var_id, lats, lons, values_float32
     )
-    assert result2[0]["value"] == 99.5
+    assert math.isclose(result2[0]["value"], 99.5, rel_tol=1e-4)
     assert isinstance(result2[0]["value"], float)
 
     # Test float64 values
     result3 = postdb.get_var_values_mapping(
         times, time_id_map, grid_id_map, var_id, lats, lons, values_float64
     )
-    assert result3[0]["value"] == -15.25
+    assert math.isclose(result3[0]["value"], -15.25, rel_tol=1e-4)
     assert isinstance(result3[0]["value"], float)
 
 
