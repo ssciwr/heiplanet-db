@@ -675,11 +675,6 @@ def test_generate_threaded_inserts_edge_missing_ids_and_worker_error(monkeypatch
         )
 
 
-# ============================================================================
-# Unit tests for generate_threaded_inserts helper functions
-# ============================================================================
-
-
 def test__q_respects_round_digits(monkeypatch):
     """Test that _q rounds floats according to ROUND_DIGITS setting."""
     # Test with ROUND_DIGITS=2
@@ -884,6 +879,176 @@ def test__process_chunk_forwards_to_get_var_values_mapping(monkeypatch):
     assert captured_args["values"].shape == (2, 2, 3)  # (time, lat, lon)
 
 
+def test__normalize_time_key():
+    """Test that _normalize_time_key normalizes datetime64 to date-only midnight."""
+    # Test with full datetime precision
+    dt1 = np.datetime64("2023-01-15T14:30:45.123456789", "ns")
+    normalized = postdb._normalize_time_key(dt1)
+    expected = np.datetime64("2023-01-15T00:00:00", "ns")
+    assert normalized == expected
+
+    # Test with date-only input
+    dt2 = np.datetime64("2023-02-28", "ns")
+    normalized = postdb._normalize_time_key(dt2)
+    expected = np.datetime64("2023-02-28T00:00:00", "ns")
+    assert normalized == expected
+
+    # Test with different time components
+    dt3 = np.datetime64("2023-12-31T23:59:59", "ns")
+    normalized = postdb._normalize_time_key(dt3)
+    expected = np.datetime64("2023-12-31T00:00:00", "ns")
+    assert normalized == expected
+
+    # Test leap year date
+    dt4 = np.datetime64("2024-02-29T12:00:00", "ns")
+    normalized = postdb._normalize_time_key(dt4)
+    expected = np.datetime64("2024-02-29T00:00:00", "ns")
+    assert normalized == expected
+
+
+def test__build_var_value_entry():
+    """Test that _build_var_value_entry creates correct dictionary structure."""
+    result = postdb._build_var_value_entry(grid_id=1, time_id=2, var_id=3, value=42.5)
+
+    assert isinstance(result, dict)
+    assert result == {
+        "grid_id": 1,
+        "time_id": 2,
+        "var_id": 3,
+        "value": 42.5,
+    }
+
+    # Test type conversions
+    result2 = postdb._build_var_value_entry(
+        grid_id=np.int64(100), time_id=np.int32(200), var_id=300, value=np.float64(99.9)
+    )
+    assert isinstance(result2["grid_id"], int)
+    assert isinstance(result2["time_id"], int)
+    assert isinstance(result2["var_id"], int)
+    assert isinstance(result2["value"], float)
+    assert result2["grid_id"] == 100
+    assert result2["time_id"] == 200
+    assert result2["var_id"] == 300
+    assert math.isclose(result2["value"], 99.9, rel_tol=1e-4)
+
+    # Test with zero and negative values
+    result3 = postdb._build_var_value_entry(
+        grid_id=0, time_id=0, var_id=0, value=np.float64(-1.5)
+    )
+    assert result3 == {
+        "grid_id": 0,
+        "time_id": 0,
+        "var_id": 0,
+        "value": np.float64(-1.5),
+    }
+
+
+def test__process_time_point_happy_path(monkeypatch):
+    """Test _process_time_point with complete mappings and valid data."""
+    monkeypatch.setattr(postdb, "ROUND_DIGITS", 4)
+
+    times = np.array(["2023-01-01", "2023-02-01"], dtype="datetime64[ns]")
+    lats = np.array([10.1, 10.2], dtype=float)
+    lons = np.array([10.1, 10.2], dtype=float)
+    values = np.array([[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]])
+
+    grid_id_map = {
+        (10.1, 10.1): 1,
+        (10.1, 10.2): 2,
+        (10.2, 10.1): 3,
+        (10.2, 10.2): 4,
+    }
+    time_id_map = {_build_time_key("2023-01-01"): 10, _build_time_key("2023-02-01"): 20}
+    var_id = 5
+
+    # Process first time point
+    result = postdb._process_time_point(
+        0, times[0], time_id_map, grid_id_map, var_id, lats, lons, values
+    )
+
+    assert len(result) == 4  # 2 lats * 2 lons
+    assert all(entry["time_id"] == 10 for entry in result)
+    assert all(entry["var_id"] == 5 for entry in result)
+    assert {entry["value"] for entry in result} == {1.0, 2.0, 3.0, 4.0}
+    assert {entry["grid_id"] for entry in result} == {1, 2, 3, 4}
+
+
+def test__process_time_point_skips_nans(monkeypatch):
+    """Test that _process_time_point skips NaN values."""
+    monkeypatch.setattr(postdb, "ROUND_DIGITS", 4)
+
+    times = np.array(["2023-01-01"], dtype="datetime64[ns]")
+    lats = np.array([10.1, 10.2], dtype=float)
+    lons = np.array([10.1, 10.2], dtype=float)
+    values = np.array([[[1.0, np.nan], [np.nan, 4.0]]])
+
+    grid_id_map = {
+        (10.1, 10.1): 1,
+        (10.1, 10.2): 2,
+        (10.2, 10.1): 3,
+        (10.2, 10.2): 4,
+    }
+    time_id_map = {_build_time_key("2023-01-01"): 1}
+    var_id = 1
+
+    result = postdb._process_time_point(
+        0, times[0], time_id_map, grid_id_map, var_id, lats, lons, values
+    )
+
+    assert len(result) == 2  # Only non-NaN values
+    assert {entry["value"] for entry in result} == {1.0, 4.0}
+    assert all(not np.isnan(entry["value"]) for entry in result)
+
+
+def test__process_time_point_missing_time_id(monkeypatch, capsys):
+    """Test that _process_time_point returns empty list when time_id is missing."""
+    monkeypatch.setattr(postdb, "ROUND_DIGITS", 4)
+
+    times = np.array(["2023-01-01"], dtype="datetime64[ns]")
+    lats = np.array([10.1], dtype=float)
+    lons = np.array([10.1], dtype=float)
+    values = np.array([[[1.0]]])
+
+    grid_id_map = {(10.1, 10.1): 1}
+    time_id_map = {}  # Missing time_id
+    var_id = 1
+
+    result = postdb._process_time_point(
+        0, times[0], time_id_map, grid_id_map, var_id, lats, lons, values
+    )
+
+    assert result == []
+    captured = capsys.readouterr()
+    assert "Missing time_id" in captured.out
+
+
+def test__process_time_point_missing_grid_id(monkeypatch, capsys):
+    """Test that _process_time_point skips entries with missing grid_id."""
+    monkeypatch.setattr(postdb, "ROUND_DIGITS", 4)
+
+    times = np.array(["2023-01-01"], dtype="datetime64[ns]")
+    lats = np.array([10.1, 10.2], dtype=float)
+    lons = np.array([10.1, 10.2], dtype=float)
+    values = np.array([[[1.0, 2.0], [3.0, 4.0]]])
+
+    grid_id_map = {
+        (10.1, 10.1): 1,
+        # Missing (10.1, 10.2), (10.2, 10.1), (10.2, 10.2)
+    }
+    time_id_map = {_build_time_key("2023-01-01"): 1}
+    var_id = 1
+
+    result = postdb._process_time_point(
+        0, times[0], time_id_map, grid_id_map, var_id, lats, lons, values
+    )
+
+    assert len(result) == 1
+    assert result[0]["grid_id"] == 1
+    assert result[0]["value"] == 1.0
+    captured = capsys.readouterr()
+    assert "Missing grid_id" in captured.out
+
+
 def test_get_var_values_mapping_happy_path(monkeypatch):
     """Test get_var_values_mapping with complete ID maps and no NaNs."""
     monkeypatch.setattr(postdb, "ROUND_DIGITS", 4)
@@ -893,16 +1058,18 @@ def test_get_var_values_mapping_happy_path(monkeypatch):
     )
     lats = np.array([10.12345, 10.23456], dtype=float)
     lons = np.array([10.11111, 10.22222, 10.33333], dtype=float)
-    values = np.arange(12, dtype=float).reshape(2, 2, 3)
+    values = np.arange(12, dtype=np.float64).reshape(2, 2, 3)
 
     # Build maps with rounded keys
+    # ensure consistent rounding for the different float types
+    # and float comparisons
     grid_id_map = {
-        (round(10.12345, 4), round(10.11111, 4)): 1,
-        (round(10.12345, 4), round(10.22222, 4)): 2,
-        (round(10.12345, 4), round(10.33333, 4)): 3,
-        (round(10.23456, 4), round(10.11111, 4)): 4,
-        (round(10.23456, 4), round(10.22222, 4)): 5,
-        (round(10.23456, 4), round(10.33333, 4)): 6,
+        (postdb._q(float(lats[0])), postdb._q(lons[0])): 1,
+        (postdb._q(lats[0]), postdb._q(lons[1])): 2,
+        (postdb._q(lats[0]), postdb._q(lons[2])): 3,
+        (postdb._q(lats[1]), postdb._q(lons[0])): 4,
+        (postdb._q(lats[1]), postdb._q(lons[1])): 5,
+        (postdb._q(lats[1]), postdb._q(lons[2])): 6,
     }
     time_id_map = {
         _build_time_key("2023-01-01"): 1,
@@ -917,19 +1084,30 @@ def test_get_var_values_mapping_happy_path(monkeypatch):
     # Should have 12 entries (2 * 2 * 3)
     assert len(result) == 12
 
-    # Verify structure of first entry
-    assert "grid_id" in result[0]
-    assert "time_id" in result[0]
-    assert "var_id" in result[0]
-    assert "value" in result[0]
-    assert result[0]["var_id"] == 42
+    # Verify structure of entries
+    for entry in result:
+        assert isinstance(entry, dict)
+        assert set(entry.keys()) == {"grid_id", "time_id", "var_id", "value"}
+        assert isinstance(entry["grid_id"], int)
+        assert isinstance(entry["time_id"], int)
+        assert isinstance(entry["var_id"], int)
+        assert isinstance(entry["value"], float)
+        assert entry["var_id"] == 42
 
-    # Verify values match
+    # Verify values match expected order (time, lat, lon)
     assert result[0]["value"] == 0.0  # values[0, 0, 0]
+    assert result[0]["time_id"] == 1
+    assert result[0]["grid_id"] == 1
+
     assert result[11]["value"] == 11.0  # values[1, 1, 2]
+    assert result[11]["time_id"] == 2
+    assert result[11]["grid_id"] == 6
+
+    # Verify all time points are represented
+    assert {entry["time_id"] for entry in result} == {1, 2}
 
 
-def test_get_var_values_mapping_skips_missing_ids_and_nans(monkeypatch):
+def test_get_var_values_mapping_skips_missing_ids_and_nans(monkeypatch, capsys):
     """Test that get_var_values_mapping skips NaNs and missing ID mappings."""
     monkeypatch.setattr(postdb, "ROUND_DIGITS", 4)
 
@@ -969,18 +1147,25 @@ def test_get_var_values_mapping_skips_missing_ids_and_nans(monkeypatch):
     # Verify no NaN values
     for entry in result:
         assert not np.isnan(entry["value"])
+        assert isinstance(entry["value"], (int, float))
 
     # Verify all entries have valid IDs
     for entry in result:
         assert entry["time_id"] == 1  # only first time point
         assert entry["grid_id"] in [1, 3, 4, 5]  # only existing grid IDs
+        assert entry["var_id"] == 1
+
+    # Verify warning messages are printed
+    captured = capsys.readouterr()
+    assert "Missing time_id" in captured.out
+    assert "Missing grid_id" in captured.out
 
 
 def test_get_var_values_mapping_time_key_normalization(monkeypatch):
     """Test that get_var_values_mapping normalizes time keys correctly."""
     monkeypatch.setattr(postdb, "ROUND_DIGITS", 4)
 
-    # Times with full precision (hours/minutes)
+    # Times with full precision (hours/minutes/seconds)
     times = np.array(
         [
             "2023-01-01T14:30:00",
@@ -1008,6 +1193,141 @@ def test_get_var_values_mapping_time_key_normalization(monkeypatch):
     assert len(result) == 2
     assert {r["time_id"] for r in result} == {1, 2}
     assert {r["value"] for r in result} == {1.0, 2.0}
+    assert all(r["grid_id"] == 1 for r in result)
+    assert all(r["var_id"] == 1 for r in result)
+
+
+def test_get_var_values_mapping_empty_arrays(monkeypatch):
+    """Test get_var_values_mapping with empty input arrays."""
+    monkeypatch.setattr(postdb, "ROUND_DIGITS", 4)
+
+    times = np.array([], dtype="datetime64[ns]")
+    lats = np.array([], dtype=float)
+    lons = np.array([], dtype=float)
+    values = np.array([]).reshape(0, 0, 0)
+
+    grid_id_map = {}
+    time_id_map = {}
+    var_id = 1
+
+    result = postdb.get_var_values_mapping(
+        times, time_id_map, grid_id_map, var_id, lats, lons, values
+    )
+
+    assert result == []
+
+
+def test_get_var_values_mapping_single_point(monkeypatch):
+    """Test get_var_values_mapping with single time/lat/lon point."""
+    monkeypatch.setattr(postdb, "ROUND_DIGITS", 4)
+
+    times = np.array(["2023-01-01"], dtype="datetime64[ns]")
+    lats = np.array([10.1], dtype=float)
+    lons = np.array([20.2], dtype=float)
+    values = np.array([[[42.5]]])
+
+    grid_id_map = {(10.1, 20.2): 100}
+    time_id_map = {_build_time_key("2023-01-01"): 50}
+    var_id = 7
+
+    result = postdb.get_var_values_mapping(
+        times, time_id_map, grid_id_map, var_id, lats, lons, values
+    )
+
+    assert len(result) == 1
+    assert result[0] == {"grid_id": 100, "time_id": 50, "var_id": 7, "value": 42.5}
+
+
+def test_get_var_values_mapping_all_nans(monkeypatch):
+    """Test get_var_values_mapping when all values are NaN."""
+    monkeypatch.setattr(postdb, "ROUND_DIGITS", 4)
+
+    times = np.array(["2023-01-01"], dtype="datetime64[ns]")
+    lats = np.array([10.1, 10.2], dtype=float)
+    lons = np.array([20.1, 20.2], dtype=float)
+    values = np.full((1, 2, 2), np.nan)
+
+    grid_id_map = {
+        (10.1, 20.1): 1,
+        (10.1, 20.2): 2,
+        (10.2, 20.1): 3,
+        (10.2, 20.2): 4,
+    }
+    time_id_map = {_build_time_key("2023-01-01"): 1}
+    var_id = 1
+
+    result = postdb.get_var_values_mapping(
+        times, time_id_map, grid_id_map, var_id, lats, lons, values
+    )
+
+    assert result == []
+
+
+def test_get_var_values_mapping_coordinate_rounding(monkeypatch):
+    """Test that get_var_values_mapping correctly rounds coordinates using _q."""
+    monkeypatch.setattr(postdb, "ROUND_DIGITS", 2)
+
+    times = np.array(["2023-01-01"], dtype="datetime64[ns]")
+    lats = np.array([10.123456, 10.234567], dtype=float)
+    lons = np.array([20.111111, 20.222222], dtype=float)
+    values = np.array([[[1.0, 2.0], [3.0, 4.0]]])
+
+    # Grid map uses rounded coordinates (ROUND_DIGITS=2)
+    grid_id_map = {
+        (round(10.123456, 2), round(20.111111, 2)): 1,
+        (round(10.123456, 2), round(20.222222, 2)): 2,
+        (round(10.234567, 2), round(20.111111, 2)): 3,
+        (round(10.234567, 2), round(20.222222, 2)): 4,
+    }
+    time_id_map = {_build_time_key("2023-01-01"): 1}
+    var_id = 1
+
+    result = postdb.get_var_values_mapping(
+        times, time_id_map, grid_id_map, var_id, lats, lons, values
+    )
+
+    assert len(result) == 4
+    assert {entry["grid_id"] for entry in result} == {1, 2, 3, 4}
+    assert {entry["value"] for entry in result} == {1.0, 2.0, 3.0, 4.0}
+
+
+def test_get_var_values_mapping_value_types(monkeypatch):
+    """Test get_var_values_mapping handles different numeric value types."""
+    monkeypatch.setattr(postdb, "ROUND_DIGITS", 4)
+
+    times = np.array(["2023-01-01"], dtype="datetime64[ns]")
+    lats = np.array([10.1], dtype=float)
+    lons = np.array([20.1], dtype=float)
+
+    # Test with different numeric types
+    values_int = np.array([[[42]]], dtype=int)
+    values_float32 = np.array([[[99.5]]], dtype=np.float32)
+    values_float64 = np.array([[[-15.25]]], dtype=np.float64)
+
+    grid_id_map = {(10.1, 20.1): 1}
+    time_id_map = {_build_time_key("2023-01-01"): 1}
+    var_id = 1
+
+    # Test integer values
+    result1 = postdb.get_var_values_mapping(
+        times, time_id_map, grid_id_map, var_id, lats, lons, values_int
+    )
+    assert result1[0]["value"] == 42.0
+    assert isinstance(result1[0]["value"], float)
+
+    # Test float32 values
+    result2 = postdb.get_var_values_mapping(
+        times, time_id_map, grid_id_map, var_id, lats, lons, values_float32
+    )
+    assert result2[0]["value"] == 99.5
+    assert isinstance(result2[0]["value"], float)
+
+    # Test float64 values
+    result3 = postdb.get_var_values_mapping(
+        times, time_id_map, grid_id_map, var_id, lats, lons, values_float64
+    )
+    assert result3[0]["value"] == -15.25
+    assert isinstance(result3[0]["value"], float)
 
 
 def test_get_var_value(get_session):

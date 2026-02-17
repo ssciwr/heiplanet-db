@@ -44,8 +44,29 @@ ROUND_DIGITS = int(os.environ.get("ROUND_DIGITS", 4))
 TIMEOUT = int(os.environ.get("TIMEOUT", 300))
 
 
-def _q(x: float) -> float:
-    return round(float(x), ROUND_DIGITS)
+def _q(value):
+    """Round a float coordinate to ROUND_DIGITS precision.
+
+    Ensures consistent rounding behavior for both Python floats and NumPy scalars.
+    Returns a Python float for reliable dictionary key lookups.
+    """
+    # Convert NumPy scalars to Python float first
+    if isinstance(value, (np.floating, np.integer)):
+        value = float(value)
+    return round(value, ROUND_DIGITS)
+
+
+def _normalize_time_key(t_val: np.datetime64) -> np.datetime64:
+    """Normalize a datetime64 value to a date-only key for time_id_map lookup.
+
+    Args:
+        t_val: datetime64 value (may include time components).
+
+    Returns:
+        datetime64[ns] normalized to midnight of the date.
+    """
+    ts = pd.Timestamp(t_val)
+    return np.datetime64(pd.to_datetime(f"{ts.year}-{ts.month}-{ts.day}"), "ns")
 
 
 # Base declarative class
@@ -660,7 +681,10 @@ def get_id_maps(session: Session) -> tuple[dict, dict, dict]:
         )
 
         for grid_id, lat, lon in grid_points:
-            grid_id_map[(_q(lat), _q(lon))] = grid_id
+            # Convert to Python float first, then apply _q() for consistent rounding
+            lat_float = float(lat)
+            lon_float = float(lon)
+            grid_id_map[(_q(lat_float), _q(lon_float))] = grid_id
 
         session.expire_all()  # Clear session cache
 
@@ -887,6 +911,81 @@ def _process_chunk(
     )
 
 
+def _build_var_value_entry(
+    grid_id: int, time_id: int, var_id: int, value: float
+) -> dict:
+    """Build a single variable value entry dictionary for database insertion.
+
+    Args:
+        grid_id: Grid point ID.
+        time_id: Time point ID.
+        var_id: Variable type ID.
+        value: Variable value.
+
+    Returns:
+        Dictionary with keys: grid_id, time_id, var_id, value.
+    """
+    return {
+        "grid_id": int(grid_id),
+        "time_id": int(time_id),
+        "var_id": int(var_id),
+        "value": float(value),
+    }
+
+
+def _process_time_point(
+    t_i: int,
+    t_val: np.datetime64,
+    time_id_map: dict,
+    grid_id_map: dict,
+    var_id: int,
+    lats: np.ndarray,
+    lons: np.ndarray,
+    values: np.ndarray,
+) -> list[dict]:
+    """Process a single time point and return variable value entries.
+
+    Args:
+        t_i: Time index.
+        t_val: Time value (datetime64).
+        time_id_map: Mapping of datetime64 to time point ID.
+        grid_id_map: Mapping of (latitude, longitude) to grid point ID.
+        var_id: Variable type ID.
+        lats: Array of latitudes.
+        lons: Array of longitudes.
+        values: 3D array of variable values (time, lat, lon).
+
+    Returns:
+        List of variable value entry dictionaries.
+    """
+    time_key = _normalize_time_key(t_val)
+    time_id = time_id_map.get(time_key)
+    if time_id is None:
+        print(
+            f"Missing time_id for {time_key}. Available keys sample: {list(time_id_map.keys())[:5]}"
+        )
+        return []
+
+    var_values = []
+    for lat_i in range(len(lats)):
+        lat_val = _q(lats[lat_i])
+        for lon_i in range(len(lons)):
+            lon_val = _q(lons[lon_i])
+            val = float(values[t_i, lat_i, lon_i])
+
+            if np.isnan(val):
+                continue
+
+            grid_id = grid_id_map.get((lat_val, lon_val))
+            if grid_id is None:
+                print(f"Missing grid_id for ({lat_val}, {lon_val})")
+                continue
+
+            var_values.append(_build_var_value_entry(grid_id, time_id, var_id, val))
+
+    return var_values
+
+
 def get_var_values_mapping(
     times: np.ndarray,
     time_id_map: dict,
@@ -912,35 +1011,11 @@ def get_var_values_mapping(
     var_values = []
     # Loop order: time, lat, lon to match xarray dimension order (time, latitude, longitude)
     for t_i in range(len(times)):
-        t_val = times[t_i]
-        ts = pd.Timestamp(t_val)
-        time_key = np.datetime64(pd.to_datetime(f"{ts.year}-{ts.month}-{ts.day}"), "ns")
-        time_id = time_id_map.get(time_key)
-        if time_id is None:
-            print(
-                f"Missing time_id for {time_key}. Available keys sample: {list(time_id_map.keys())[:5]}"
-            )
-            continue
-        for lat_i in range(len(lats)):
-            lat_val = _q(lats[lat_i])
-            for lon_i in range(len(lons)):
-                lon_val = _q(lons[lon_i])
-                val = float(values[t_i, lat_i, lon_i])  # Correct indexing order
-                if np.isnan(val):
-                    continue
-                grid_id = grid_id_map.get((lat_val, lon_val))
-                if grid_id is None:
-                    print(f"Missing grid_id for ({lat_val}, {lon_val})")
+        entries = _process_time_point(
+            t_i, times[t_i], time_id_map, grid_id_map, var_id, lats, lons, values
+        )
+        var_values.extend(entries)
 
-                if grid_id is not None:
-                    var_values.append(
-                        {
-                            "grid_id": int(grid_id),
-                            "time_id": int(time_id),
-                            "var_id": int(var_id),
-                            "value": float(val),
-                        }
-                    )
     del var_id, times, lats, lons, values
     gc.collect()
     return var_values

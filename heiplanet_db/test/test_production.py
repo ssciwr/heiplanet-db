@@ -29,7 +29,7 @@ def test_read_production_config(production_config: Traversable):
     assert dict2["var_name"][0]["name"] == "R0"
     assert (
         dict2["filename"]
-        == "era5_data_2025_07_2t_monthly_unicoords_adjlon_celsius_silver_output_JModel_global_ts20260206-161638_hssclap09.nc"
+        == "era5_data_2025_07_2t_monthly_unicoords_adjlon_celsius_output_JModel_global.nc"
     )
     assert dict2["host"] == "heibox"
     # read another config file

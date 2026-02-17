@@ -218,8 +218,8 @@ def get_dataset():
                 np.datetime64("2023-01-01", "ns"),
                 np.datetime64("2024-01-01", "ns"),
             ],
-            "latitude": [10.1, 10.2],
-            "longitude": [10.1, 10.2, 10.3],
+            "latitude": np.array([10.1, 10.2]),
+            "longitude": np.array([10.1, 10.2, 10.3]),
         },
     )
     dataset = xr.Dataset({"t2m": data_array})
