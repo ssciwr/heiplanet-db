@@ -38,8 +38,14 @@ except Exception:
     )
 allowed_origins = [
     f"http://{ip_address}",
+    f"http://{ip_address}:80",
+    f"http://{ip_address}:443",
     "http://localhost",
+    "http://localhost:80",
+    "http://localhost:443",
     "http://127.0.0.1",
+    "http://127.0.0.1:80",
+    "http://127.0.0.1:443",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
 ]
@@ -73,6 +79,7 @@ app.add_middleware(
     CORSMiddleware,
     # update this to https later when using ssl
     allow_origins=allowed_origins,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )

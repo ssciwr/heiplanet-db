@@ -798,7 +798,7 @@ def insert_var_values(
         var_id,
         engine,
     )
-
+    print("all threaded inserts completed.")
     return t_yearly_to_monthly, t_start_insert
 
 
