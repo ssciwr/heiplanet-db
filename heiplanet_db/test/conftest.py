@@ -45,20 +45,40 @@ def get_session(get_engine_with_tables):
 
     # tear down
     session.close()
+    connection.close()
 
 
-def retrieve_id_maps(session, dataset, var_type_data, to_monthly=False):
-    # insert data into the database
-    postdb.insert_grid_points(
-        session, dataset.latitude.values, dataset.longitude.values
+@pytest.fixture(scope="function", autouse=True)
+def clean_db(get_session):
+    yield
+    get_session.execute(
+        text(
+            """
+            TRUNCATE TABLE
+                var_value_nuts,
+                var_value,
+                grid_point_resolution,
+                resolution_group,
+                time_point,
+                grid_point,
+                var_type,
+                nuts_def
+            RESTART IDENTITY CASCADE
+            """
+        )
     )
-    postdb.insert_time_points(session, [(dataset.time.values, to_monthly)])
-    postdb.insert_var_types(session, var_type_data)
+    get_session.commit()
 
-    # get the id maps
-    grid_id_map, time_id_map, var_id_map = postdb.get_id_maps(session)
 
-    return grid_id_map, time_id_map, var_id_map
+@pytest.fixture
+def seed_base_data(get_session, get_dataset, get_engine_with_tables):
+    postdb.insert_var_types(
+        get_session, [{"name": "t2m", "unit": "K", "description": "2m temperature"}]
+    )
+    postdb.insert_grid_points(
+        get_session, get_dataset.latitude.values, get_dataset.longitude.values
+    )
+    postdb.insert_time_points(get_session, [(get_dataset.time.values, False)])
 
 
 @pytest.fixture(scope="function")
@@ -79,9 +99,7 @@ def insert_data(get_session, get_dataset, get_engine_with_tables):
     postdb.insert_time_points(get_session, [(get_dataset.time.values, False)])
 
     # get the id maps
-    grid_id_map, time_id_map, var_id_map = retrieve_id_maps(
-        get_session, get_dataset, var_type_data
-    )
+    grid_id_map, time_id_map, var_id_map = postdb.get_id_maps(get_session)
 
     # insert var values
     postdb.insert_var_values(
@@ -100,12 +118,21 @@ def insert_data(get_session, get_dataset, get_engine_with_tables):
 
     yield get_session
     # clean up
-    get_session.execute(text("TRUNCATE TABLE var_value RESTART IDENTITY CASCADE"))
-    get_session.execute(text("TRUNCATE TABLE var_type RESTART IDENTITY CASCADE"))
-    get_session.execute(text("TRUNCATE TABLE time_point RESTART IDENTITY CASCADE"))
-    get_session.execute(text("TRUNCATE TABLE grid_point RESTART IDENTITY CASCADE"))
     get_session.execute(
-        text("TRUNCATE TABLE resolution_group RESTART IDENTITY CASCADE")
+        text(
+            """
+            TRUNCATE TABLE
+                var_value_nuts,
+                var_value,
+                grid_point_resolution,
+                resolution_group,
+                time_point,
+                grid_point,
+                var_type,
+                nuts_def
+            RESTART IDENTITY CASCADE
+            """
+        )
     )
     get_session.commit()
 
@@ -182,17 +209,17 @@ def get_time_point_lists():
 @pytest.fixture()
 def get_dataset():
     rng = np.random.default_rng(42)
-    data = rng.random((2, 3, 2)) * 1000 + 273.15
+    data = rng.random((2, 2, 3)) * 1000 + 273.15
     data_array = xr.DataArray(
         data,
-        dims=["latitude", "longitude", "time"],
+        dims=["time", "latitude", "longitude"],
         coords={
-            "latitude": [10.1, 10.2],
-            "longitude": [10.1, 10.2, 10.3],
             "time": [
                 np.datetime64("2023-01-01", "ns"),
                 np.datetime64("2024-01-01", "ns"),
             ],
+            "latitude": np.array([10.1, 10.2]),
+            "longitude": np.array([10.1, 10.2, 10.3]),
         },
     )
     dataset = xr.Dataset({"t2m": data_array})
@@ -214,5 +241,5 @@ def get_varnuts_dataset():
             ],
         },
     )
-    dataset = xr.Dataset({"t2m_mean": data_array})
+    dataset = xr.Dataset({"t2m": data_array})
     return dataset

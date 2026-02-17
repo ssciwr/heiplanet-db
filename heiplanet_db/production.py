@@ -9,6 +9,7 @@ from heiplanet_db import postgresql_database as db
 import zipfile
 import xarray as xr
 from sqlalchemy import engine
+from sqlalchemy import text
 
 
 def read_production_config(dict_path: str | Traversable | Path | None = None) -> dict:
@@ -23,7 +24,9 @@ def read_production_config(dict_path: str | Traversable | Path | None = None) ->
             production database.
     """
     if dict_path is None:
-        dict_path = resources.files("heiplanet_db") / "data" / "production_config.yml"
+        dict_path = (
+            resources.files("heiplanet_db") / "data" / "production_config_small.yml"
+        )
     # check if the file exists
     if isinstance(dict_path, str):
         dict_path = Path(dict_path)
@@ -54,6 +57,7 @@ def get_production_data(url: str, filename: str, filehash: str, outputdir: Path)
             known_hash=filehash,
             fname=filename,
             path=outputdir,
+            progressbar=True,
         )
     except Exception as e:
         print(f"Error fetching data: {e}")
@@ -147,6 +151,7 @@ def insert_var_values(
         latitudes=r0_ds.latitude.to_numpy(),
         longitudes=r0_ds.longitude.to_numpy(),
     )
+    grid_point_session.commit()
     grid_point_session.close()
     # add time points
     time_point_session = db.create_session(engine)
@@ -156,11 +161,14 @@ def insert_var_values(
             (r0_ds.time.to_numpy(), False),
         ],
     )  # True means yearly data
+    time_point_session.commit()
     time_point_session.close()
     # get id maps for grid, time, and variable types
+    print("Getting id maps for grid, time, and variable types.")
     id_map_session = db.create_session(engine)
     grid_id_map, time_id_map, var_type_id_map = db.get_id_maps(id_map_session)
     id_map_session.close()
+    print("Inserting variable values into the database.")
     # add R0 values
     _, _ = db.insert_var_values(
         engine, r0_ds, "R0", grid_id_map, time_id_map, var_type_id_map
@@ -168,6 +176,7 @@ def insert_var_values(
     # assign resolution groups to grid points
     resolution_session = db.create_session(engine)
     db.assign_grid_resolution_group_to_grid_point(resolution_session)
+    resolution_session.commit()
     resolution_session.close()
     return 0
 
@@ -189,6 +198,23 @@ def insert_var_values_nuts(
         var_id_map=var_type_id_map,
     )
     return 0
+
+
+def get_data_files(data: dict, config: dict, data_level: str) -> None:
+    if "local" in data["host"]:
+        # if the host is local, we can use the local path
+        data["url"] = str(Path(data["url"]).resolve())
+        print(f"Using local path {data['url']} for {data['filename']}")
+    elif "heibox" in data["host"]:
+        # if the host is heibox, we need to use the heibox URL
+        get_production_data(
+            url=data["url"],
+            filename=data["filename"],
+            filehash=data["filehash"],
+            outputdir=Path(config["datalake"][data_level]),
+        )
+    else:
+        raise ValueError(f"Unknown host {data['host']} for data {data['filename']}")
 
 
 def main() -> None:
@@ -213,36 +239,28 @@ def main() -> None:
         # set the data level, default to bronze if not specified
         data_level = data["var_name"][0].get("level", "bronze")
         # check if the data is already in the data lake
-        path_to_file = Path(config["datalake"][data_level]) / data.get("filename", "")
+        path_to_file = (
+            Path(config["datalake"][data_level]) / data.get("filename", "")
+        ).resolve()
         if path_to_file.is_file():
             print(
                 f"File {data['filename']} already exists in the data lake \
                     at level {data_level}, skipping download."
             )
-        elif "local" in data["host"]:
-            # if the host is local, we can use the local path
-            data["url"] = str(Path(data["url"]).resolve())
-            print(f"Using local path {data['url']} for {data['filename']}")
-        elif "heibox" in data["host"]:
-            # if the host is heibox, we need to use the heibox URL
-            get_production_data(
-                url=data["url"],
-                filename=data["filename"],
-                filehash=data["filehash"],
-                outputdir=Path(config["datalake"][data_level]),
-            )
+        else:
+            get_data_files(data, config, data_level)
+
         if data["var_name"][0]["type"] == "R0":
             # set the path to the R0 data
-            r0_path = Path(config["datalake"][data_level]) / data["filename"]
+            r0_path = path_to_file
             print(f"R0 data path: {r0_path}")
         elif data["var_name"][0]["type"] == "R0_nuts":
             # set the path to the R0 nuts data
-            r0_nuts_path = Path(config["datalake"][data_level]) / data["filename"]
+            r0_nuts_path = path_to_file
             print(f"R0 NUTS data path: {r0_nuts_path}")
         elif data["var_name"][0]["type"] == "definition":
             # extract file and set the path to the NUTS shapefiles
-            shapefile_path = Path(config["datalake"][data_level])
-            shapefile_path = shapefile_path / data["filename"]
+            shapefile_path = path_to_file
             # make sure the shapefile folder is unzipped
             shapefile_folder_path = shapefile_path.with_suffix("")
             with zipfile.ZipFile(shapefile_path, "r") as zip_ref:
@@ -256,19 +274,74 @@ def main() -> None:
     engine = get_engine()
     # insert the NUTS shape data
     insert_data(engine=engine, shapefiles_folder_path=shapefile_folder_path)
+
     # insert the cartesian variables data
     var_type_session = db.create_session(engine)
     var_types = get_var_types_from_config(config=config["data_to_fetch"])
     db.insert_var_types(var_type_session, var_types)
     var_type_session.close()
+
     # insert the resolution groups
     resolution_session = db.create_session(engine)
     db.insert_resolution_groups(resolution_session)
     resolution_session.close()
-    # insert the data
-    insert_var_values(engine, r0_path=r0_path)
-    # insert the nuts variables data
-    insert_var_values_nuts(engine, r0_nuts_path=r0_nuts_path)
+
+    # load data with optimization
+    load_data_with_optimization(engine, r0_path, r0_nuts_path)
+
+
+def load_data_with_optimization(
+    engine: engine.Engine,
+    r0_path: Path | None = None,
+    r0_nuts_path: Path | None = None,
+) -> None:
+    """
+    Load data into the database with autovacuum disabled for performance.
+    Ensures autovacuum is re-enabled even if an error occurs.
+    """
+    try:
+        # Disable autovacuum globally for all tables during bulk load
+        with engine.begin() as conn:
+            conn.execute(
+                text("ALTER TABLE grid_point SET (autovacuum_enabled = false);")
+            )
+            conn.execute(
+                text("ALTER TABLE time_point SET (autovacuum_enabled = false);")
+            )
+            conn.execute(
+                text("ALTER TABLE var_value SET (autovacuum_enabled = false);")
+            )
+            conn.execute(
+                text("ALTER TABLE var_value_nuts SET (autovacuum_enabled = false);")
+            )
+
+        # insert the data
+        if r0_path:
+            insert_var_values(engine, r0_path=r0_path)
+        # insert the nuts variables data
+        if r0_nuts_path:
+            insert_var_values_nuts(engine, r0_nuts_path=r0_nuts_path)
+
+    finally:
+        # Re-enable autovacuum and run VACUUM ANALYZE on all tables
+        # This block is executed even if an error occurs in the try block
+        with engine.begin() as conn:
+            conn.execute(
+                text("ALTER TABLE grid_point SET (autovacuum_enabled = true);")
+            )
+            conn.execute(
+                text("ALTER TABLE time_point SET (autovacuum_enabled = true);")
+            )
+            conn.execute(text("ALTER TABLE var_value SET (autovacuum_enabled = true);"))
+            conn.execute(
+                text("ALTER TABLE var_value_nuts SET (autovacuum_enabled = true);")
+            )
+
+    # Run VACUUM in autocommit mode (outside transaction)
+    with engine.connect() as conn:
+        conn = conn.execution_options(isolation_level="AUTOCOMMIT")
+        conn.execute(text("VACUUM ANALYZE;"))
+    print("Database vacuumed and ready.")
 
 
 if __name__ == "__main__":

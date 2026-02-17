@@ -1,7 +1,7 @@
 services:
 
   frontend:
-    image: ghcr.io/ssciwr/onehealth-map-frontend:global_map_with_month_selector
+    image: ghcr.io/ssciwr/onehealth-map-frontend:today-fixups-from-main
     ports:
       - "80:80"
       - "443:443"
@@ -17,17 +17,32 @@ services:
       - heiplanet-network
   db:
     image: postgis/postgis:17-3.5
-    restart: always  
+    restart: always
+    shm_size: "512m"
+    mem_limit: 2g
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=512MB"
+      - "-c"
+      - "work_mem=64MB"
+      - "-c"
+      - "maintenance_work_mem=512MB"
+      - "-c"
+      - "effective_cache_size=1536MB"
+      - "-c"
+      - "max_wal_size=2GB"
+      - "-c"
+      - "autovacuum_max_workers=4"
+      - "-c"
+      - "autovacuum_naptime=10s"
     ports:
       - "5445:5432"
-    environment:
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRES_DB=${POSTGRES_DB}
+    env_file: ./.env
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d heiplanet_db"]
+      test: [ "CMD-SHELL", "pg_isready -U postgres -d heiplanet_db" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -36,7 +51,7 @@ services:
 
   # FastAPI Application service (Stage 2)
   api:
-    image: ghcr.io/ssciwr/heiplanet-backend:latest
+    image: heiplanet-db
     build:
       context: .
       dockerfile: Dockerfile
@@ -45,45 +60,35 @@ services:
         condition: service_healthy
       frontend:
         condition: service_started
-    environment:
-      - DB_URL=${DB_URL}
-      - DB_HOST=${DB_HOST}
-      - DB_PORT=${DB_PORT}
-      - DB_USER=${DB_USER}
-      - WAIT_FOR_DB=${WAIT_FOR_DB}
+    env_file: ./.env
     volumes:
-      - ./production.yaml:/heiplanet_db/production.yaml
-      - ./heiplanet_db:/heiplanet_db/heiplanet_db  # For development hot reload
-    command: ["api"]  # Run FastAPI server
+      - ./heiplanet_db/data/production_config.yml:/heiplanet_db/production.yaml
+    command: [ "api" ] # Run FastAPI server
     restart: "no"
     networks:
       - heiplanet-network
-    profiles: ["api"]
+    profiles: [ "api" ]
 
   production-runner:
-    image: ghcr.io/ssciwr/heiplanet-backend:latest
+    image: heiplanet-db
     build:
       context: .
       dockerfile: Dockerfile
     depends_on:
       db:
         condition: service_healthy
-    environment:
-      - DB_URL=${DB_URL}
-      - DB_HOST=${DB_HOST}
-      - DB_PORT=${DB_PORT}
-      - DB_USER=${DB_USER}
-      - WAIT_FOR_DB=${WAIT_FOR_DB}
+    env_file: ./.env
     volumes:
-      - ./production.yaml:/heiplanet_db/production.yaml
-    command: ["production"]
-    restart: "no"  # Run once
+      - ./heiplanet_db/data/production_config.yml:/heiplanet_db/production.yaml
+    command: [ "production" ]
+    restart: "no" # Run once
     networks:
       - heiplanet-network
-    profiles: ["init"]
+    profiles: [ "init" ]
 
 volumes:
   postgres_data:
+
 
 networks:
   heiplanet-network:
