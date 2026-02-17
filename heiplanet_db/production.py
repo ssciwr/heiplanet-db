@@ -78,14 +78,22 @@ def create_directories(dir: str) -> int:
     return 0
 
 
-def get_engine() -> engine.Engine:
+def get_engine(drop_tables: bool = False) -> engine.Engine:
+    """
+    Get or initialize the database engine.
+
+    Args:
+        drop_tables (bool): If True, drop all existing tables and recreate them.
+            If False, only create tables if they don't exist. Defaults to False.
+
+    Returns:
+        engine.Engine: SQLAlchemy engine object.
+    """
     # get the db url from dotenv
     dotenv.load_dotenv()
     db_url = os.environ.get("DB_URL")
     try:
-        # Here we drop all existing tables and create a new database
-        # make sure this is not run in real production!
-        engine = db.initialize_database(db_url, replace=True)
+        engine = db.initialize_database(db_url, replace=drop_tables)
     except Exception as e:
         raise ValueError(
             "Could not initialize engine, please check \
@@ -174,10 +182,12 @@ def insert_var_values(
         engine, r0_ds, "R0", grid_id_map, time_id_map, var_type_id_map
     )
     # assign resolution groups to grid points
+    print("Assigning resolution groups to grid points.")
     resolution_session = db.create_session(engine)
     db.assign_grid_resolution_group_to_grid_point(resolution_session)
     resolution_session.commit()
     resolution_session.close()
+    print("Variable values inserted and resolution groups assigned.")
     return 0
 
 
@@ -217,15 +227,22 @@ def get_data_files(data: dict, config: dict, data_level: str) -> None:
         raise ValueError(f"Unknown host {data['host']} for data {data['filename']}")
 
 
-def main() -> None:
+def main(drop_tables: bool = False, config_path: str | None = None) -> None:
     """
     Main function to set up the production database and data lake.
     This function reads the production configuration, creates the necessary
     directories, and fetches the data from the configured sources.
     It is intended to be run as a script.
+
+    Args:
+        drop_tables (bool): If True, drop all existing tables before inserting data.
+            If False, insert data into existing tables. Defaults to False.
+            Set to True only when initializing a fresh database.
+        config_path (str | None): Path to the production configuration file.
+            If None, uses the default config. Defaults to None.
     """
     # set up production database and data lake using the provided config
-    config = read_production_config()
+    config = read_production_config(config_path)
     shapefile_folder_path = None
     r0_path = None
     r0_nuts_path = None
@@ -271,7 +288,7 @@ def main() -> None:
         raise ValueError(
             "Shapefile path could not be generated from the data to fetch."
         )
-    engine = get_engine()
+    engine = get_engine(drop_tables=drop_tables)
     # insert the NUTS shape data
     insert_data(engine=engine, shapefiles_folder_path=shapefile_folder_path)
 
@@ -345,4 +362,23 @@ def load_data_with_optimization(
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Set up production database and data lake for HEIPlanet."
+    )
+    parser.add_argument(
+        "--drop-tables",
+        action="store_true",
+        default=False,
+        help="Drop all existing tables before inserting data (use only for fresh initialization).",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to the production configuration file. If not provided, uses the default config.",
+    )
+
+    args = parser.parse_args()
+    main(drop_tables=args.drop_tables, config_path=args.config)
