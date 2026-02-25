@@ -1,4 +1,5 @@
 from heiplanet_db import postgresql_database as db
+from heiplanet_db import model_metadata_service as model_metadata
 from fastapi import FastAPI, Depends, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -81,6 +82,15 @@ app.add_middleware(
 @app.get("/")
 async def root(message: str = "Hello World") -> dict:
     return {"message": message}
+
+
+@app.get("/models")
+def get_models() -> dict:
+    try:
+        models = model_metadata.get_model_cards()
+        return {"models": models}
+    except model_metadata.ModelMetadataError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
 
 
 @app.get("/db-status")
