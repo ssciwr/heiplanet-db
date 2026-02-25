@@ -46,23 +46,54 @@ If you know what you are doing, and want to test the API directly, you can open 
 ```
 Similarly you can expose the database, to test the connectivity from outside of the docker network.
 
-### Alternative minimal container local development
-In order to run just the database and the API, if for example you lack Github permissions to get tokens for the Dockercompose to run, you can follow this three step procedure:
-Here are the commands to run the OneHealth DB backend, which the frontend connects to:
 
-From `heiplanet-db/` folder:
+### Local run without docker compose
+To run with a local Python process and only PostGIS in Docker, use the following workflow from the `heiplanet-db/` root directory.
 
-##### 1. Start the database we will connect to:
+##### 1. Configure `.env`
+Create/update `.env` with:
+```
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=heiplanet-db-secret-name
+POSTGRES_DB=heiplanet_db
 
-`docker run -d --name postgres\_heiplanet -p 5432:5432 -e POSTGRES\_PASSWORD=postgres -e POSTGRES\_DB=heiplanet\_db postgis/postgis:17-3.5`
+DB_USER=postgres
+DB_PASSWORD=heiplanet-db-secret-name
+DB_HOST=127.0.0.1
+DB_PORT=5432
+DB_URL=postgresql://postgres:heiplanet-db-secret-name@127.0.0.1:5432/heiplanet_db
+WAIT_FOR_DB=true
+IP_ADDRESS=127.0.0.1
+BATCH_SIZE=10000
+MAX_WORKERS=4
+VAR_TIME_CHUNK=6
+VAR_LAT_CHUNK=45
+VAR_LON_CHUNK=90
+```
 
-##### 2. Start the API using the Dockerfile:
+##### 2. Start PostgreSQL/PostGIS
+```
+docker run --name my-postgres \
+  -e POSTGRES_USER=$POSTGRES_USER \
+  -e POSTGRES_PASSWORD=$POSTGRES_PASSWORD \
+  -e POSTGRES_DB=$POSTGRES_DB \
+  -p 5432:5432 \
+  --shm-size=512mb \
+  -d postgis/postgis:17-3.5
+```
 
-`docker run --name heiplanet\_api -p 8000:8000 --link postgres\_heiplanet:db -e IP\_ADDRESS=1.1.1.1 -e DB\_URL=postgresql+psycopg2://postgres:postgres@db:5432/heiplanet\_db heiplanet-db`
+##### 3. Populate database tables
+```
+python heiplanet_db/production.py
+```
 
-##### 3. Fill the API with mock data - Run the "production.py" script to generate mock data
+##### 4. Run the API locally
+```
+cd heiplanet_db
+fastapi dev
+```
 
-`docker exec -it heiplanet\_api python3 /heiplanet\_db/production.py`
+With the currently reduced input files (Grid and NUTS only), database setup is typically fast.
 
 ### Building the image locally 
 To build the docker image locally, i.e. for a changed database config file, execute
