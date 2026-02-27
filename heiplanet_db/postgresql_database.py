@@ -1707,10 +1707,26 @@ def insert_var_value_nuts(
     # Stream inserts in small time-chunks to avoid loading/stacking the full
     # (time, NUTS_ID) array and building a huge in-memory list of rows.
     var_data = ds[var_name].dropna(dim="NUTS_ID", how="all")
-    if ("time" not in var_data.dims) or ("NUTS_ID" not in var_data.dims):
+    required_dims = {"time", "NUTS_ID"}
+    missing_dims = required_dims - set(var_data.dims)
+    if missing_dims:
         raise ValueError(
-            f"{var_name} must have dims ('time', 'NUTS_ID'); got {var_data.dims}."
+            f"{var_name} must include dims ('time', 'NUTS_ID'); got {var_data.dims}."
         )
+
+    # Reject unexpected non-singleton dimensions (e.g., lat/lon) early to avoid
+    # shape mismatches that would later lead to IndexError / incorrect inserts.
+    extra_dims = [d for d in var_data.dims if d not in required_dims]
+    if extra_dims:
+        non_singleton = [d for d in extra_dims if int(var_data.sizes.get(d, 0)) != 1]
+        if non_singleton:
+            raise ValueError(
+                f"{var_name} must be 2D over ('time', 'NUTS_ID'); got extra dims "
+                f"{tuple(non_singleton)} with sizes "
+                f"{ {d: int(var_data.sizes[d]) for d in non_singleton} }."
+            )
+        # harmless singleton dims can be squeezed away (keeps behavior flexible)
+        var_data = var_data.squeeze(dim=extra_dims, drop=True)
 
     # Some inputs come as (NUTS_ID, time). Normalize to (time, NUTS_ID) so the
     # chunking/insertion logic always treats axis 0 as time.
@@ -1736,6 +1752,16 @@ def insert_var_value_nuts(
             time_ids = [time_id_map.get(_normalize_time_key(t)) for t in time_vals]
 
             values = chunk.values
+            if values.ndim != 2:
+                raise ValueError(
+                    f"{var_name} must be 2D after normalization; got array with "
+                    f"ndim={values.ndim} and dims={chunk.dims}."
+                )
+            if values.shape[1] != len(nuts_ids):
+                raise ValueError(
+                    f"{var_name} dimension mismatch: NUTS axis length is {values.shape[1]} "
+                    f"but got {len(nuts_ids)} NUTS_IDs."
+                )
             batch: list[dict] = []
 
             for ti, time_id in enumerate(time_ids):
