@@ -22,7 +22,7 @@ The deployment consists of three main containerized services:
   - Efficient spatial indexing for fast geographic queries
 
 ### 2. Web Frontend
-- **Image:** `ghcr.io/ssciwr/onehealth-map-frontend:<tag>`
+- **Image:** `ghcr.io/ssciwr/heiplanet-frontend:<tag>`
 - **Purpose:** Interactive web interface for data visualization
 - **Features:**
   - Geographic map-based visualization

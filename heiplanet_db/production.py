@@ -345,13 +345,17 @@ def load_data_with_optimization(
         # insert the data
         if r0_path:
             insert_var_values(engine, r0_path=r0_path)
+            print("DEBUG: insert_var_values completed.")
         # insert the nuts variables data
         if r0_nuts_path:
             insert_var_values_nuts(engine, r0_nuts_path=r0_nuts_path)
+            print("DEBUG: insert_var_values_nuts completed.")
+        print("DEBUG: All variable value inserts done, entering finally block.")
 
     finally:
         # Re-enable autovacuum and run VACUUM ANALYZE on all tables
         # This block is executed even if an error occurs in the try block
+        print("DEBUG: Re-enabling autovacuum on all tables...")
         with engine.begin() as conn:
             conn.execute(
                 text("ALTER TABLE grid_point SET (autovacuum_enabled = true);")
@@ -363,11 +367,14 @@ def load_data_with_optimization(
             conn.execute(
                 text("ALTER TABLE var_value_nuts SET (autovacuum_enabled = true);")
             )
+        print("DEBUG: Autovacuum re-enabled on all tables.")
 
     # Run VACUUM in autocommit mode (outside transaction)
+    print("DEBUG: Running VACUUM ANALYZE...")
     with engine.connect() as conn:
         conn = conn.execution_options(isolation_level="AUTOCOMMIT")
         conn.execute(text("VACUUM ANALYZE;"))
+    print("DEBUG: VACUUM ANALYZE completed.")
     print("Database vacuumed and ready.")
 
 

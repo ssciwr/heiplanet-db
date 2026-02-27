@@ -153,6 +153,44 @@ def test_check_paths(tmp_path: Path):
     valid_path.unlink()  # Clean up the dummy file
 
 
+def test_get_engine_drop_tables_true_calls_initialize_database_replace_true(
+    monkeypatch,
+):
+    sentinel_engine = object()
+    monkeypatch.setenv("DB_URL", "postgresql://user:pass@host:5432/dbname")
+
+    with patch(
+        "heiplanet_db.production.db.initialize_database",
+        return_value=sentinel_engine,
+    ) as init_db:
+        engine = prod.get_engine(drop_tables=True)
+
+    assert engine is sentinel_engine
+    init_db.assert_called_once_with(
+        "postgresql://user:pass@host:5432/dbname",
+        replace=True,
+    )
+
+
+def test_main_uses_explicit_config_path(tmp_path):
+    # minimal shape needed to reach create_directories loop
+    fake_config = {"datalake": {"bronze": str(tmp_path)}, "data_to_fetch": []}
+
+    with (
+        patch(
+            "heiplanet_db.production.read_production_config", return_value=fake_config
+        ) as read_cfg,
+        patch(
+            "heiplanet_db.production.create_directories",
+            side_effect=RuntimeError("stop"),
+        ) as _,
+    ):
+        with pytest.raises(RuntimeError, match="stop"):
+            prod.main(config_path="my-config.yml")
+
+    read_cfg.assert_called_once_with("my-config.yml")
+
+
 @pytest.mark.skip(
     reason="This test requires a lot of resources and is not suitable for CI."
 )
