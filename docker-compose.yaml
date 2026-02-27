@@ -19,19 +19,19 @@ services:
     image: postgis/postgis:17-3.5
     restart: always
     shm_size: "512m"
-    mem_limit: 2g
+    mem_limit: 4g
     command:
       - "postgres"
       - "-c"
-      - "shared_buffers=512MB"
+      - "shared_buffers=1GB"
       - "-c"
-      - "work_mem=64MB"
+      - "work_mem=256MB"
       - "-c"
-      - "maintenance_work_mem=512MB"
+      - "maintenance_work_mem=1GB"
       - "-c"
-      - "effective_cache_size=1536MB"
+      - "effective_cache_size=2GB"
       - "-c"
-      - "max_wal_size=2GB"
+      - "max_wal_size=4GB"
       - "-c"
       - "autovacuum_max_workers=4"
       - "-c"
