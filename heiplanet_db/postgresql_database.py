@@ -1704,56 +1704,75 @@ def insert_var_value_nuts(
     if var_id is None:
         raise ValueError(f"Variable {var_name} not found in var_type table.")
 
-    # values of the variable
-    var_data = (
-        ds[var_name].dropna(dim="NUTS_ID", how="all").load()
-    )  # load data into memory
+    # Stream inserts in small time-chunks to avoid loading/stacking the full
+    # (time, NUTS_ID) array and building a huge in-memory list of rows.
+    var_data = ds[var_name].dropna(dim="NUTS_ID", how="all")
+    if ("time" not in var_data.dims) or ("NUTS_ID" not in var_data.dims):
+        raise ValueError(
+            f"{var_name} must have dims ('time', 'NUTS_ID'); got {var_data.dims}."
+        )
 
-    # using stack() from xarray to vectorize the data
-    stacked_var_data = var_data.stack(points=("time", "NUTS_ID"))
-    stacked_var_data = stacked_var_data.dropna("points")
+    # Some inputs come as (NUTS_ID, time). Normalize to (time, NUTS_ID) so the
+    # chunking/insertion logic always treats axis 0 as time.
+    var_data = var_data.transpose("time", "NUTS_ID")
 
-    # get values of each dim
-    time_vals = stacked_var_data["time"].values.astype("datetime64[ns]")
-    nuts_ids = stacked_var_data["NUTS_ID"].values
+    nuts_ids = var_data["NUTS_ID"].values
 
-    # create vectorized mapping
-    # normalize time before mapping as the time in isimip is 12:00:00
-    # TODO: find an optimal way to do this
-    get_time_id = np.vectorize(
-        lambda t: time_id_map.get(np.datetime64(pd.Timestamp(t).normalize(), "ns"))
+    print(
+        f"Start inserting {var_name} values for NUTS in streaming time-chunks "
+        f"(time_chunk={VAR_TIME_CHUNK}, batch_size={BATCH_SIZE})..."
     )
-
-    time_ids = get_time_id(time_vals)
-    values = stacked_var_data.values.astype(float)
-
-    # create a mask for valid values
-    masks = ~np.isnan(values)
-
-    # create bulk data for insertion
-    var_values = [
-        {
-            "nuts_id": str(nuts_id),
-            "time_id": int(time_id),
-            "var_id": int(var_id),
-            "value": float(value),
-        }
-        for nuts_id, time_id, value, mask in zip(nuts_ids, time_ids, values, masks)
-        if mask and (nuts_id is not None) and (time_id is not None)
-    ]
-
-    print(f"Start inserting {var_name} values for NUTS in parallel...")
     t_start_insert = time.time()
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = []
-        for i in range(0, len(var_values), BATCH_SIZE):
-            e_batch = i + BATCH_SIZE
-            batch = var_values[i:e_batch]
-            futures.append(executor.submit(insert_batch, batch, engine, VarValueNuts))
+    session = create_session(engine)
+    total_inserted = 0
+    try:
+        n_time = int(var_data.sizes["time"])
+        for t0 in range(0, n_time, VAR_TIME_CHUNK):
+            t1 = min(t0 + VAR_TIME_CHUNK, n_time)
+            chunk = var_data.isel(time=slice(t0, t1)).load()
 
-        for _ in tqdm(as_completed(futures), total=len(futures)):
-            pass
+            time_vals = chunk["time"].values.astype("datetime64[ns]")
+            time_ids = [time_id_map.get(_normalize_time_key(t)) for t in time_vals]
 
-    print(f"Values of {var_name} inserted into VarValueNuts.")
+            values = chunk.values
+            batch: list[dict] = []
+
+            for ti, time_id in enumerate(time_ids):
+                if time_id is None:
+                    continue
+                row = values[ti]
+                valid_idx = np.flatnonzero(~np.isnan(row))
+                for nj in valid_idx:
+                    nuts_id = nuts_ids[nj]
+                    if nuts_id is None:
+                        continue
+                    batch.append(
+                        {
+                            "nuts_id": str(nuts_id),
+                            "time_id": int(time_id),
+                            "var_id": int(var_id),
+                            "value": float(row[nj]),
+                        }
+                    )
+                    if len(batch) >= BATCH_SIZE:
+                        add_data_list_bulk(session, batch, VarValueNuts)
+                        total_inserted += len(batch)
+                        batch.clear()
+
+            if batch:
+                add_data_list_bulk(session, batch, VarValueNuts)
+                total_inserted += len(batch)
+                batch.clear()
+
+            del chunk, values
+            gc.collect()
+            print(
+                f"Inserted {total_inserted} {var_name} rows into VarValueNuts "
+                f"(processed time indices {t0}:{t1})."
+            )
+    finally:
+        session.close()
+
+    print(f"Values of {var_name} inserted into VarValueNuts. Total: {total_inserted}.")
     return t_start_insert

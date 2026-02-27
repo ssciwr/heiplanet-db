@@ -62,9 +62,18 @@ def test_create_directories(tmp_path: Path):
 
 
 def test_get_engine():
-    # test that the engine can be created with production db
-    engine = prod.get_engine()
-    assert engine is not None
+    # Avoid relying on a locally running production Postgres.
+    # This test asserts the wiring to initialize_database, not connectivity.
+    with (
+        patch.dict("os.environ", {"DB_URL": "postgresql://example/db"}, clear=False),
+        patch(
+            "heiplanet_db.production.db.initialize_database",
+            return_value=object(),
+        ) as init_db,
+    ):
+        engine = prod.get_engine()
+        assert engine is not None
+        init_db.assert_called_once_with("postgresql://example/db", replace=False)
 
 
 def test_insert_data(get_engine_with_tables, get_nuts_def_data, tmp_path):
