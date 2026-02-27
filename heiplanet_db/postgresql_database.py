@@ -515,26 +515,29 @@ def assign_grid_resolution_group_to_grid_point(session: Session) -> None:
           AND (ROUND(gp.longitude::numeric * 10)::integer % :resolution_mod = 0)
     """)
 
-    for resolution_group in resolution_groups:
-        resolution_mod = int(float(resolution_group.resolution) * 10)
-        result = session.execute(
-            insert_sql,
-            {
-                "resolution_id": resolution_group.id,
-                "resolution_mod": resolution_mod,
-            },
-        )
-        rowcount = result.rowcount
-        if rowcount == 0:
-            raise ValueError(
-                f"No matching grid points for {resolution_group.resolution} degree resolution found."
+    try:
+        for resolution_group in resolution_groups:
+            resolution_mod = int(float(resolution_group.resolution) * 10)
+            result = session.execute(
+                insert_sql,
+                {
+                    "resolution_id": resolution_group.id,
+                    "resolution_mod": resolution_mod,
+                },
             )
-        print(
-            f"Assigned {rowcount} grid points to resolution {resolution_group.resolution}°."
-        )
-
-    session.commit()
-    print("Grid point resolutions assigned.")
+            rowcount = result.rowcount
+            if rowcount == 0:
+                raise ValueError(
+                    f"No matching grid points for {resolution_group.resolution} degree resolution found."
+                )
+            print(
+                f"Assigned {rowcount} grid points to resolution {resolution_group.resolution}°."
+            )
+        session.commit()
+        print("Grid point resolutions assigned.")
+    except Exception:
+        session.rollback()
+        raise
 
 
 def extract_time_point(
