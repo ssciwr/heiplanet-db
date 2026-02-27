@@ -239,8 +239,18 @@ def main(drop_tables: bool = False, config_path: str | None = None) -> None:
             If False, insert data into existing tables. Defaults to False.
             Set to True only when initializing a fresh database.
         config_path (str | None): Path to the production configuration file.
-            If None, uses the default config. Defaults to None.
+            If None, uses the CONFIG_FILE environment variable or the default
+            container path `/heiplanet_db/production.yaml` if available; otherwise
+            falls back to the built-in default config. Defaults to None.
     """
+    # determine configuration path, preferring an explicit argument, then env var,
+    # then the default container mount path; finally fall back to package default
+    if config_path is None:
+        env_config = os.getenv("CONFIG_FILE")
+        if env_config:
+            config_path = env_config
+        elif Path("/heiplanet_db/production.yaml").is_file():
+            config_path = "/heiplanet_db/production.yaml"
     # set up production database and data lake using the provided config
     config = read_production_config(config_path)
     shapefile_folder_path = None
