@@ -1,5 +1,4 @@
 from sqlalchemy import (
-    cast,
     create_engine,
     text,
     Float,
@@ -498,46 +497,43 @@ def assign_grid_resolution_group_to_grid_point(session: Session) -> None:
     creating the many-to-many relationship between resolutions and
     grid points.
 
+    Uses raw SQL INSERT...SELECT so the database performs the matching
+    and insert directly, avoiding OOM when processing millions of grid points.
+
     Args:
         session (Session): SQLAlchemy session object.
     """
-    # we assume that by multiplying the resolution, and the
-    # lat/long values by 10, we can use the modulo operator to
-    # map the grid points to the resolution groups
-    # also we are using exact equality check since the way it is stored on postgresql
-    # should be exact and not numerically imprecise
-    grid_point_resolutions = []
-    # get the resolution groups from the database
     resolution_groups = session.query(ResolutionGroup).all()
     if not resolution_groups:
         raise ValueError("No resolution groups found in the database.")
+
+    insert_sql = text("""
+        INSERT INTO grid_point_resolution (grid_id, resolution_id)
+        SELECT gp.id, :resolution_id
+        FROM grid_point gp
+        WHERE (ROUND(gp.latitude::numeric * 10)::integer % :resolution_mod = 0)
+          AND (ROUND(gp.longitude::numeric * 10)::integer % :resolution_mod = 0)
+    """)
+
     for resolution_group in resolution_groups:
-        resolution = float(resolution_group.resolution) * 10
-        grid_points = (
-            session.query(GridPoint)
-            .filter(
-                (cast(func.round(GridPoint.latitude * 10), Integer) % resolution == 0)
-                & (
-                    cast(func.round(GridPoint.longitude * 10), Integer) % resolution
-                    == 0
-                )
-            )
-            .all()
+        resolution_mod = int(float(resolution_group.resolution) * 10)
+        result = session.execute(
+            insert_sql,
+            {
+                "resolution_id": resolution_group.id,
+                "resolution_mod": resolution_mod,
+            },
         )
-        if not grid_points:
+        rowcount = result.rowcount
+        if rowcount == 0:
             raise ValueError(
-                f"No matching grid points for {resolution / 10} degree resolution found."
+                f"No matching grid points for {resolution_group.resolution} degree resolution found."
             )
-        grid_point_resolutions.extend(
-            [
-                {
-                    "grid_id": grid_point.id,
-                    "resolution_id": resolution_group.id,
-                }
-                for grid_point in grid_points
-            ]
+        print(
+            f"Assigned {rowcount} grid points to resolution {resolution_group.resolution}°."
         )
-    add_data_list_bulk(session, grid_point_resolutions, GridPointResolution)
+
+    session.commit()
     print("Grid point resolutions assigned.")
 
 
