@@ -38,8 +38,17 @@ except Exception:
     )
 allowed_origins = [
     f"http://{ip_address}",
+    f"http://{ip_address}:80",
+    f"https://{ip_address}",
+    f"https://{ip_address}:443",
     "http://localhost",
+    "http://localhost:80",
+    "https://localhost",
+    "https://localhost:443",
     "http://127.0.0.1",
+    "http://127.0.0.1:80",
+    "https://127.0.0.1",
+    "https://127.0.0.1:443",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
 ]
@@ -73,6 +82,7 @@ app.add_middleware(
     CORSMiddleware,
     # update this to https later when using ssl
     allow_origins=allowed_origins,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -119,7 +129,11 @@ def get_cartesian(
         request.requested_time_point.year,
         request.requested_time_point.month,
     )
-    var_name = request.requested_variable_type
+    var_name = (
+        "R0"
+        if request.requested_variable_type == "r0_estimate"
+        else request.requested_variable_type
+    )
     try:
         var_value = db.get_var_values_cartesian(
             session,
@@ -150,7 +164,9 @@ def get_nuts_data(
     if not isinstance(requested_time_point, datetime.date):
         return {"error": "Invalid date format. Use YYYY-MM-DD."}
     date_requested = (requested_time_point.year, requested_time_point.month)
-    var_name = requested_variable_type
+    var_name = (
+        "R0" if requested_variable_type == "r0_estimate" else requested_variable_type
+    )
     try:
         grid_resolution = (
             requested_grid_resolution

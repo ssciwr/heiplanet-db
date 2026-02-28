@@ -1932,3 +1932,30 @@ def test_insert_var_value_nuts(
     assert result[0].time_id == 1
     assert result[0].var_id == 1
     assert math.isclose(result[0].value, get_varnuts_dataset.t2m[0, 0], abs_tol=1e-5)
+
+
+def test_insert_var_value_nuts_rejects_extra_dims(
+    get_engine_with_tables,
+    get_session,
+    get_varnuts_dataset,
+    get_nuts_def_data,
+    tmp_path,
+    seed_base_data,
+):
+    nuts_path = tmp_path / "nuts_def.shp"
+    gdf_nuts_data = get_nuts_def_data
+    gdf_nuts_data.to_file(nuts_path, driver="ESRI Shapefile")
+    postdb.insert_nuts_def(get_engine_with_tables, nuts_path)
+
+    # get the id maps
+    _, time_id_map, var_id_map = postdb.get_id_maps(get_session)
+
+    ds_extra = get_varnuts_dataset.expand_dims(lat=[0, 1])
+    with pytest.raises(ValueError, match="must be 2D over \\('time', 'NUTS_ID'\\)"):
+        postdb.insert_var_value_nuts(
+            get_engine_with_tables,
+            ds_extra,
+            var_name="t2m",
+            time_id_map=time_id_map,
+            var_id_map=var_id_map,
+        )

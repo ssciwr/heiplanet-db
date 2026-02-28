@@ -1,5 +1,4 @@
 from sqlalchemy import (
-    cast,
     create_engine,
     text,
     Float,
@@ -498,47 +497,47 @@ def assign_grid_resolution_group_to_grid_point(session: Session) -> None:
     creating the many-to-many relationship between resolutions and
     grid points.
 
+    Uses raw SQL INSERT...SELECT so the database performs the matching
+    and insert directly, avoiding OOM when processing millions of grid points.
+
     Args:
         session (Session): SQLAlchemy session object.
     """
-    # we assume that by multiplying the resolution, and the
-    # lat/long values by 10, we can use the modulo operator to
-    # map the grid points to the resolution groups
-    # also we are using exact equality check since the way it is stored on postgresql
-    # should be exact and not numerically imprecise
-    grid_point_resolutions = []
-    # get the resolution groups from the database
     resolution_groups = session.query(ResolutionGroup).all()
     if not resolution_groups:
         raise ValueError("No resolution groups found in the database.")
-    for resolution_group in resolution_groups:
-        resolution = float(resolution_group.resolution) * 10
-        grid_points = (
-            session.query(GridPoint)
-            .filter(
-                (cast(func.round(GridPoint.latitude * 10), Integer) % resolution == 0)
-                & (
-                    cast(func.round(GridPoint.longitude * 10), Integer) % resolution
-                    == 0
-                )
-            )
-            .all()
-        )
-        if not grid_points:
-            raise ValueError(
-                f"No matching grid points for {resolution / 10} degree resolution found."
-            )
-        grid_point_resolutions.extend(
-            [
+
+    insert_sql = text("""
+        INSERT INTO grid_point_resolution (grid_id, resolution_id)
+        SELECT gp.id, :resolution_id
+        FROM grid_point gp
+        WHERE (ROUND(gp.latitude::numeric * 10)::integer % :resolution_mod = 0)
+          AND (ROUND(gp.longitude::numeric * 10)::integer % :resolution_mod = 0)
+    """)
+
+    try:
+        for resolution_group in resolution_groups:
+            resolution_mod = int(float(resolution_group.resolution) * 10)
+            result = session.execute(
+                insert_sql,
                 {
-                    "grid_id": grid_point.id,
                     "resolution_id": resolution_group.id,
-                }
-                for grid_point in grid_points
-            ]
-        )
-    add_data_list_bulk(session, grid_point_resolutions, GridPointResolution)
-    print("Grid point resolutions assigned.")
+                    "resolution_mod": resolution_mod,
+                },
+            )
+            rowcount = result.rowcount
+            if rowcount == 0:
+                raise ValueError(
+                    f"No matching grid points for {resolution_group.resolution} degree resolution found."
+                )
+            print(
+                f"Assigned {rowcount} grid points to resolution {resolution_group.resolution}°."
+            )
+        session.commit()
+        print("Grid point resolutions assigned.")
+    except Exception:
+        session.rollback()
+        raise
 
 
 def extract_time_point(
@@ -798,7 +797,7 @@ def insert_var_values(
         var_id,
         engine,
     )
-
+    print("all threaded inserts completed.")
     return t_yearly_to_monthly, t_start_insert
 
 
@@ -1704,56 +1703,101 @@ def insert_var_value_nuts(
     if var_id is None:
         raise ValueError(f"Variable {var_name} not found in var_type table.")
 
-    # values of the variable
-    var_data = (
-        ds[var_name].dropna(dim="NUTS_ID", how="all").load()
-    )  # load data into memory
+    # Stream inserts in small time-chunks to avoid loading/stacking the full
+    # (time, NUTS_ID) array and building a huge in-memory list of rows.
+    var_data = ds[var_name].dropna(dim="NUTS_ID", how="all")
+    required_dims = {"time", "NUTS_ID"}
+    missing_dims = required_dims - set(var_data.dims)
+    if missing_dims:
+        raise ValueError(
+            f"{var_name} must include dims ('time', 'NUTS_ID'); got {var_data.dims}."
+        )
 
-    # using stack() from xarray to vectorize the data
-    stacked_var_data = var_data.stack(points=("time", "NUTS_ID"))
-    stacked_var_data = stacked_var_data.dropna("points")
+    # Reject unexpected non-singleton dimensions (e.g., lat/lon) early to avoid
+    # shape mismatches that would later lead to IndexError / incorrect inserts.
+    extra_dims = [d for d in var_data.dims if d not in required_dims]
+    if extra_dims:
+        non_singleton = [d for d in extra_dims if int(var_data.sizes.get(d, 0)) != 1]
+        if non_singleton:
+            raise ValueError(
+                f"{var_name} must be 2D over ('time', 'NUTS_ID'); got extra dims "
+                f"{tuple(non_singleton)} with sizes "
+                f"{ {d: int(var_data.sizes[d]) for d in non_singleton} }."
+            )
+        # harmless singleton dims can be squeezed away (keeps behavior flexible)
+        var_data = var_data.squeeze(dim=extra_dims, drop=True)
 
-    # get values of each dim
-    time_vals = stacked_var_data["time"].values.astype("datetime64[ns]")
-    nuts_ids = stacked_var_data["NUTS_ID"].values
+    # Some inputs come as (NUTS_ID, time). Normalize to (time, NUTS_ID) so the
+    # chunking/insertion logic always treats axis 0 as time.
+    var_data = var_data.transpose("time", "NUTS_ID")
 
-    # create vectorized mapping
-    # normalize time before mapping as the time in isimip is 12:00:00
-    # TODO: find an optimal way to do this
-    get_time_id = np.vectorize(
-        lambda t: time_id_map.get(np.datetime64(pd.Timestamp(t).normalize(), "ns"))
+    nuts_ids = var_data["NUTS_ID"].values
+
+    print(
+        f"Start inserting {var_name} values for NUTS in streaming time-chunks "
+        f"(time_chunk={VAR_TIME_CHUNK}, batch_size={BATCH_SIZE})..."
     )
-
-    time_ids = get_time_id(time_vals)
-    values = stacked_var_data.values.astype(float)
-
-    # create a mask for valid values
-    masks = ~np.isnan(values)
-
-    # create bulk data for insertion
-    var_values = [
-        {
-            "nuts_id": str(nuts_id),
-            "time_id": int(time_id),
-            "var_id": int(var_id),
-            "value": float(value),
-        }
-        for nuts_id, time_id, value, mask in zip(nuts_ids, time_ids, values, masks)
-        if mask and (nuts_id is not None) and (time_id is not None)
-    ]
-
-    print(f"Start inserting {var_name} values for NUTS in parallel...")
     t_start_insert = time.time()
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = []
-        for i in range(0, len(var_values), BATCH_SIZE):
-            e_batch = i + BATCH_SIZE
-            batch = var_values[i:e_batch]
-            futures.append(executor.submit(insert_batch, batch, engine, VarValueNuts))
+    session = create_session(engine)
+    total_inserted = 0
+    try:
+        n_time = int(var_data.sizes["time"])
+        for t0 in range(0, n_time, VAR_TIME_CHUNK):
+            t1 = min(t0 + VAR_TIME_CHUNK, n_time)
+            chunk = var_data.isel(time=slice(t0, t1)).load()
 
-        for _ in tqdm(as_completed(futures), total=len(futures)):
-            pass
+            time_vals = chunk["time"].values.astype("datetime64[ns]")
+            time_ids = [time_id_map.get(_normalize_time_key(t)) for t in time_vals]
 
-    print(f"Values of {var_name} inserted into VarValueNuts.")
+            values = chunk.values
+            if values.ndim != 2:
+                raise ValueError(
+                    f"{var_name} must be 2D after normalization; got array with "
+                    f"ndim={values.ndim} and dims={chunk.dims}."
+                )
+            if values.shape[1] != len(nuts_ids):
+                raise ValueError(
+                    f"{var_name} dimension mismatch: NUTS axis length is {values.shape[1]} "
+                    f"but got {len(nuts_ids)} NUTS_IDs."
+                )
+            batch: list[dict] = []
+
+            for ti, time_id in enumerate(time_ids):
+                if time_id is None:
+                    continue
+                row = values[ti]
+                valid_idx = np.flatnonzero(~np.isnan(row))
+                for nj in valid_idx:
+                    nuts_id = nuts_ids[nj]
+                    if nuts_id is None:
+                        continue
+                    batch.append(
+                        {
+                            "nuts_id": str(nuts_id),
+                            "time_id": int(time_id),
+                            "var_id": int(var_id),
+                            "value": float(row[nj]),
+                        }
+                    )
+                    if len(batch) >= BATCH_SIZE:
+                        add_data_list_bulk(session, batch, VarValueNuts)
+                        total_inserted += len(batch)
+                        batch.clear()
+
+            if batch:
+                add_data_list_bulk(session, batch, VarValueNuts)
+                total_inserted += len(batch)
+                batch.clear()
+
+            del chunk, values
+            gc.collect()
+            print(
+                f"Inserted {total_inserted} {var_name} rows into VarValueNuts "
+                f"(processed time indices {t0}:{t1})."
+            )
+    finally:
+        session.close()
+
+    print(f"Values of {var_name} inserted into VarValueNuts. Total: {total_inserted}.")
     return t_start_insert
