@@ -179,7 +179,7 @@ def insert_var_values(
     print("Inserting variable values into the database.")
     # add R0 values
     _, _ = db.insert_var_values(
-        engine, r0_ds, "R0", grid_id_map, time_id_map, var_type_id_map
+        engine, r0_ds, "r0_estimate", grid_id_map, time_id_map, var_type_id_map
     )
     # assign resolution groups to grid points
     print("Assigning resolution groups to grid points.")
@@ -203,7 +203,7 @@ def insert_var_values_nuts(
     db.insert_var_value_nuts(
         engine,
         r0_ds,
-        var_name="R0",
+        var_name="r0_estimate",
         time_id_map=time_id_map,
         var_id_map=var_type_id_map,
     )

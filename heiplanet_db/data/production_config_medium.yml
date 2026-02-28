@@ -12,7 +12,7 @@ data_to_fetch:
     filehash: "246a5e1a3901380f194879cff5a65bbac86c9c906a7871027a3a918dbe6c7e46"
   - var_name: 
     - type: "R0"
-      name: "R0"
+      name: "r0_estimate"
       unit: "1"
       grid: "0.1"
       level: "gold"
@@ -23,7 +23,7 @@ data_to_fetch:
     filehash: "68d304540ccd38f9cc9924337ee2ee3d9d29ab88e0251a6147de9d1184cdd58e"
   - var_name: 
     - type: "R0_nuts"
-      name: "R0"
+      name: "r0_estimate"
       unit: "1"
       grid: "NUTS"
       level: "gold"
