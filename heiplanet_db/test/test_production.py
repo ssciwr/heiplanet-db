@@ -3,7 +3,7 @@ import pytest
 from pathlib import Path
 from importlib import resources
 from importlib.resources.abc import Traversable
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 from sqlalchemy import text
 
 
@@ -14,6 +14,11 @@ def production_config() -> Traversable:
         resources.files("heiplanet_db") / "test" / "data" / "test_production_config.yml"
     )
     return dict_path
+
+
+def test_read_production_config_file_not_found():
+    with pytest.raises(FileNotFoundError, match="Configuration file not found"):
+        prod.read_production_config("nonexistent_config.yml")
 
 
 def test_read_production_config(production_config: Traversable):
@@ -44,6 +49,22 @@ def test_read_production_config(production_config: Traversable):
     assert config_dict
 
 
+def test_get_production_data_fetch_error(tmp_path: Path):
+    outputdir = tmp_path / "out"
+    outputdir.mkdir(parents=True, exist_ok=True)
+    with patch(
+        "heiplanet_db.production.pooch.retrieve",
+        side_effect=Exception("Connection refused"),
+    ):
+        with pytest.raises(RuntimeError, match="Failed to fetch data from"):
+            prod.get_production_data(
+                url="https://example.com/missing",
+                filename="missing.nc",
+                filehash="abc123",
+                outputdir=outputdir,
+            )
+
+
 def test_get_production_data(tmp_path: Path):
     filename = "test_download.md"
     filehash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -62,9 +83,26 @@ def test_create_directories(tmp_path: Path):
 
 
 def test_get_engine():
-    # test that the engine can be created with production db
-    engine = prod.get_engine()
-    assert engine is not None
+    # Avoid relying on a locally running production Postgres.
+    # This test asserts the wiring to initialize_database, not connectivity.
+    with (
+        patch.dict("os.environ", {"DB_URL": "postgresql://example/db"}, clear=False),
+        patch(
+            "heiplanet_db.production.db.initialize_database",
+            return_value=object(),
+        ) as init_db,
+    ):
+        engine = prod.get_engine()
+        assert engine is not None
+        init_db.assert_called_once_with("postgresql://example/db", replace=False)
+
+
+def test_insert_data_invalid_path(get_engine_with_tables, tmp_path):
+    with pytest.raises(ValueError, match="Shapefile folder path .* does not exist"):
+        prod.insert_data(
+            get_engine_with_tables,
+            shapefiles_folder_path=tmp_path / "nonexistent_folder",
+        )
 
 
 def test_insert_data(get_engine_with_tables, get_nuts_def_data, tmp_path):
@@ -78,6 +116,46 @@ def test_insert_data(get_engine_with_tables, get_nuts_def_data, tmp_path):
         get_engine_with_tables, shapefile_folder_path.parents[0]
     )
     assert completion_code == 0
+
+
+def test_get_data_files_local(tmp_path: Path):
+    config = {"datalake": {"bronze": str(tmp_path / "bronze")}}
+    data = {
+        "host": "local",
+        "url": str(tmp_path / "local_file.nc"),
+        "filename": "local_file.nc",
+    }
+    (tmp_path / "local_file.nc").touch()
+    prod.get_data_files(data, config, "bronze")
+    assert data["url"] == str((tmp_path / "local_file.nc").resolve())
+
+
+def test_get_data_files_heibox(tmp_path: Path):
+    config = {"datalake": {"bronze": str(tmp_path / "bronze")}}
+    (tmp_path / "bronze").mkdir(parents=True)
+    data = {
+        "host": "heibox",
+        "url": "https://heibox.example.com/f/x",
+        "filename": "remote.nc",
+        "filehash": "sha256:abc123",
+    }
+    with patch(
+        "heiplanet_db.production.get_production_data",
+        return_value=0,
+    ) as get_data:
+        prod.get_data_files(data, config, "bronze")
+        get_data.assert_called_once()
+        call_kw = get_data.call_args.kwargs
+        assert call_kw["url"] == data["url"]
+        assert call_kw["filename"] == data["filename"]
+        assert call_kw["outputdir"] == tmp_path / "bronze"
+
+
+def test_get_data_files_unknown_host():
+    config = {"datalake": {"bronze": "/tmp/bronze"}}
+    data = {"host": "unknown", "filename": "file.nc"}
+    with pytest.raises(ValueError, match="Unknown host"):
+        prod.get_data_files(data, config, "bronze")
 
 
 def test_get_var_types_from_config():
@@ -153,6 +231,207 @@ def test_check_paths(tmp_path: Path):
     valid_path.unlink()  # Clean up the dummy file
 
 
+def test_get_engine_raises_on_init_failure(monkeypatch):
+    monkeypatch.setenv("DB_URL", "postgresql://bad/url")
+    with patch(
+        "heiplanet_db.production.db.initialize_database",
+        side_effect=Exception("connection refused"),
+    ):
+        with pytest.raises(ValueError, match="Could not initialize engine"):
+            prod.get_engine()
+
+
+def test_get_engine_drop_tables_true_calls_initialize_database_replace_true(
+    monkeypatch,
+):
+    sentinel_engine = object()
+    monkeypatch.setenv("DB_URL", "postgresql://user:pass@host:5432/dbname")
+
+    with patch(
+        "heiplanet_db.production.db.initialize_database",
+        return_value=sentinel_engine,
+    ) as init_db:
+        engine = prod.get_engine(drop_tables=True)
+
+    assert engine is sentinel_engine
+    init_db.assert_called_once_with(
+        "postgresql://user:pass@host:5432/dbname",
+        replace=True,
+    )
+
+
+def test_reset_production_data_executes_truncate_statement():
+    engine = MagicMock()
+    conn = engine.begin.return_value.__enter__.return_value
+
+    prod.reset_production_data(engine)
+
+    engine.begin.assert_called_once()
+    conn.execute.assert_called_once()
+    sql_arg = conn.execute.call_args.args[0]
+    # The SQLAlchemy text object should contain our TRUNCATE statement and key tables.
+    sql_str = str(sql_arg)
+    assert "TRUNCATE TABLE" in sql_str
+    assert "grid_point_resolution" in sql_str
+    assert "var_value_nuts" in sql_str
+    assert "var_value" in sql_str
+    assert "grid_point" in sql_str
+    assert "time_point" in sql_str
+    assert "var_type" in sql_str
+    assert "resolution_group" in sql_str
+    assert "nuts_def" in sql_str
+
+
+def test_main_uses_config_from_env(tmp_path, monkeypatch):
+    fake_config = {"datalake": {"bronze": str(tmp_path)}, "data_to_fetch": []}
+    monkeypatch.setenv("CONFIG_FILE", str(tmp_path / "env_config.yml"))
+    (tmp_path / "env_config.yml").touch()
+    with (
+        patch(
+            "heiplanet_db.production.read_production_config",
+            return_value=fake_config,
+        ) as read_cfg,
+        patch(
+            "heiplanet_db.production.create_directories",
+            side_effect=RuntimeError("stop"),
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="stop"):
+            prod.main()
+    read_cfg.assert_called_once_with(str(tmp_path / "env_config.yml"))
+
+
+def test_main_value_error_when_no_shapefile(tmp_path, monkeypatch):
+    fake_config = {
+        "datalake": {"bronze": str(tmp_path), "silver": str(tmp_path / "silver")},
+        "data_to_fetch": [
+            {
+                "var_name": [{"type": "R0", "name": "t2m", "level": "bronze"}],
+                "filename": "r0.nc",
+            },
+        ],
+    }
+    (tmp_path / "r0.nc").touch()
+    monkeypatch.delenv("CONFIG_FILE", raising=False)
+    with (
+        patch(
+            "heiplanet_db.production.read_production_config", return_value=fake_config
+        ),
+        patch("heiplanet_db.production.create_directories"),
+        patch("heiplanet_db.production.get_data_files"),
+        patch("heiplanet_db.production.get_engine"),
+    ):
+        with pytest.raises(ValueError, match="Shapefile path could not be generated"):
+            prod.main()
+
+
+def test_main_uses_explicit_config_path(tmp_path):
+    fake_config = {"datalake": {"bronze": str(tmp_path)}, "data_to_fetch": []}
+    with (
+        patch(
+            "heiplanet_db.production.read_production_config", return_value=fake_config
+        ) as read_cfg,
+        patch(
+            "heiplanet_db.production.create_directories",
+            side_effect=RuntimeError("stop"),
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="stop"):
+            prod.main(config_path="my-config.yml")
+    read_cfg.assert_called_once_with("my-config.yml")
+
+
+def _make_minimal_definition_config(tmp_path: Path) -> dict:
+    bronze_dir = tmp_path / "bronze"
+    bronze_dir.mkdir(parents=True, exist_ok=True)
+    # Dummy zip file that will be "opened" by the patched ZipFile
+    shapefile_zip = bronze_dir / "nuts_def.zip"
+    shapefile_zip.touch()
+    return {
+        "datalake": {"bronze": str(bronze_dir)},
+        "data_to_fetch": [
+            {
+                "var_name": [
+                    {
+                        "type": "definition",
+                        "name": "NUTS-definition",
+                        "level": "bronze",
+                    }
+                ],
+                "filename": shapefile_zip.name,
+                "host": "local",
+            }
+        ],
+    }
+
+
+def test_main_calls_reset_production_data_when_drop_tables_false(tmp_path, monkeypatch):
+    fake_config = _make_minimal_definition_config(tmp_path)
+    sentinel_engine = object()
+
+    with (
+        patch(
+            "heiplanet_db.production.read_production_config",
+            return_value=fake_config,
+        ),
+        patch("heiplanet_db.production.create_directories"),
+        patch("heiplanet_db.production.get_data_files"),
+        patch(
+            "heiplanet_db.production.zipfile.ZipFile"
+        ) as zip_cls,  # avoid working with a real zip
+        patch(
+            "heiplanet_db.production.get_engine",
+            return_value=sentinel_engine,
+        ),
+        patch("heiplanet_db.production.insert_data"),
+        patch("heiplanet_db.production.get_var_types_from_config", return_value=[]),
+        patch("heiplanet_db.production.db.insert_var_types"),
+        patch("heiplanet_db.production.db.insert_resolution_groups"),
+        patch("heiplanet_db.production.load_data_with_optimization"),
+        patch("heiplanet_db.production.reset_production_data") as reset_data,
+    ):
+        # Make the ZipFile context manager a no-op
+        zip_inst = zip_cls.return_value.__enter__.return_value
+        zip_inst.extractall.return_value = None
+
+        prod.main(drop_tables=False, config_path="ignored.yml")
+
+    reset_data.assert_called_once_with(sentinel_engine)
+
+
+def test_main_does_not_call_reset_production_data_when_drop_tables_true(
+    tmp_path, monkeypatch
+):
+    fake_config = _make_minimal_definition_config(tmp_path)
+    sentinel_engine = object()
+
+    with (
+        patch(
+            "heiplanet_db.production.read_production_config",
+            return_value=fake_config,
+        ),
+        patch("heiplanet_db.production.create_directories"),
+        patch("heiplanet_db.production.get_data_files"),
+        patch("heiplanet_db.production.zipfile.ZipFile") as zip_cls,
+        patch(
+            "heiplanet_db.production.get_engine",
+            return_value=sentinel_engine,
+        ),
+        patch("heiplanet_db.production.insert_data"),
+        patch("heiplanet_db.production.get_var_types_from_config", return_value=[]),
+        patch("heiplanet_db.production.db.insert_var_types"),
+        patch("heiplanet_db.production.db.insert_resolution_groups"),
+        patch("heiplanet_db.production.load_data_with_optimization"),
+        patch("heiplanet_db.production.reset_production_data") as reset_data,
+    ):
+        zip_inst = zip_cls.return_value.__enter__.return_value
+        zip_inst.extractall.return_value = None
+
+        prod.main(drop_tables=True, config_path="ignored.yml")
+
+    reset_data.assert_not_called()
+
+
 @pytest.mark.skip(
     reason="This test requires a lot of resources and is not suitable for CI."
 )
@@ -205,6 +484,18 @@ def test_autovacuum_restoration_on_success(get_engine_with_tables):
         patch("heiplanet_db.production.insert_var_values_nuts"),
     ):
         prod.load_data_with_optimization(engine, r0_path=Path("dummy.nc"))
+
+
+def test_load_data_with_optimization_nuts_only(get_engine_with_tables):
+    engine = get_engine_with_tables
+    with (
+        patch("heiplanet_db.production.insert_var_values"),
+        patch("heiplanet_db.production.insert_var_values_nuts") as insert_nuts,
+    ):
+        prod.load_data_with_optimization(
+            engine, r0_path=None, r0_nuts_path=Path("dummy_nuts.nc")
+        )
+    insert_nuts.assert_called_once_with(engine, r0_nuts_path=Path("dummy_nuts.nc"))
 
     # Verify autovacuum is enabled
     with engine.connect() as conn:
