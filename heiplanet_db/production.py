@@ -210,6 +210,34 @@ def insert_var_values_nuts(
     return 0
 
 
+def reset_production_data(engine: engine.Engine) -> None:
+    """
+    Truncate production data tables while keeping the existing schema.
+
+    This makes reruns of the production load idempotent when tables are kept
+    (i.e. when drop_tables=False), avoiding uniqueness constraint violations
+    from bulk inserts into already-populated tables.
+    """
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                TRUNCATE TABLE
+                    grid_point_resolution,
+                    var_value_nuts,
+                    var_value,
+                    grid_point,
+                    time_point,
+                    var_type,
+                    resolution_group,
+                    nuts_def
+                RESTART IDENTITY CASCADE;
+                """
+            )
+        )
+    print("Production data tables truncated (schema preserved).")
+
+
 def get_data_files(data: dict, config: dict, data_level: str) -> None:
     if "local" in data["host"]:
         # if the host is local, we can use the local path
@@ -236,8 +264,10 @@ def main(drop_tables: bool = False, config_path: str | None = None) -> None:
 
     Args:
         drop_tables (bool): If True, drop all existing tables before inserting data.
-            If False, insert data into existing tables. Defaults to False.
-            Set to True only when initializing a fresh database.
+            If False, keep the existing schema but truncate and reload all
+            production data tables so the load is idempotent. Defaults to False.
+            Set to True only when initializing a fresh database and you also
+            want tables to be recreated.
         config_path (str | None): Path to the production configuration file.
             If None, uses the CONFIG_FILE environment variable or the default
             container path `/heiplanet_db/production.yaml` if available; otherwise
@@ -299,6 +329,10 @@ def main(drop_tables: bool = False, config_path: str | None = None) -> None:
             "Shapefile path could not be generated from the data to fetch."
         )
     engine = get_engine(drop_tables=drop_tables)
+    # When we keep tables (drop_tables=False) we still need to clear existing
+    # data to avoid uniqueness violations from bulk inserts on reruns.
+    if not drop_tables:
+        reset_production_data(engine)
     # insert the NUTS shape data
     insert_data(engine=engine, shapefiles_folder_path=shapefile_folder_path)
 

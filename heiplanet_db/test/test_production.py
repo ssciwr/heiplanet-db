@@ -3,7 +3,7 @@ import pytest
 from pathlib import Path
 from importlib import resources
 from importlib.resources.abc import Traversable
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 from sqlalchemy import text
 
 
@@ -260,6 +260,28 @@ def test_get_engine_drop_tables_true_calls_initialize_database_replace_true(
     )
 
 
+def test_reset_production_data_executes_truncate_statement():
+    engine = MagicMock()
+    conn = engine.begin.return_value.__enter__.return_value
+
+    prod.reset_production_data(engine)
+
+    engine.begin.assert_called_once()
+    conn.execute.assert_called_once()
+    sql_arg = conn.execute.call_args.args[0]
+    # The SQLAlchemy text object should contain our TRUNCATE statement and key tables.
+    sql_str = str(sql_arg)
+    assert "TRUNCATE TABLE" in sql_str
+    assert "grid_point_resolution" in sql_str
+    assert "var_value_nuts" in sql_str
+    assert "var_value" in sql_str
+    assert "grid_point" in sql_str
+    assert "time_point" in sql_str
+    assert "var_type" in sql_str
+    assert "resolution_group" in sql_str
+    assert "nuts_def" in sql_str
+
+
 def test_main_uses_config_from_env(tmp_path, monkeypatch):
     fake_config = {"datalake": {"bronze": str(tmp_path)}, "data_to_fetch": []}
     monkeypatch.setenv("CONFIG_FILE", str(tmp_path / "env_config.yml"))
@@ -317,6 +339,97 @@ def test_main_uses_explicit_config_path(tmp_path):
         with pytest.raises(RuntimeError, match="stop"):
             prod.main(config_path="my-config.yml")
     read_cfg.assert_called_once_with("my-config.yml")
+
+
+def _make_minimal_definition_config(tmp_path: Path) -> dict:
+    bronze_dir = tmp_path / "bronze"
+    bronze_dir.mkdir(parents=True, exist_ok=True)
+    # Dummy zip file that will be "opened" by the patched ZipFile
+    shapefile_zip = bronze_dir / "nuts_def.zip"
+    shapefile_zip.touch()
+    return {
+        "datalake": {"bronze": str(bronze_dir)},
+        "data_to_fetch": [
+            {
+                "var_name": [
+                    {
+                        "type": "definition",
+                        "name": "NUTS-definition",
+                        "level": "bronze",
+                    }
+                ],
+                "filename": shapefile_zip.name,
+                "host": "local",
+            }
+        ],
+    }
+
+
+def test_main_calls_reset_production_data_when_drop_tables_false(tmp_path, monkeypatch):
+    fake_config = _make_minimal_definition_config(tmp_path)
+    sentinel_engine = object()
+
+    with (
+        patch(
+            "heiplanet_db.production.read_production_config",
+            return_value=fake_config,
+        ),
+        patch("heiplanet_db.production.create_directories"),
+        patch("heiplanet_db.production.get_data_files"),
+        patch(
+            "heiplanet_db.production.zipfile.ZipFile"
+        ) as zip_cls,  # avoid working with a real zip
+        patch(
+            "heiplanet_db.production.get_engine",
+            return_value=sentinel_engine,
+        ),
+        patch("heiplanet_db.production.insert_data"),
+        patch("heiplanet_db.production.get_var_types_from_config", return_value=[]),
+        patch("heiplanet_db.production.db.insert_var_types"),
+        patch("heiplanet_db.production.db.insert_resolution_groups"),
+        patch("heiplanet_db.production.load_data_with_optimization"),
+        patch("heiplanet_db.production.reset_production_data") as reset_data,
+    ):
+        # Make the ZipFile context manager a no-op
+        zip_inst = zip_cls.return_value.__enter__.return_value
+        zip_inst.extractall.return_value = None
+
+        prod.main(drop_tables=False, config_path="ignored.yml")
+
+    reset_data.assert_called_once_with(sentinel_engine)
+
+
+def test_main_does_not_call_reset_production_data_when_drop_tables_true(
+    tmp_path, monkeypatch
+):
+    fake_config = _make_minimal_definition_config(tmp_path)
+    sentinel_engine = object()
+
+    with (
+        patch(
+            "heiplanet_db.production.read_production_config",
+            return_value=fake_config,
+        ),
+        patch("heiplanet_db.production.create_directories"),
+        patch("heiplanet_db.production.get_data_files"),
+        patch("heiplanet_db.production.zipfile.ZipFile") as zip_cls,
+        patch(
+            "heiplanet_db.production.get_engine",
+            return_value=sentinel_engine,
+        ),
+        patch("heiplanet_db.production.insert_data"),
+        patch("heiplanet_db.production.get_var_types_from_config", return_value=[]),
+        patch("heiplanet_db.production.db.insert_var_types"),
+        patch("heiplanet_db.production.db.insert_resolution_groups"),
+        patch("heiplanet_db.production.load_data_with_optimization"),
+        patch("heiplanet_db.production.reset_production_data") as reset_data,
+    ):
+        zip_inst = zip_cls.return_value.__enter__.return_value
+        zip_inst.extractall.return_value = None
+
+        prod.main(drop_tables=True, config_path="ignored.yml")
+
+    reset_data.assert_not_called()
 
 
 @pytest.mark.skip(
