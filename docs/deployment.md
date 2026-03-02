@@ -238,10 +238,10 @@ Building a local Docker image is necessary when:
 From the `heiplanet-db/` root directory:
 
 ```bash
-docker build -t heiplanet-backend .
+docker build -t heiplanet-db .
 ```
 
-This creates a local image tagged as `heiplanet-backend` containing:
+This creates a local image tagged as `heiplanet-db` containing:
 - Python backend application
 - Data processing pipeline
 - Configuration files
@@ -255,10 +255,10 @@ Change the image reference in `docker-compose.yaml`:
 
 ```yaml
 # Before
-image: ghcr.io/ssciwr/heiplanet-backend:latest
+image: ghcr.io/ssciwr/heiplanet-db:latest
 
 # After
-image: heiplanet-backend
+image: heiplanet-db
 ```
 
 **Option 2: Use Build Configuration**
@@ -269,7 +269,7 @@ Alternatively, uncomment the `build:` lines in `docker-compose.yaml` to force lo
 services:
   api:
     build: .
-    # image: ghcr.io/ssciwr/heiplanet-backend:latest
+    # image: ghcr.io/ssciwr/heiplanet-db:latest
 ```
 
 Then run:
@@ -292,17 +292,17 @@ echo $CR_PAT | docker login ghcr.io -u <github-username> --password-stdin
 **Step 2: Tag the Image**
 
 ```bash
-docker image tag heiplanet-backend ghcr.io/ssciwr/heiplanet-backend:latest
+docker image tag heiplanet-db ghcr.io/ssciwr/heiplanet-db:latest
 
 # For version-specific tags
-docker image tag heiplanet-backend ghcr.io/ssciwr/heiplanet-backend:v1.2.3
+docker image tag heiplanet-db ghcr.io/ssciwr/heiplanet-db:v1.2.3
 ```
 
 **Step 3: Push to GHCR**
 
 ```bash
-docker push ghcr.io/ssciwr/heiplanet-backend:latest
-docker push ghcr.io/ssciwr/heiplanet-backend:v1.2.3
+docker push ghcr.io/ssciwr/heiplanet-db:latest
+docker push ghcr.io/ssciwr/heiplanet-db:v1.2.3
 ```
 
 **Note:** Ensure your GitHub Personal Access Token has `write:packages` and `read:packages` permissions.
@@ -412,7 +412,7 @@ To deploy the system in production with your chosen configuration:
 
 2. **Build the Docker image** with your selected configuration ([see above](./deployment.md#building-the-image-locally)):
    ```bash
-   docker build -t heiplanet-backend .
+   docker build -t heiplanet-db .
    ```
 
 3. **Run the deployment** using docker compose:
