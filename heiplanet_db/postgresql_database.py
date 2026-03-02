@@ -500,6 +500,11 @@ def assign_grid_resolution_group_to_grid_point(session: Session) -> None:
     Uses raw SQL INSERT...SELECT so the database performs the matching
     and insert directly, avoiding OOM when processing millions of grid points.
 
+    This function is idempotent due to ON CONFLICT DO NOTHING - reruns will
+    skip existing assignments without error. If you need to completely refresh
+    assignments (e.g., after changing resolution logic), manually TRUNCATE
+    the grid_point_resolution table before running this function.
+
     Args:
         session (Session): SQLAlchemy session object.
     """
@@ -516,21 +521,9 @@ def assign_grid_resolution_group_to_grid_point(session: Session) -> None:
         ON CONFLICT DO NOTHING
     """)
 
-    delete_sql = text("""
-        DELETE FROM grid_point_resolution
-        WHERE resolution_id = :resolution_id
-    """)
-
     try:
         for resolution_group in resolution_groups:
             resolution_mod = int(float(resolution_group.resolution) * 10)
-            # Clear any existing assignments for this resolution_id so reruns are idempotent
-            session.execute(
-                delete_sql,
-                {
-                    "resolution_id": resolution_group.id,
-                },
-            )
             result = session.execute(
                 insert_sql,
                 {
@@ -540,12 +533,26 @@ def assign_grid_resolution_group_to_grid_point(session: Session) -> None:
             )
             rowcount = result.rowcount
             if rowcount == 0:
-                raise ValueError(
-                    f"No matching grid points for {resolution_group.resolution} degree resolution found."
+                # Check if assignments already exist for this resolution
+                existing_count = session.execute(
+                    text("""
+                        SELECT COUNT(*) FROM grid_point_resolution
+                        WHERE resolution_id = :resolution_id
+                    """),
+                    {"resolution_id": resolution_group.id},
+                ).scalar()
+                if existing_count == 0:
+                    raise ValueError(
+                        f"No matching grid points for {resolution_group.resolution} degree resolution found."
+                    )
+                else:
+                    print(
+                        f"Resolution {resolution_group.resolution}° already has {existing_count} assignments (skipped)."
+                    )
+            else:
+                print(
+                    f"Assigned {rowcount} grid points to resolution {resolution_group.resolution}°."
                 )
-            print(
-                f"Assigned {rowcount} grid points to resolution {resolution_group.resolution}°."
-            )
         session.commit()
         print("Grid point resolutions assigned.")
     except Exception:

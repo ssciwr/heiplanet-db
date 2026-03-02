@@ -185,7 +185,6 @@ def insert_var_values(
     print("Assigning resolution groups to grid points.")
     resolution_session = db.create_session(engine)
     db.assign_grid_resolution_group_to_grid_point(resolution_session)
-    resolution_session.commit()
     resolution_session.close()
     print("Variable values inserted and resolution groups assigned.")
     return 0
