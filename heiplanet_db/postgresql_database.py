@@ -513,11 +513,24 @@ def assign_grid_resolution_group_to_grid_point(session: Session) -> None:
         FROM grid_point gp
         WHERE (ROUND(gp.latitude::numeric * 10)::integer % :resolution_mod = 0)
           AND (ROUND(gp.longitude::numeric * 10)::integer % :resolution_mod = 0)
+        ON CONFLICT DO NOTHING
+    """)
+
+    delete_sql = text("""
+        DELETE FROM grid_point_resolution
+        WHERE resolution_id = :resolution_id
     """)
 
     try:
         for resolution_group in resolution_groups:
             resolution_mod = int(float(resolution_group.resolution) * 10)
+            # Clear any existing assignments for this resolution_id so reruns are idempotent
+            session.execute(
+                delete_sql,
+                {
+                    "resolution_id": resolution_group.id,
+                },
+            )
             result = session.execute(
                 insert_sql,
                 {

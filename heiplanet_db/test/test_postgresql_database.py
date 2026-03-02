@@ -368,6 +368,26 @@ def test_assign_grid_resolution_group_to_grid_point_no_resolution_group(get_sess
     get_session.commit()
 
 
+def test_assign_grid_resolution_group_to_grid_point_idempotent(get_session):
+    # Arrange: insert resolution groups and grid points
+    postdb.insert_resolution_groups(get_session)
+    latitudes = np.array([0.0, 0.1, 0.2])
+    longitudes = np.array([0.0, 0.1, 0.2])
+    postdb.insert_grid_points(get_session, latitudes, longitudes)
+
+    # Act: first assignment
+    postdb.assign_grid_resolution_group_to_grid_point(get_session)
+    first_count = get_session.query(postdb.GridPointResolution).count()
+    assert first_count > 0
+
+    # Act again: second assignment must not raise and must not create duplicates
+    postdb.assign_grid_resolution_group_to_grid_point(get_session)
+    second_count = get_session.query(postdb.GridPointResolution).count()
+
+    # Assert: idempotent behaviour (same number of relationships)
+    assert second_count == first_count
+
+
 def test_extract_time_point():
     time_points = {
         np.datetime64("2024-01-01T00:00:00.000000000"): (2024, 1, 1),
