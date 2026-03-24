@@ -40,6 +40,15 @@ The `<tag>` can be a specific version number, `latest` for the most recent relea
   - **Data Pipeline**: ETL (Extract, Transform, Load) processes for ingesting surveillance data
   - **Data Validation**: Quality checks and integrity verification
 
+name = "mailcom"
+license = {text = "MIT License"}
+readme = "README.md"
+description = "Pseudonymize email content in Romance languages"
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
 The `<tag>` can be a version number, `latest`, or a branch name. Using a locally built image allows customization of the data configuration, enabling you to modify which datasets are ingested or add new data sources.
 
 
@@ -195,15 +204,63 @@ docker run -d \
   heiplanet-db
 ```
 
-The API will be accessible at `http://localhost:8000`
 
-#### Step 3: Populate Database with Test Data
+### Local run without docker compose
+To run with a local Python process and only PostGIS in Docker, use the following workflow from the `heiplanet-db/` root directory.
+
+##### 1. Configure `.env`
+Create/update `.env` with:
+```
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=heiplanet-db-secret-name
+POSTGRES_DB=heiplanet_db
+
+DB_USER=postgres
+DB_PASSWORD=heiplanet-db-secret-name
+DB_HOST=127.0.0.1
+DB_PORT=5432
+DB_URL=postgresql://postgres:heiplanet-db-secret-name@127.0.0.1:5432/heiplanet_db
+WAIT_FOR_DB=true
+IP_ADDRESS=127.0.0.1
+BATCH_SIZE=10000
+MAX_WORKERS=4
+VAR_TIME_CHUNK=6
+VAR_LAT_CHUNK=45
+VAR_LON_CHUNK=90
+```
+
+##### 2. Start PostgreSQL/PostGIS
+```
+docker run --name my-postgres \
+  -e POSTGRES_USER=$POSTGRES_USER \
+  -e POSTGRES_PASSWORD=$POSTGRES_PASSWORD \
+  -e POSTGRES_DB=$POSTGRES_DB \
+  -p 5432:5432 \
+  --shm-size=512mb \
+  -d postgis/postgis:17-3.5
+```
+
+##### 3. Populate database tables
+```
+python heiplanet_db/production.py
+```
+
+#### Alternative 3 when using docker compose: Populate Database with Test Data
 
 Run the data ingestion script inside the API container:
 
 ```bash
 docker exec -it heiplanet_api python3 /heiplanet_db/production.py
 ```
+##### 4. Run the API locally
+```
+cd heiplanet_db
+fastapi dev
+```
+
+With the currently reduced input files (Grid and NUTS only), database setup is typically fast.
+The API will be accessible at `http://localhost:8000`
+
 
 This processes and loads test data into the database. Depending on the configuration file used, this may take several minutes.
 
