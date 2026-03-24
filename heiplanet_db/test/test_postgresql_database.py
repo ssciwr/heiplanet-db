@@ -368,6 +368,26 @@ def test_assign_grid_resolution_group_to_grid_point_no_resolution_group(get_sess
     get_session.commit()
 
 
+def test_assign_grid_resolution_group_to_grid_point_idempotent(get_session):
+    # Arrange: insert resolution groups and grid points
+    postdb.insert_resolution_groups(get_session)
+    latitudes = np.array([0.0, 0.1, 0.2])
+    longitudes = np.array([0.0, 0.1, 0.2])
+    postdb.insert_grid_points(get_session, latitudes, longitudes)
+
+    # Act: first assignment
+    postdb.assign_grid_resolution_group_to_grid_point(get_session)
+    first_count = get_session.query(postdb.GridPointResolution).count()
+    assert first_count > 0
+
+    # Act again: second assignment must not raise and must not create duplicates
+    postdb.assign_grid_resolution_group_to_grid_point(get_session)
+    second_count = get_session.query(postdb.GridPointResolution).count()
+
+    # Assert: idempotent behaviour (same number of relationships)
+    assert second_count == first_count
+
+
 def test_extract_time_point():
     time_points = {
         np.datetime64("2024-01-01T00:00:00.000000000"): (2024, 1, 1),
@@ -1932,3 +1952,30 @@ def test_insert_var_value_nuts(
     assert result[0].time_id == 1
     assert result[0].var_id == 1
     assert math.isclose(result[0].value, get_varnuts_dataset.t2m[0, 0], abs_tol=1e-5)
+
+
+def test_insert_var_value_nuts_rejects_extra_dims(
+    get_engine_with_tables,
+    get_session,
+    get_varnuts_dataset,
+    get_nuts_def_data,
+    tmp_path,
+    seed_base_data,
+):
+    nuts_path = tmp_path / "nuts_def.shp"
+    gdf_nuts_data = get_nuts_def_data
+    gdf_nuts_data.to_file(nuts_path, driver="ESRI Shapefile")
+    postdb.insert_nuts_def(get_engine_with_tables, nuts_path)
+
+    # get the id maps
+    _, time_id_map, var_id_map = postdb.get_id_maps(get_session)
+
+    ds_extra = get_varnuts_dataset.expand_dims(lat=[0, 1])
+    with pytest.raises(ValueError, match="must be 2D over \\('time', 'NUTS_ID'\\)"):
+        postdb.insert_var_value_nuts(
+            get_engine_with_tables,
+            ds_extra,
+            var_name="t2m",
+            time_id_map=time_id_map,
+            var_id_map=var_id_map,
+        )
