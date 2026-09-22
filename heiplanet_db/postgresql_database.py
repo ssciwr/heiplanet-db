@@ -1,46 +1,47 @@
+import gc
+import json
+import math
+import os
+import time
+from collections.abc import Generator
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+import xarray as xr
+from fastapi import HTTPException
+from geoalchemy2 import Geometry, WKBElement
 from sqlalchemy import (
-    create_engine,
-    text,
+    BigInteger,
     Float,
-    String,
+    ForeignKey,
+    ForeignKeyConstraint,
+    Index,
     Integer,
     Numeric,
-    BigInteger,
-    Index,
-    ForeignKey,
+    String,
     UniqueConstraint,
-    ForeignKeyConstraint,
+    create_engine,
     engine,
     func,
+    text,
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.exc import SQLAlchemyError
-from geoalchemy2 import Geometry, WKBElement
-from sqlalchemy.orm.session import sessionmaker, Session
-import geopandas as gpd
-from pathlib import Path
-import pandas as pd
-import numpy as np
-import xarray as xr
-import time
-import os
-import math
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm.session import Session, sessionmaker
 from tqdm import tqdm
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Generator, Type, Tuple, List
-from fastapi import HTTPException
-import json
-import gc
 
 CRS = 4326
 STR_POINT = "SRID={};POINT({} {})"
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", 10000))
-MAX_WORKERS = int(os.environ.get("MAX_WORKERS", 4))
-VAR_TIME_CHUNK = int(os.environ.get("VAR_TIME_CHUNK", 6))
-GRID_LAT_CHUNK = int(os.environ.get("GRID_LAT_CHUNK", 45))
-GRID_LON_CHUNK = int(os.environ.get("GRID_LON_CHUNK", 360))
-ROUND_DIGITS = int(os.environ.get("ROUND_DIGITS", 4))
-TIMEOUT = int(os.environ.get("TIMEOUT", 300))
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "10000"))
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "4"))
+VAR_TIME_CHUNK = int(os.environ.get("VAR_TIME_CHUNK", "6"))
+GRID_LAT_CHUNK = int(os.environ.get("GRID_LAT_CHUNK", "45"))
+GRID_LON_CHUNK = int(os.environ.get("GRID_LON_CHUNK", "360"))
+ROUND_DIGITS = int(os.environ.get("ROUND_DIGITS", "4"))
+TIMEOUT = int(os.environ.get("TIMEOUT", "300"))
 
 
 def _q(value):
@@ -72,8 +73,6 @@ def _normalize_time_key(t_val: np.datetime64) -> np.datetime64:
 class Base(DeclarativeBase):
     """
     Base class for all models in the database."""
-
-    pass
 
 
 class NutsDef(Base):
@@ -397,7 +396,7 @@ def add_data_list(session: Session, data_list: list):
         print(f"Error inserting data: {e}")
 
 
-def add_data_list_bulk(session: Session, data_dict_list: list, class_type: Type[Base]):
+def add_data_list_bulk(session: Session, data_dict_list: list, class_type: type[Base]):
     """
     Add a list of data to the database in bulk.
 
@@ -458,7 +457,7 @@ def insert_grid_points(session: Session, latitudes: np.ndarray, longitudes: np.n
 
 def insert_resolution_groups(
     session: Session,
-    resolutions: np.ndarray = np.array([0.1, 0.2, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 5.0]),
+    resolutions: np.ndarray | None = None,
     descriptions: list[str] | None = None,
 ) -> None:
     """Create the resolution groups.
@@ -477,6 +476,8 @@ def insert_resolution_groups(
         descriptions (list[str]|None): List of descriptions for each resolution.
             If None, default descriptions will be used.
     """
+    if resolutions is None:
+        resolutions = np.array([0.1, 0.2, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 5.0])
     if descriptions is None:
         descriptions = [f"{res} degree resolution" for res in resolutions]
     # create list of dictionaries for bulk insert
@@ -583,11 +584,11 @@ def extract_time_point(
             time_stamp.second,
         )
     else:
-        raise ValueError("Invalid time point format.")
+        raise TypeError("Invalid time point format.")
 
 
 def get_unique_time_points(
-    time_point_data: list[Tuple[np.ndarray, bool]],
+    time_point_data: list[tuple[np.ndarray, bool]],
 ) -> np.ndarray:
     """Get the unique of time points.
 
@@ -628,7 +629,7 @@ def get_unique_time_points(
 
 
 def insert_time_points(
-    session: Session, time_point_data: list[Tuple[np.ndarray, bool]]
+    session: Session, time_point_data: list[tuple[np.ndarray, bool]]
 ):
     """Insert time points into the database.
 
@@ -772,7 +773,7 @@ def convert_yearly_to_monthly(ds: xr.Dataset) -> xr.Dataset:
     return ds.reindex(time=new_time_points, method="ffill")
 
 
-def insert_batch(batch: list[VarValue], engine: engine.Engine, VarClass: Type[Base]):
+def insert_batch(batch: list[VarValue], engine: engine.Engine, VarClass: type[Base]):
     session = create_session(engine)
     try:
         add_data_list_bulk(session, batch, VarClass)
@@ -1140,9 +1141,9 @@ def get_var_value_nuts(
 
 def get_time_points(
     session: Session,
-    start_time_point: Tuple[int, int],
-    end_time_point: Tuple[int, int] | None = None,
-) -> List[TimePoint]:
+    start_time_point: tuple[int, int],
+    end_time_point: tuple[int, int] | None = None,
+) -> list[TimePoint]:
     """Get time points from the database that fall within a specified range.
 
     Args:
@@ -1193,7 +1194,7 @@ def get_resolution_id(session: Session, resolution: float) -> int | None:
     return resolution_group.id if resolution_group else None
 
 
-def get_grid_ids_by_resolution(session: Session, resolution_id: int) -> List[int]:
+def get_grid_ids_by_resolution(session: Session, resolution_id: int) -> list[int]:
     """Get all grid point IDs for a specific resolution.
 
     Args:
@@ -1213,9 +1214,9 @@ def get_grid_ids_by_resolution(session: Session, resolution_id: int) -> List[int
 
 def get_grid_points(
     session: Session,
-    area: None | Tuple[float, float, float, float] = None,
+    area: None | tuple[float, float, float, float] = None,
     resolution_id: int | None = None,
-) -> List[GridPoint]:
+) -> list[GridPoint]:
     """Get grid points from the database that fall within a specified area.
     Args:
         session (Session): SQLAlchemy session object.
@@ -1250,8 +1251,8 @@ def get_grid_points(
 
 def get_var_types(
     session: Session,
-    var_names: None | List[str] = None,
-) -> List[VarType]:
+    var_names: None | list[str] = None,
+) -> list[VarType]:
     """Get variable types from the database with names specified in a list.
 
     Args:
@@ -1269,7 +1270,7 @@ def get_var_types(
 
 
 def sort_grid_points_get_ids(
-    grid_points: List[GridPoint],
+    grid_points: list[GridPoint],
 ) -> tuple[dict, list[float], list[float]]:
     # Sort and deduplicate latitudes and longitudes
     latitudes = sorted({_q(gp.latitude) for gp in grid_points})
@@ -1289,9 +1290,9 @@ def sort_grid_points_get_ids(
 
 def get_var_values_cartesian(
     session: Session,
-    time_point: Tuple[int, int],
+    time_point: tuple[int, int],
     grid_resolution: float = 0.1,
-    area: None | Tuple[float, float, float, float] = None,
+    area: None | tuple[float, float, float, float] = None,
     var_name: None | str = None,
 ) -> dict:
     """Get variable values for a cartesian map.
@@ -1381,10 +1382,10 @@ def get_var_values_cartesian(
 
 def get_var_values_cartesian_for_download(
     session: Session,
-    start_time_point: Tuple[int, int],
-    end_time_point: Tuple[int, int] | None = None,
-    area: None | Tuple[float, float, float, float] = None,
-    var_names: None | List[str] = None,
+    start_time_point: tuple[int, int],
+    end_time_point: tuple[int, int] | None = None,
+    area: None | tuple[float, float, float, float] = None,
+    var_names: None | list[str] = None,
     netcdf_file: str = "cartesian_grid_data_heiplanet.nc",
 ) -> dict:
     """Get variable values for a cartesian map.
@@ -1565,7 +1566,7 @@ def get_nuts_regions_geojson(
 def get_grid_ids_in_nuts(
     engine: engine.Engine,
     nuts_regions: gpd.GeoDataFrame,
-) -> List[int]:
+) -> list[int]:
     """Get grid point IDs that are within the NUTS regions.
 
     Args:
@@ -1588,7 +1589,7 @@ def get_grid_ids_in_nuts(
         sql,
         engine,
         geom_col="geometry",
-        crs=f"EPSG:{str(CRS)}",
+        crs=f"EPSG:{CRS!s}",
     )
 
     # filter grid points that intersect with NUTS regions
@@ -1599,7 +1600,7 @@ def get_grid_ids_in_nuts(
     return sorted(set(filtered_grid_points_gdf["id"].tolist()))
 
 
-def filter_nuts_ids_for_resolution(nuts_ids: List[str], resolution: str) -> List[str]:
+def filter_nuts_ids_for_resolution(nuts_ids: list[str], resolution: str) -> list[str]:
     """Filter NUTS IDs based on the specified resolution.
 
     Args:
@@ -1628,7 +1629,7 @@ def filter_nuts_ids_for_resolution(nuts_ids: List[str], resolution: str) -> List
 
 def get_var_values_nuts(
     session: Session,
-    time_point: Tuple[int, int],
+    time_point: tuple[int, int],
     var_name: None | str = None,
     grid_resolution: str = "NUTS2",
 ) -> dict:

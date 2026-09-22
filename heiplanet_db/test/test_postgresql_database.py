@@ -1,17 +1,18 @@
-import pytest
-from heiplanet_db import postgresql_database as postdb
-import numpy as np
-import xarray as xr
-from testcontainers.postgres import PostgresContainer
-from sqlalchemy import text, inspect
-from sqlalchemy.orm.session import Session
-import geopandas as gpd
-from shapely.geometry import Polygon
 import math
-from fastapi import HTTPException
-from conftest import cleanup
-import pandas as pd
 
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+import pytest
+import xarray as xr
+from conftest import cleanup
+from fastapi import HTTPException
+from shapely.geometry import Polygon
+from sqlalchemy import inspect, text
+from sqlalchemy.orm.session import Session
+from testcontainers.postgres import PostgresContainer
+
+from heiplanet_db import postgresql_database as postdb
 
 # for local docker desktop,
 # environ["DOCKER_HOST"] is "unix:///home/[user]/.docker/desktop/docker.sock"
@@ -1890,7 +1891,6 @@ def test_get_var_values_nuts(
             var_name="t2m",
             grid_resolution="NUTS0",
         )
-    #
 
 
 def test_insert_var_value_nuts_no_var(
