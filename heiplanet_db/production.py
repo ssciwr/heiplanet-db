@@ -1,15 +1,16 @@
+import os
+import zipfile
 from importlib import resources
 from importlib.resources.abc import Traversable
 from pathlib import Path
-import yaml
-import pooch
+
 import dotenv
-import os
-from heiplanet_db import postgresql_database as db
-import zipfile
+import pooch
 import xarray as xr
-from sqlalchemy import engine
-from sqlalchemy import text
+import yaml
+from sqlalchemy import engine, text
+
+from heiplanet_db import postgresql_database as db
 
 
 def read_production_config(dict_path: str | Traversable | Path | None = None) -> dict:
@@ -96,8 +97,8 @@ def get_engine(drop_tables: bool = False) -> engine.Engine:
         engine = db.initialize_database(db_url, replace=drop_tables)
     except Exception as e:
         raise ValueError(
-            "Could not initialize engine, please check \
-                         your db_url {}".format(db_url)
+            f"Could not initialize engine, please check \
+                         your db_url {db_url}"
         ) from e
     return engine
 
@@ -286,7 +287,7 @@ def main(drop_tables: bool = False, config_path: str | None = None) -> None:
     r0_path = None
     r0_nuts_path = None
     # create the data lake structure if it does not exist
-    for dir_name in config["datalake"].keys():
+    for dir_name in config["datalake"]:
         create_directories(config["datalake"][dir_name])
 
     # fetch the data from the configured sources
@@ -320,7 +321,7 @@ def main(drop_tables: bool = False, config_path: str | None = None) -> None:
             # make sure the shapefile folder is unzipped
             shapefile_folder_path = shapefile_path.with_suffix("")
             with zipfile.ZipFile(shapefile_path, "r") as zip_ref:
-                print("Extracting zip archive to {}.".format(shapefile_folder_path))
+                print(f"Extracting zip archive to {shapefile_folder_path}.")
                 zip_ref.extractall(shapefile_folder_path)
     # now the files are in the silver stage, feed into database
     if not shapefile_folder_path:

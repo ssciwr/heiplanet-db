@@ -1,17 +1,20 @@
-from heiplanet_db import postgresql_database as db
-from fastapi import FastAPI, Depends, HTTPException, Response
-from fastapi.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
-from sqlalchemy.orm import Session
-from sqlalchemy import create_engine, text
-from typing import Annotated, Union
 import datetime
-import dotenv
-import os
-import logging
 import ipaddress
 import json
+import logging
+import os
+from contextlib import asynccontextmanager
+from typing import Annotated
+
+import dotenv
+from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
+
+from heiplanet_db import postgresql_database as db
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -29,10 +32,10 @@ engine = create_engine(db_url)
 ip_address = os.environ.get("IP_ADDRESS")
 # check that the IP address is a string
 if not isinstance(ip_address, str):
-    raise ValueError("IP_ADDRESS environment variable must be a string.")
+    raise TypeError("IP_ADDRESS environment variable must be a string.")
 try:
     ipaddress.IPv4Address(ip_address)
-except Exception:
+except ValueError:
     raise ValueError(
         f"IP_ADDRESS environment variable is not a valid IPv4 address: {ip_address}"
     )
@@ -99,7 +102,7 @@ def db_status():
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         return {"status": "ok"}
-    except Exception as e:
+    except SQLAlchemyError as e:
         return {"status": "error", "detail": str(e)}
 
 
@@ -114,7 +117,7 @@ class CartesianRequest(BaseModel):
 def get_cartesian(
     session: Annotated[Session, Depends(get_session)],
     request: CartesianRequest,  # Now everything comes from the body
-) -> Union[dict, None]:
+) -> dict | None:
     # the frontend will request a variable over all available lat, long values for that variable
     # the date input is 2016-01-01 (a date object)
     # the variable input is a matching string, ie "t2m" for temperature
@@ -143,7 +146,7 @@ def get_cartesian(
             var_name=var_name,
         )
         return {"result": var_value}
-    except Exception as e:
+    except (HTTPException, SQLAlchemyError) as e:
         return {"error": str(e)}
 
 
@@ -153,7 +156,7 @@ def get_nuts_data(
     requested_time_point: datetime.date,
     requested_variable_type: str | None,
     requested_grid_resolution: str | None,
-) -> Union[dict, None]:
+) -> dict | None:
     # the frontend will request a variable over all available lat, long values for that variable
     # the date input is 2016-01-01 (a date object)
     # the variable input is a matching string, ie "t2m" for temperature
@@ -180,21 +183,24 @@ def get_nuts_data(
             grid_resolution=grid_resolution,
         )
         return {"result": var_value}
-    except Exception as e:
+    except (HTTPException, SQLAlchemyError) as e:
         return {"error": str(e)}
 
 
-@app.get("/nuts_regions")
+@app.get(
+    "/nuts_regions",
+    responses={500: {"description": "Database error while fetching NUTS regions"}},
+)
 def get_nuts_regions(
     grid_resolution: str | None = None,
 ):
     try:
         resolution = grid_resolution.upper() if grid_resolution else None
         geojson = db.get_nuts_regions_geojson(engine, resolution)
-    except HTTPException as http_exc:
-        raise http_exc
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
+    except SQLAlchemyError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
     suffix = f"_{resolution.lower()}" if resolution else ""
     filename = f"nuts_regions{suffix}.geojson"

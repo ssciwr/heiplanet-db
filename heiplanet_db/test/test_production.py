@@ -1,10 +1,12 @@
-from heiplanet_db import production as prod
-import pytest
-from pathlib import Path
 from importlib import resources
 from importlib.resources.abc import Traversable
-from unittest.mock import patch, MagicMock
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
 from sqlalchemy import text
+
+from heiplanet_db import production as prod
 
 
 @pytest.fixture(scope="module")
@@ -52,17 +54,19 @@ def test_read_production_config(production_config: Traversable):
 def test_get_production_data_fetch_error(tmp_path: Path):
     outputdir = tmp_path / "out"
     outputdir.mkdir(parents=True, exist_ok=True)
-    with patch(
-        "heiplanet_db.production.pooch.retrieve",
-        side_effect=Exception("Connection refused"),
+    with (
+        patch(
+            "heiplanet_db.production.pooch.retrieve",
+            side_effect=Exception("Connection refused"),
+        ),
+        pytest.raises(RuntimeError, match="Failed to fetch data from"),
     ):
-        with pytest.raises(RuntimeError, match="Failed to fetch data from"):
-            prod.get_production_data(
-                url="https://example.com/missing",
-                filename="missing.nc",
-                filehash="abc123",
-                outputdir=outputdir,
-            )
+        prod.get_production_data(
+            url="https://example.com/missing",
+            filename="missing.nc",
+            filehash="abc123",
+            outputdir=outputdir,
+        )
 
 
 def test_get_production_data(tmp_path: Path):
@@ -233,12 +237,14 @@ def test_check_paths(tmp_path: Path):
 
 def test_get_engine_raises_on_init_failure(monkeypatch):
     monkeypatch.setenv("DB_URL", "postgresql://bad/url")
-    with patch(
-        "heiplanet_db.production.db.initialize_database",
-        side_effect=Exception("connection refused"),
+    with (
+        patch(
+            "heiplanet_db.production.db.initialize_database",
+            side_effect=Exception("connection refused"),
+        ),
+        pytest.raises(ValueError, match="Could not initialize engine"),
     ):
-        with pytest.raises(ValueError, match="Could not initialize engine"):
-            prod.get_engine()
+        prod.get_engine()
 
 
 def test_get_engine_drop_tables_true_calls_initialize_database_replace_true(
@@ -295,9 +301,9 @@ def test_main_uses_config_from_env(tmp_path, monkeypatch):
             "heiplanet_db.production.create_directories",
             side_effect=RuntimeError("stop"),
         ),
+        pytest.raises(RuntimeError, match="stop"),
     ):
-        with pytest.raises(RuntimeError, match="stop"):
-            prod.main()
+        prod.main()
     read_cfg.assert_called_once_with(str(tmp_path / "env_config.yml"))
 
 
@@ -320,9 +326,9 @@ def test_main_value_error_when_no_shapefile(tmp_path, monkeypatch):
         patch("heiplanet_db.production.create_directories"),
         patch("heiplanet_db.production.get_data_files"),
         patch("heiplanet_db.production.get_engine"),
+        pytest.raises(ValueError, match="Shapefile path could not be generated"),
     ):
-        with pytest.raises(ValueError, match="Shapefile path could not be generated"):
-            prod.main()
+        prod.main()
 
 
 def test_main_uses_explicit_config_path(tmp_path):
@@ -335,9 +341,9 @@ def test_main_uses_explicit_config_path(tmp_path):
             "heiplanet_db.production.create_directories",
             side_effect=RuntimeError("stop"),
         ),
+        pytest.raises(RuntimeError, match="stop"),
     ):
-        with pytest.raises(RuntimeError, match="stop"):
-            prod.main(config_path="my-config.yml")
+        prod.main(config_path="my-config.yml")
     read_cfg.assert_called_once_with("my-config.yml")
 
 
@@ -441,7 +447,7 @@ def test_main():
     # that the main function can be called without raising exceptions.
     try:
         prod.main()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - smoke test must catch any failure
         pytest.fail(f"Main function raised an exception: {e}")
 
 
@@ -449,12 +455,14 @@ def test_autovacuum_restoration_on_failure(get_engine_with_tables):
     engine = get_engine_with_tables
 
     # Mock insert_var_values to raise an exception
-    with patch(
-        "heiplanet_db.production.insert_var_values",
-        side_effect=RuntimeError("Insertion failed"),
+    with (
+        patch(
+            "heiplanet_db.production.insert_var_values",
+            side_effect=RuntimeError("Insertion failed"),
+        ),
+        pytest.raises(RuntimeError, match="Insertion failed"),
     ):
-        with pytest.raises(RuntimeError, match="Insertion failed"):
-            prod.load_data_with_optimization(engine, r0_path=Path("dummy.nc"))
+        prod.load_data_with_optimization(engine, r0_path=Path("dummy.nc"))
 
     # Verify autovacuum is enabled for all tables
     with engine.connect() as conn:
