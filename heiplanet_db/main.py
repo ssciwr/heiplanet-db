@@ -187,7 +187,10 @@ def get_nuts_data(
         return {"error": str(e)}
 
 
-@app.get("/nuts_regions")
+@app.get(
+    "/nuts_regions",
+    responses={500: {"description": "Database error while fetching NUTS regions"}},
+)
 def get_nuts_regions(
     grid_resolution: str | None = None,
 ):
