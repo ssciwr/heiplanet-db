@@ -1,13 +1,13 @@
+import geopandas as gpd
+import numpy as np
 import pytest
-from heiplanet_db import postgresql_database as postdb
-from testcontainers.postgres import PostgresContainer
+import xarray as xr
+from shapely.geometry import Polygon
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm.session import sessionmaker
-import numpy as np
-from shapely.geometry import Polygon
-import geopandas as gpd
-import xarray as xr
+from testcontainers.postgres import PostgresContainer
 
+from heiplanet_db import postgresql_database as postdb
 
 # for local docker desktop,
 # environ["DOCKER_HOST"] is "unix:///home/[user]/.docker/desktop/docker.sock"
