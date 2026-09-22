@@ -400,10 +400,10 @@ def test_extract_time_point():
 
 
 def test_extract_time_point_invalid():
-    with pytest.raises(ValueError):
+    with pytest.raises(TypeError):
         postdb.extract_time_point("2024-01-01")
 
-    with pytest.raises(ValueError):
+    with pytest.raises(TypeError):
         postdb.extract_time_point(1)
 
 
