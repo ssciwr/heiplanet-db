@@ -11,5 +11,5 @@ mkdocs-literate-nav==0.6.3
 mkdocs-section-index==0.3.12
 mkdocs-minify-plugin==0.8.0
 fastapi[standard]
-Pygments==2.20.0
+Pygments==2.21.0
 httpx
