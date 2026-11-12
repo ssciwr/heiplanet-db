@@ -62,7 +62,7 @@ services:
         condition: service_started
     env_file: ./.env
     volumes:
-      - ./heiplanet_db/data/production_config.yml:/heiplanet_db/production.yaml
+      - ./heiplanet_db/data/production_config_2014-2018.yml:/heiplanet_db/production.yaml
     command: [ "api" ] # Run FastAPI server
     restart: "no"
     networks:
@@ -79,7 +79,9 @@ services:
         condition: service_healthy
     env_file: ./.env
     volumes:
-      - ./heiplanet_db/data/production_config.yml:/heiplanet_db/production.yaml
+      - ./heiplanet_db/data/production_config_2014-2018.yml:/heiplanet_db/production.yaml
+      # gold data from heiplanet-data, read by the `host: local` config entries
+      - ../heiplanet-data/.data_heiplanet_db/gold:/data/gold:ro
     command: [ "production" ]
     restart: "no" # Run once
     networks:

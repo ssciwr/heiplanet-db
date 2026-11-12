@@ -454,15 +454,17 @@ def test_main():
 def test_autovacuum_restoration_on_failure(get_engine_with_tables):
     engine = get_engine_with_tables
 
-    # Mock insert_var_values to raise an exception
+    # Mock insert_grid_var_values to raise an exception
     with (
         patch(
-            "heiplanet_db.production.insert_var_values",
+            "heiplanet_db.production.insert_grid_var_values",
             side_effect=RuntimeError("Insertion failed"),
         ),
         pytest.raises(RuntimeError, match="Insertion failed"),
     ):
-        prod.load_data_with_optimization(engine, r0_path=Path("dummy.nc"))
+        prod.load_data_with_optimization(
+            engine, grid_vars=[prod.GridVar("R0", [Path("dummy.nc")])]
+        )
 
     # Verify autovacuum is enabled for all tables
     with engine.connect() as conn:
@@ -487,23 +489,26 @@ def test_autovacuum_restoration_on_success(get_engine_with_tables):
     engine = get_engine_with_tables
 
     # Mock inserts to do nothing
+    grid_vars = [prod.GridVar("R0", [Path("dummy.nc")])]
     with (
-        patch("heiplanet_db.production.insert_var_values"),
-        patch("heiplanet_db.production.insert_var_values_nuts"),
+        patch("heiplanet_db.production.insert_grid_var_values") as insert_grid,
+        patch("heiplanet_db.production.insert_nuts_var_values") as insert_nuts,
     ):
-        prod.load_data_with_optimization(engine, r0_path=Path("dummy.nc"))
+        prod.load_data_with_optimization(engine, grid_vars=grid_vars)
+    insert_grid.assert_called_once_with(engine, grid_vars)
+    insert_nuts.assert_not_called()
 
 
 def test_load_data_with_optimization_nuts_only(get_engine_with_tables):
     engine = get_engine_with_tables
+    nuts_vars = [prod.NutsVar("R0", Path("dummy_nuts.nc"))]
     with (
-        patch("heiplanet_db.production.insert_var_values"),
-        patch("heiplanet_db.production.insert_var_values_nuts") as insert_nuts,
+        patch("heiplanet_db.production.insert_grid_var_values") as insert_grid,
+        patch("heiplanet_db.production.insert_nuts_var_values") as insert_nuts,
     ):
-        prod.load_data_with_optimization(
-            engine, r0_path=None, r0_nuts_path=Path("dummy_nuts.nc")
-        )
-    insert_nuts.assert_called_once_with(engine, r0_nuts_path=Path("dummy_nuts.nc"))
+        prod.load_data_with_optimization(engine, grid_vars=None, nuts_vars=nuts_vars)
+    insert_grid.assert_not_called()
+    insert_nuts.assert_called_once_with(engine, nuts_vars)
 
     # Verify autovacuum is enabled
     with engine.connect() as conn:
@@ -518,3 +523,309 @@ def test_load_data_with_optimization_nuts_only(get_engine_with_tables):
                 assert opts.get("autovacuum_enabled") == "true", (
                     f"Autovacuum not enabled for {table}: {reloptions}"
                 )
+
+
+# --- config handling for several variables and files ---
+
+
+def test_get_var_types_from_config_aggregation():
+    config = [
+        {"var_name": [{"name": "R0", "unit": "1", "description": "r0"}]},
+        {
+            "var_name": [
+                {
+                    "name": "adults",
+                    "unit": "u",
+                    "description": "grid",
+                    "aggregation": "mean",
+                }
+            ]
+        },
+        # a later NUTS entry without aggregation keeps the grid entry's setting
+        {"var_name": [{"name": "adults", "unit": "u", "description": "nuts"}]},
+    ]
+    var_types = prod.get_var_types_from_config(config)
+    assert [vt["name"] for vt in var_types] == ["R0", "adults"]
+    assert var_types[0]["aggregation"] == "subsample"
+    assert var_types[1]["aggregation"] == "mean"
+    assert var_types[1]["description"] == "grid"
+    config[1]["var_name"][0]["aggregation"] = "sum"
+    with pytest.raises(ValueError, match="Unknown aggregation"):
+        prod.get_var_types_from_config(config)
+
+
+def test_fetch_files_local(tmp_path: Path):
+    data_dir = tmp_path / "gold"
+    data_dir.mkdir()
+    for name in ["a.nc", "b.nc"]:
+        (data_dir / name).touch()
+    config = {"datalake": {"gold": str(tmp_path / "lake")}}
+    # url is the folder holding a list of files
+    data = {"host": "local", "url": str(data_dir), "filename": ["a.nc", "b.nc"]}
+    assert prod.fetch_files(data, config, "gold") == [
+        (data_dir / "a.nc").resolve(),
+        (data_dir / "b.nc").resolve(),
+    ]
+    # url is the file itself
+    data = {"host": "local", "url": str(data_dir / "a.nc"), "filename": "x.nc"}
+    assert prod.fetch_files(data, config, "gold") == [(data_dir / "a.nc").resolve()]
+    # no url: read from the data lake
+    config = {"datalake": {"gold": str(data_dir)}}
+    data = {"host": "local", "filename": "b.nc"}
+    assert prod.fetch_files(data, config, "gold") == [(data_dir / "b.nc").resolve()]
+    # missing files are reported
+    data = {"host": "local", "url": str(data_dir), "filename": ["a.nc", "c.nc"]}
+    with pytest.raises(FileNotFoundError, match="c.nc"):
+        prod.fetch_files(data, config, "gold")
+
+
+def test_fetch_files_heibox_list(tmp_path: Path):
+    config = {"datalake": {"gold": str(tmp_path)}}
+    (tmp_path / "a.nc").touch()  # already downloaded
+    data = {
+        "host": "heibox",
+        "filename": ["a.nc", "b.nc"],
+        "url": ["https://example.com/a", "https://example.com/b"],
+        "filehash": ["ha", "hb"],
+    }
+    with patch("heiplanet_db.production.get_data_files") as get_files:
+        paths = prod.fetch_files(data, config, "gold")
+    assert paths == [(tmp_path / "a.nc").resolve(), (tmp_path / "b.nc").resolve()]
+    get_files.assert_called_once()
+    entry = get_files.call_args.args[0]
+    assert entry["filename"] == "b.nc"
+    assert entry["url"] == "https://example.com/b"
+    assert entry["filehash"] == "hb"
+    data["filehash"] = ["ha"]
+    with pytest.raises(ValueError, match="filehash must list one entry per file"):
+        prod.fetch_files(data, config, "gold")
+
+
+def _main_with_config(fake_config, tmp_path):
+    with (
+        patch(
+            "heiplanet_db.production.read_production_config",
+            return_value=fake_config,
+        ),
+        patch("heiplanet_db.production.create_directories"),
+        patch("heiplanet_db.production.zipfile.ZipFile"),
+        patch("heiplanet_db.production.get_engine", return_value="engine"),
+        patch("heiplanet_db.production.reset_production_data"),
+        patch("heiplanet_db.production.insert_data"),
+        patch("heiplanet_db.production.get_var_types_from_config", return_value=[]),
+        patch("heiplanet_db.production.db.insert_var_types"),
+        patch("heiplanet_db.production.db.insert_resolution_groups"),
+        patch("heiplanet_db.production.load_data_with_optimization") as load,
+    ):
+        prod.main(config_path="ignored.yml")
+    return load
+
+
+def test_main_collects_grid_and_nuts_vars(tmp_path: Path):
+    fake_config = _make_minimal_definition_config(tmp_path)
+    for name in ["r0.nc", "p1.nc", "p2.nc", "nuts.nc"]:
+        (tmp_path / name).touch()
+    var = {"unit": "1", "description": "d"}
+    fake_config["data_to_fetch"] += [
+        {
+            "var_name": [{"type": "R0", "name": "R0", **var}],
+            "filename": "r0.nc",
+            "host": "local",
+            "url": str(tmp_path),
+        },
+        {
+            "var_name": [
+                {
+                    "type": "grid",
+                    "name": "adults",
+                    "aggregation": "mean",
+                    "mask_by": "R0",
+                    **var,
+                }
+            ],
+            "filename": ["p1.nc", "p2.nc"],
+            "host": "local",
+            "url": str(tmp_path),
+        },
+        {
+            "var_name": [
+                {"type": "R0_nuts", "name": "R0", **var},
+                {"type": "nuts", "name": "adults", **var},
+            ],
+            "filename": "nuts.nc",
+            "host": "local",
+            "url": str(tmp_path),
+        },
+    ]
+    load = _main_with_config(fake_config, tmp_path)
+    kwargs = load.call_args.kwargs
+    assert kwargs["grid_vars"] == [
+        prod.GridVar("R0", [(tmp_path / "r0.nc").resolve()]),
+        prod.GridVar(
+            "adults",
+            [(tmp_path / "p1.nc").resolve(), (tmp_path / "p2.nc").resolve()],
+            aggregation="mean",
+            mask_by="R0",
+        ),
+    ]
+    nuts_path = (tmp_path / "nuts.nc").resolve()
+    assert kwargs["nuts_vars"] == [
+        prod.NutsVar("R0", nuts_path),
+        prod.NutsVar("adults", nuts_path),
+    ]
+
+
+def test_main_rejects_unknown_type_and_multi_file_nuts(tmp_path: Path):
+    fake_config = _make_minimal_definition_config(tmp_path)
+    (tmp_path / "a.nc").touch()
+    (tmp_path / "b.nc").touch()
+    fake_config["data_to_fetch"].append(
+        {
+            "var_name": [{"type": "other", "name": "x"}],
+            "filename": "a.nc",
+            "host": "local",
+            "url": str(tmp_path),
+        }
+    )
+    with pytest.raises(ValueError, match="Unknown type other"):
+        _main_with_config(fake_config, tmp_path)
+    fake_config["data_to_fetch"][-1] = {
+        "var_name": [{"type": "nuts", "name": "x"}],
+        "filename": ["a.nc", "b.nc"],
+        "host": "local",
+        "url": str(tmp_path),
+    }
+    with pytest.raises(ValueError, match="must be a single file"):
+        _main_with_config(fake_config, tmp_path)
+
+
+def test_production_config_2014_2018():
+    config = prod.read_production_config(
+        resources.files("heiplanet_db") / "data" / "production_config_2014-2018.yml"
+    )
+    var_types = {
+        vt["name"]: vt for vt in prod.get_var_types_from_config(config["data_to_fetch"])
+    }
+    assert var_types["R0"]["aggregation"] == "subsample"
+    assert var_types["adults"]["aggregation"] == "mean"
+    assert var_types["adults"]["unit"] == "mosquitoes per 625 km²"
+    pmodel = config["data_to_fetch"][2]
+    assert len(pmodel["filename"]) == 5
+    assert pmodel["var_name"][0]["mask_by"] == "R0"
+
+
+# --- loading gridded variables ---
+
+
+def _write_grid_files(tmp_path: Path):
+    """R0 on a 5x5 0.1 degree grid with NaN 'ocean', and two yearly files of
+    adults stored as (longitude, latitude, time) with zeros on the ocean."""
+    import numpy as np
+    import xarray as xr
+
+    lats = np.round(np.arange(0.4, -0.05, -0.1), 1)
+    lons = np.round(np.arange(0.0, 0.45, 0.1), 1)
+    times = np.array(
+        ["2023-01-01", "2023-02-01", "2024-01-01", "2024-02-01"],
+        dtype="datetime64[ns]",
+    )
+    r0 = np.ones((4, 5, 5))
+    r0[:, :, 0] = np.nan  # ocean in the first column
+    xr.Dataset(
+        {"R0": (("time", "latitude", "longitude"), r0)},
+        coords={"time": times, "latitude": lats, "longitude": lons},
+    ).to_netcdf(tmp_path / "r0.nc")
+    paths = []
+    for year, sl in ((2023, slice(0, 2)), (2024, slice(2, 4))):
+        adults = np.full((4, 5, 5), 2.0)[sl]
+        adults[:, :, 0] = 0.0
+        ds = xr.Dataset(
+            {"adults": (("time", "latitude", "longitude"), adults)},
+            coords={"time": times[sl], "latitude": lats, "longitude": lons},
+        ).transpose("longitude", "latitude", "time")
+        path = tmp_path / f"adults_{year}.nc"
+        ds.to_netcdf(path)
+        paths.append(path)
+    return tmp_path / "r0.nc", paths
+
+
+def test_open_grid_dataset_multi_file(tmp_path: Path):
+    _, paths = _write_grid_files(tmp_path)
+    ds = prod.open_grid_dataset(prod.GridVar("adults", paths))
+    assert ds["adults"].dims == ("time", "latitude", "longitude")
+    assert ds.sizes["time"] == 4
+    with pytest.raises(ValueError, match="not found"):
+        prod.open_grid_dataset(prod.GridVar("eggs", paths))
+
+
+def test_insert_grid_var_values_mask_by_unknown(tmp_path: Path):
+    with pytest.raises(ValueError, match="masked by R0"):
+        prod.insert_grid_var_values(
+            engine=None,
+            grid_vars=[prod.GridVar("adults", [], aggregation="mean", mask_by="R0")],
+        )
+
+
+def test_insert_grid_var_values_different_grids(tmp_path: Path):
+    r0_path, paths = _write_grid_files(tmp_path)
+    import xarray as xr
+
+    with xr.open_dataset(paths[0]) as ds:
+        ds.isel(latitude=slice(0, 4)).to_netcdf(tmp_path / "small.nc")
+    with pytest.raises(ValueError, match="different grid"):
+        prod.insert_grid_var_values(
+            engine=None,
+            grid_vars=[
+                prod.GridVar("R0", [r0_path]),
+                prod.GridVar("adults", [tmp_path / "small.nc"]),
+            ],
+        )
+
+
+def test_insert_grid_var_values_end_to_end(get_engine_with_tables, tmp_path):
+    import numpy as np
+
+    from heiplanet_db import postgresql_database as db
+
+    engine = get_engine_with_tables
+    r0_path, paths = _write_grid_files(tmp_path)
+    grid_vars = [
+        prod.GridVar("R0", [r0_path]),
+        prod.GridVar("adults", paths, aggregation="mean", mask_by="R0"),
+    ]
+    session = db.create_session(engine)
+    db.insert_var_types(
+        session,
+        [
+            {"name": "R0", "unit": "1", "description": "r0"},
+            {
+                "name": "adults",
+                "unit": "mosquitoes per 625 km²",
+                "description": "adults",
+                "aggregation": "mean",
+            },
+        ],
+    )
+    db.insert_resolution_groups(session, resolutions=np.array([0.1, 0.2]))
+    session.close()
+
+    prod.insert_grid_var_values(engine, grid_vars)
+
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT vt.name, rg.resolution, COUNT(*), MIN(vv.value), "
+                "MAX(vv.value) FROM var_value vv "
+                "JOIN var_type vt ON vt.id = vv.var_id "
+                "LEFT JOIN resolution_group rg ON rg.id = vv.resolution_id "
+                "GROUP BY vt.name, rg.resolution ORDER BY vt.name, rg.resolution"
+            )
+        ).all()
+    summary = {(name, None if res is None else float(res)): r for name, res, *r in rows}
+    # R0: 4 months x 20 land cells, one row each (no resolution)
+    assert summary[("R0", None)] == [80, 1.0, 1.0]
+    # adults at 0.1: ocean column masked out, so the zeros are gone
+    assert summary[("adults", 0.1)] == [80, 2.0, 2.0]
+    # adults at 0.2: 3x3 coarse cells; the column at lon 0.0 still has land
+    # (lon 0.1) in its window, so all 9 exist and the mean ignores the ocean
+    assert summary[("adults", 0.2)] == [36, 2.0, 2.0]

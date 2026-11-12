@@ -1979,3 +1979,327 @@ def test_insert_var_value_nuts_rejects_extra_dims(
             time_id_map=time_id_map,
             var_id_map=var_id_map,
         )
+
+
+# --- variables stored per resolution (aggregation "mean") ---
+
+
+def _fine_grid_ds(var_name="adults", n_time=2, lon_lat_time=False):
+    """5x5 grid on 0.1 degree spacing, non-periodic in longitude."""
+    lats = np.round(np.arange(0.4, -0.05, -0.1), 1)
+    lons = np.round(np.arange(0.0, 0.45, 0.1), 1)
+    times = [np.datetime64(f"2023-0{i + 1}-01", "ns") for i in range(n_time)]
+    values = np.arange(n_time * 25, dtype=float).reshape(n_time, 5, 5) + 1.0
+    da = xr.DataArray(
+        values,
+        dims=("time", "latitude", "longitude"),
+        coords={"time": times, "latitude": lats, "longitude": lons},
+    )
+    if lon_lat_time:
+        da = da.transpose("longitude", "latitude", "time")
+    return xr.Dataset({var_name: da})
+
+
+def test__window_matrix_odd_factor():
+    m = postdb._window_matrix(9, np.array([1, 4, 7]), 3, periodic=False)
+    assert m.shape == (3, 9)
+    np.testing.assert_array_equal(m[1], [0, 0, 0, 1, 1, 1, 0, 0, 0])
+    # every fine cell is counted exactly once
+    np.testing.assert_array_equal(m.sum(axis=0), np.ones(9))
+
+
+def test__window_matrix_even_factor_half_weights():
+    m = postdb._window_matrix(8, np.array([0, 2, 4, 6]), 2, periodic=True)
+    np.testing.assert_array_equal(m[1], [0, 0.5, 1, 0.5, 0, 0, 0, 0])
+    # periodic: the first window wraps around to the last cell
+    np.testing.assert_array_equal(m[0], [1, 0.5, 0, 0, 0, 0, 0, 0.5])
+    np.testing.assert_array_equal(m.sum(axis=0), np.ones(8))
+    # non-periodic: the window is cut off at the ends
+    m = postdb._window_matrix(8, np.array([0]), 2, periodic=False)
+    np.testing.assert_array_equal(m[0], [1, 0.5, 0, 0, 0, 0, 0, 0])
+
+
+def test__block_mean_plan():
+    ds = _fine_grid_ds()
+    lats, lons = ds.latitude.values, ds.longitude.values
+    native = postdb._block_mean_plan(lats, lons, 0.1)
+    assert native["factor"] == 1
+    np.testing.assert_array_equal(native["latitude"], lats)
+    plan = postdb._block_mean_plan(lats, lons, 0.2)
+    assert plan["factor"] == 2
+    np.testing.assert_allclose(plan["latitude"], [0.4, 0.2, 0.0])
+    np.testing.assert_allclose(plan["longitude"], [0.0, 0.2, 0.4])
+    # not a multiple of the grid step, or finer than the data
+    assert postdb._block_mean_plan(lats, lons, 0.25) is None
+    assert postdb._block_mean_plan(lats, lons, 0.05) is None
+    with pytest.raises(ValueError, match="not regularly spaced"):
+        postdb._block_mean_plan(np.array([0.0, 0.1, 0.3]), lons, 0.2)
+
+
+def test_block_mean_values_and_nan():
+    ds = _fine_grid_ds(n_time=1)
+    lats, lons = ds.latitude.values, ds.longitude.values
+    values = ds["adults"].values.copy()
+    values[0, 2, 2] = np.nan  # centre cell
+    plan = postdb._block_mean_plan(lats, lons, 0.2)
+    out = postdb.block_mean(values, plan)
+    assert out.shape == (1, 3, 3)
+    # centre coarse cell (0.2, 0.2): rows/cols 1..3, half weights on the edges
+    w1 = np.array([0.5, 1.0, 0.5])
+    area = np.cos(np.deg2rad(lats[1:4]))
+    weights = (w1 * area)[:, None] * w1[None, :]
+    block = values[0, 1:4, 1:4]
+    valid = np.isfinite(block)
+    expected = (np.where(valid, block, 0) * weights).sum() / (weights * valid).sum()
+    np.testing.assert_allclose(out[0, 1, 1], expected)
+    # a constant field stays constant
+    const = np.full_like(values, 7.0)
+    np.testing.assert_allclose(postdb.block_mean(const, plan), 7.0)
+    # all-NaN input gives NaN
+    assert np.isnan(postdb.block_mean(np.full_like(values, np.nan), plan)).all()
+    with pytest.raises(ValueError, match="native resolution"):
+        postdb.block_mean(values, postdb._block_mean_plan(lats, lons, 0.1))
+
+
+def test__to_time_lat_lon():
+    ds = _fine_grid_ds(lon_lat_time=True)
+    assert ds["adults"].dims == ("longitude", "latitude", "time")
+    out = postdb._to_time_lat_lon(ds, "adults")
+    assert out["adults"].dims == ("time", "latitude", "longitude")
+    with pytest.raises(ValueError, match="not found"):
+        postdb._to_time_lat_lon(ds, "missing")
+    with pytest.raises(ValueError, match="must have dims"):
+        postdb._to_time_lat_lon(ds.isel(time=0, drop=True), "adults")
+
+
+def test_insert_var_values_transposes_lon_lat_time(monkeypatch):
+    ds = _fine_grid_ds(var_name="t2m", lon_lat_time=True)
+    captured = {}
+
+    def _fake_threaded(t, la, lo, ds_in, *args, **kwargs):
+        captured["dims"] = ds_in["t2m"].dims
+
+    monkeypatch.setattr(postdb, "generate_threaded_inserts", _fake_threaded)
+    postdb.insert_var_values(object(), ds, "t2m", {}, {}, {"t2m": 1})
+    assert captured["dims"] == ("time", "latitude", "longitude")
+
+
+def test_generate_threaded_inserts_sets_resolution_id(monkeypatch):
+    ds = _build_cartesian_ds()
+    grid_id_map, time_id_map = _build_maps()
+    batches = []
+    monkeypatch.setattr(
+        postdb, "insert_batch", lambda batch, engine, var_cls: batches.append(batch)
+    )
+    monkeypatch.setattr(postdb, "BATCH_SIZE", 4)
+    monkeypatch.setattr(postdb, "MAX_WORKERS", 1)  # forces waiting for free slots
+    total = postdb.generate_threaded_inserts(
+        t_chunk=10,
+        lat_chunk=10,
+        lon_chunk=10,
+        ds=ds,
+        var_name="t2m",
+        grid_id_map=grid_id_map,
+        time_id_map=time_id_map,
+        var_id=1,
+        engine=object(),
+        resolution_id=7,
+    )
+    assert total == 12
+    rows = [row for batch in batches for row in batch]
+    assert len(rows) == 12
+    assert all(row["resolution_id"] == 7 for row in rows)
+
+
+def _seed_mean_var(session, engine, ds, mask=None):
+    """Insert grid/time points, resolution groups and `adults` per resolution."""
+    postdb.insert_var_types(
+        session,
+        [
+            {
+                "name": "adults",
+                "unit": "mosquitoes per 625 km²",
+                "description": "adult mosquitoes",
+                "aggregation": "mean",
+            }
+        ],
+    )
+    postdb.insert_grid_points(session, ds.latitude.values, ds.longitude.values)
+    postdb.insert_time_points(session, [(ds.time.values, False)])
+    postdb.insert_resolution_groups(session, resolutions=np.array([0.1, 0.2, 0.25]))
+    grid_id_map, time_id_map, var_id_map = postdb.get_id_maps(session)
+    resolution_id_map = postdb.get_resolution_id_map(session)
+    total = postdb.insert_var_values_by_resolution(
+        engine,
+        ds,
+        "adults",
+        grid_id_map,
+        time_id_map,
+        var_id_map,
+        resolution_id_map,
+        mask=mask,
+    )
+    postdb.assign_grid_resolution_group_to_grid_point(session)
+    return total, resolution_id_map
+
+
+def test_insert_var_values_by_resolution_and_queries(
+    get_engine_with_tables, get_session, tmp_path
+):
+    ds = _fine_grid_ds(lon_lat_time=True)
+    mask = xr.ones_like(ds["adults"], dtype=bool)
+    mask[{"longitude": 4, "latitude": 0}] = False  # (lat 0.4, lon 0.4)
+    total, resolution_id_map = _seed_mean_var(
+        get_session, get_engine_with_tables, ds, mask=mask
+    )
+    # 0.1: 25 - 1 masked per time step, 0.2: 3x3, 0.25 skipped
+    assert total == 2 * (24 + 9)
+    counts = dict(
+        get_session.execute(
+            text("SELECT resolution_id, COUNT(*) FROM var_value GROUP BY resolution_id")
+        ).all()
+    )
+    assert counts == {resolution_id_map[0.1]: 48, resolution_id_map[0.2]: 18}
+
+    values = ds["adults"].transpose("time", "latitude", "longitude").values
+    values = np.where(
+        mask.transpose("time", "latitude", "longitude").values, values, np.nan
+    )
+    plan = postdb._block_mean_plan(ds.latitude.values, ds.longitude.values, 0.2)
+    expected = postdb.block_mean(values, plan)
+
+    # cartesian query at 0.2 returns the coarse means
+    result = postdb.get_var_values_cartesian(
+        get_session, time_point=(2023, 1), grid_resolution=0.2, var_name="adults"
+    )["latitude, longitude, var_value"]
+    assert len(result) == 9
+    lookup = {(round(float(la), 1), round(float(lo), 1)): v for la, lo, v in result}
+    np.testing.assert_allclose(lookup[(0.2, 0.2)], expected[0, 1, 1])
+    np.testing.assert_allclose(lookup[(0.4, 0.4)], expected[0, 0, 2])
+    # at 0.1 it returns the native values, without the masked cell
+    result = postdb.get_var_values_cartesian(
+        get_session, time_point=(2023, 1), grid_resolution=0.1, var_name="adults"
+    )["latitude, longitude, var_value"]
+    assert len(result) == 24
+    lookup = {(round(float(la), 1), round(float(lo), 1)): v for la, lo, v in result}
+    np.testing.assert_allclose(lookup[(0.2, 0.2)], values[0, 2, 2])
+
+    # single values: native by default, coarse on request
+    native = postdb.get_var_value(get_session, "adults", 0.2, 0.2, 2023, 2, 1)
+    np.testing.assert_allclose(native, values[1, 2, 2])
+    coarse = postdb.get_var_value(
+        get_session, "adults", 0.2, 0.2, 2023, 2, 1, resolution=0.2
+    )
+    np.testing.assert_allclose(coarse, expected[1, 1, 1])
+
+    # download exports the native resolution only
+    out_file = tmp_path / "download.nc"
+    postdb.get_var_values_cartesian_for_download(
+        get_session,
+        start_time_point=(2023, 1),
+        end_time_point=(2023, 2),
+        var_names=["adults"],
+        netcdf_file=str(out_file),
+    )
+    with xr.open_dataset(out_file) as downloaded:
+        got = downloaded["adults"].sortby("latitude", ascending=False).values
+    np.testing.assert_allclose(got, values)
+
+
+def test_insert_var_values_by_resolution_errors(get_engine_with_tables, get_session):
+    ds = _fine_grid_ds()
+    with pytest.raises(ValueError, match="not found in var_type"):
+        postdb.insert_var_values_by_resolution(
+            get_engine_with_tables, ds, "adults", {}, {}, {}, {0.1: 1}
+        )
+    # no resolution group at the data's grid step
+    with pytest.raises(ValueError, match="No resolution group matches"):
+        postdb.insert_var_values_by_resolution(
+            get_engine_with_tables, ds, "adults", {}, {}, {"adults": 1}, {0.2: 1}
+        )
+    # mask on another grid
+    mask = xr.ones_like(ds["adults"], dtype=bool).isel(latitude=slice(0, 4))
+    with pytest.raises(ValueError, match="different grid"):
+        postdb.insert_var_values_by_resolution(
+            get_engine_with_tables,
+            ds,
+            "adults",
+            {},
+            {},
+            {"adults": 1},
+            {0.1: 1},
+            mask=mask,
+        )
+    # mask without the data's time points
+    mask = xr.ones_like(ds["adults"], dtype=bool).assign_coords(
+        time=[np.datetime64("2020-01-01", "ns"), np.datetime64("2020-02-01", "ns")]
+    )
+    with pytest.raises(ValueError, match="does not cover"):
+        postdb.insert_var_values_by_resolution(
+            get_engine_with_tables,
+            ds,
+            "adults",
+            {},
+            {},
+            {"adults": 1},
+            {0.1: 1},
+            mask=mask,
+        )
+
+
+def test_var_value_unique_with_null_resolution(get_session):
+    postdb.insert_var_types(get_session, [{"name": "t2m", "unit": "K"}])
+    postdb.insert_grid_points(get_session, np.array([0.0]), np.array([0.0]))
+    postdb.insert_time_points(
+        get_session, [(np.array([np.datetime64("2023-01-01", "ns")]), False)]
+    )
+    row = {"grid_id": 1, "time_id": 1, "var_id": 1, "value": 1.0}
+    postdb.add_data_list_bulk(get_session, [row], postdb.VarValue)
+    # NULLS NOT DISTINCT: a second row without resolution is a duplicate
+    with pytest.raises(RuntimeError, match="uq_time_grid_var_res"):
+        postdb.add_data_list_bulk(get_session, [row], postdb.VarValue)
+    assert (
+        get_session.query(postdb.VarType).first().aggregation == "subsample"
+    )  # server default
+
+
+def test_upgrade_schema_from_old_tables(get_engine_with_tables):
+    engine = get_engine_with_tables
+    # turn the tables back into the old schema
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE var_value DROP CONSTRAINT uq_time_grid_var_res"))
+        conn.execute(text("ALTER TABLE var_value DROP CONSTRAINT fk_resolution_id"))
+        conn.execute(text("ALTER TABLE var_value DROP COLUMN resolution_id"))
+        conn.execute(text("ALTER TABLE var_type DROP COLUMN aggregation"))
+        conn.execute(
+            text(
+                "ALTER TABLE var_value ADD CONSTRAINT uq_time_grid_var "
+                "UNIQUE (time_id, grid_id, var_id)"
+            )
+        )
+    postdb.upgrade_schema(engine)
+    postdb.upgrade_schema(engine)  # idempotent
+    with engine.connect() as conn:
+        columns = {
+            (t, c)
+            for t, c in conn.execute(
+                text(
+                    "SELECT table_name, column_name FROM information_schema.columns "
+                    "WHERE table_name IN ('var_value', 'var_type')"
+                )
+            )
+        }
+        constraints = {
+            row[0]
+            for row in conn.execute(
+                text(
+                    "SELECT conname FROM pg_constraint "
+                    "WHERE conrelid = 'var_value'::regclass"
+                )
+            )
+        }
+    assert ("var_value", "resolution_id") in columns
+    assert ("var_type", "aggregation") in columns
+    assert "uq_time_grid_var_res" in constraints
+    assert "fk_resolution_id" in constraints
+    assert "uq_time_grid_var" not in constraints

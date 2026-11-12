@@ -453,6 +453,42 @@ An additional configuration is available for long-term historical analysis cover
 
 **Note:** This configuration requires data files to be available locally (`host: "local"` in the configuration), as the dataset is too large for standard remote hosting.
 
+#### J-Model and P-Model 2014-2018
+
+**Configuration file:** `heiplanet_db/data/production_config_2014-2018.yml`
+
+**Included data:**
+- NUTS region definitions
+- West Nile virus transmission suitability (`R0`, J-Model) for 2014-2018, global 0.1° grid
+- Adult mosquito abundance (`adults`, P-Model) for 2014-2018, global 0.1° grid, read from five yearly files
+- `R0` and `adults` aggregated over NUTS regions
+
+**Characteristics:**
+- Requires the gold files from heiplanet-data locally. `docker-compose.yaml` mounts `../heiplanet-data/.data_heiplanet_db/gold` read-only at `/data/gold`, which is where the `host: "local"` entries look (`url: "/data/gold"`). For a run outside Docker, set `url` to that folder.
+- `adults` is a density (mosquitoes per 625 km²), so it is stored separately for every grid resolution: the value at a coarse grid point is the area-weighted mean of the 0.1° cells in its cell. This adds about a third more rows than the 0.1° values alone.
+- About 310 million rows in `var_value` (about 130 million for `R0`, 180 million for `adults`). Plan for several hours of loading and tens of GB of database storage.
+
+#### Configuration keys for variables
+
+Each entry in `data_to_fetch` lists one or more variables in `var_name`. Each variable has a `type`:
+
+| `type` | Meaning |
+|---|---|
+| `definition` | NUTS shapefile archive |
+| `grid` (or `R0`) | Gridded variable over `(time, latitude, longitude)`, in any dimension order |
+| `nuts` (or `R0_nuts`) | Variable over `(NUTS_ID, time)` |
+
+Optional keys for `grid` variables:
+
+- `aggregation`: how coarser grid resolutions are obtained.
+  - `subsample` (default): coarse grid points show the 0.1° value at that point. Suitable for smooth fields such as R0.
+  - `mean`: coarse grid points show the area-weighted mean over their cell, stored per resolution. Use this for quantities that vary strongly between neighbouring cells, such as mosquito densities.
+- `mask_by`: name of another `grid` variable. Cells where that variable is missing are left out before aggregating, e.g. `mask_by: "R0"` drops the ocean cells that the P-Model writes as 0.
+
+`filename` can be a list of files, which are combined along `time`. For downloads, `url` and `filehash` must then be lists of the same length. For `host: "local"`, `url` can be the folder that holds the files.
+
+Databases created by an earlier version are updated automatically (new columns `var_type.aggregation` and `var_value.resolution_id`) when the production runner starts without `--drop-tables`.
+
 ### Deploying with a Configuration
 
 To deploy the system in production with your chosen configuration:
