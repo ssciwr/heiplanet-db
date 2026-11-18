@@ -378,6 +378,26 @@ def upgrade_schema(engine: engine.Engine):
     print("Database schema up to date.")
 
 
+def normalize_db_url(db_url: str) -> str:
+    """Use the psycopg2 driver for plain ``postgresql://`` URLs.
+
+    SQLAlchemy >= 2.1 uses psycopg 3 for plain ``postgresql://`` URLs. psycopg 3
+    sends query parameters separately and allows at most 65535 of them, which
+    large ``IN (...)`` filters (e.g. all grid points of a global request)
+    exceed. psycopg2 inlines them, so keep using it unless a driver is named.
+
+    Args:
+        db_url (str): Database URL.
+
+    Returns:
+        str: The URL with an explicit driver.
+    """
+    for scheme in ("postgresql://", "postgres://"):
+        if db_url.startswith(scheme):
+            return "postgresql+psycopg2://" + db_url[len(scheme) :]
+    return db_url
+
+
 def initialize_database(db_url: str, replace: bool = False):
     """
     Initialize the database by creating the engine and tables, and installing PostGIS.
@@ -388,7 +408,9 @@ def initialize_database(db_url: str, replace: bool = False):
         replace (bool): Whether to drop and recreate the tables. Defaults to False.
     """
     # create engine
-    engine = create_engine(db_url)  # remove echo=True to show just errors in terminal
+    engine = create_engine(
+        normalize_db_url(db_url)
+    )  # remove echo=True to show just errors in terminal
 
     # install PostGIS extension
     install_postgis(engine)
@@ -916,6 +938,36 @@ def _to_time_lat_lon(ds: xr.Dataset, var_name: str) -> xr.Dataset:
     return ds[[var_name]].transpose(*required, ...)
 
 
+TRANSFORMS = {"log10"}
+
+
+def apply_transform(values, transform: str | None, floor: float = 1.0):
+    """Transform values for storage, e.g. to log scale for display.
+
+    For "log10", values below `floor` are raised to `floor` first, so the
+    result starts at log10(floor). NaN stays NaN. Works on numpy arrays and
+    (lazily) on xarray objects.
+
+    Args:
+        values: numpy array or xarray object.
+        transform (str | None): None (no change) or "log10".
+        floor (float): Lower limit applied before the logarithm. Must be > 0.
+
+    Returns:
+        The transformed values, same type as `values`.
+    """
+    if transform is None:
+        return values
+    if transform not in TRANSFORMS:
+        raise ValueError(
+            f"Unknown transform {transform}; use one of {sorted(TRANSFORMS)}."
+        )
+    if not floor > 0:
+        raise ValueError("The floor for a log10 transform must be > 0.")
+    # np.maximum keeps NaN (np.fmax would replace it by the floor)
+    return np.log10(np.maximum(values, floor))
+
+
 def get_resolution_id_map(session: Session) -> dict[float, int]:
     """Get a mapping of resolution (degrees) to resolution group ID.
 
@@ -1072,6 +1124,8 @@ def insert_var_values_by_resolution(
     var_id_map: dict,
     resolution_id_map: dict[float, int],
     mask: xr.DataArray | None = None,
+    transform: str | None = None,
+    transform_floor: float = 1.0,
 ) -> int:
     """Insert a variable whose value depends on the grid resolution.
 
@@ -1093,10 +1147,15 @@ def insert_var_values_by_resolution(
         mask (xr.DataArray | None): Boolean (time, latitude, longitude) array on
             the same grid. Fine cells where it is False are set to NaN before
             aggregating, e.g. to drop ocean cells. Defaults to None.
+        transform (str | None): Transform applied after aggregating, see
+            `apply_transform`. Means are always taken over the original values.
+        transform_floor (float): Floor for the transform. Defaults to 1.
 
     Returns:
         int: Total number of values inserted over all resolutions.
     """
+    # fail early, before any data is read
+    apply_transform(np.array([1.0]), transform, transform_floor)
     var_id = var_id_map.get(var_name)
     if var_id is None:
         raise ValueError(f"Variable {var_name} not found in var_type table.")
@@ -1145,6 +1204,7 @@ def insert_var_values_by_resolution(
 
         for resolution, resolution_id, plan in plans:
             coarse = values if plan["factor"] == 1 else block_mean(values, plan)
+            coarse = apply_transform(coarse, transform, transform_floor)
             coarse_ds = xr.Dataset(
                 {var_name: (("time", "latitude", "longitude"), coarse)},
                 coords={
@@ -2095,15 +2155,17 @@ def get_var_values_nuts(
         )
     # filter the nuts ids to the desired resolution
     # this could also be done based on the NutsDef table "levl_code"
-    nuts_ids = filter_nuts_ids_for_resolution(nuts_ids, grid_resolution)
+    nuts_ids = set(filter_nuts_ids_for_resolution(nuts_ids, grid_resolution))
     if not nuts_ids:
         print(f"No {grid_resolution} NUTS id's found in the database.")
         raise HTTPException(
             status_code=400,
             detail=f"No {grid_resolution} NUTS ids found in the database.",
         )
-    # create a dict with NUTS_id: var_value
-    mydict = {nuts_id: v.value for v, nuts_id in zip(values, nuts_ids)}
+    # create a dict with NUTS_id: var_value; select the values by their own
+    # nuts_id (pairing the filtered ids with the unfiltered values by position
+    # would shift values onto the wrong regions)
+    mydict = {v.nuts_id: v.value for v in values if v.nuts_id in nuts_ids}
     return mydict
 
 

@@ -460,12 +460,13 @@ An additional configuration is available for long-term historical analysis cover
 **Included data:**
 - NUTS region definitions
 - West Nile virus transmission suitability (`R0`, J-Model) for 2014-2018, global 0.1° grid
-- Adult mosquito abundance (`adults`, P-Model) for 2014-2018, global 0.1° grid, read from five yearly files
-- `R0` and `adults` aggregated over NUTS regions
+- Adult mosquito abundance (P-Model) for 2014-2018, global 0.1° grid, read from five yearly files, stored as `adults_log10`
+- `R0` and `adults_log10` aggregated over NUTS regions
 
 **Characteristics:**
 - Requires the gold files from heiplanet-data locally. `docker-compose.yaml` mounts `../heiplanet-data/.data_heiplanet_db/gold` read-only at `/data/gold`, which is where the `host: "local"` entries look (`url: "/data/gold"`). For a run outside Docker, set `url` to that folder.
 - `adults` is a density (mosquitoes per 625 km²), so it is stored separately for every grid resolution: the value at a coarse grid point is the area-weighted mean of the 0.1° cells in its cell. This adds about a third more rows than the 0.1° values alone.
+- The values span about 10 orders of magnitude, which a linear colour scale cannot show. They are therefore stored as `adults_log10` = log10(max(adults, 1)), so values below 1 mosquito per 625 km² become 0. The means are taken before the logarithm. The frontend has to request `adults_log10`.
 - About 310 million rows in `var_value` (about 130 million for `R0`, 180 million for `adults`). Plan for several hours of loading and tens of GB of database storage.
 
 #### Configuration keys for variables
@@ -484,6 +485,12 @@ Optional keys for `grid` variables:
   - `subsample` (default): coarse grid points show the 0.1° value at that point. Suitable for smooth fields such as R0.
   - `mean`: coarse grid points show the area-weighted mean over their cell, stored per resolution. Use this for quantities that vary strongly between neighbouring cells, such as mosquito densities.
 - `mask_by`: name of another `grid` variable. Cells where that variable is missing are left out before aggregating, e.g. `mask_by: "R0"` drops the ocean cells that the P-Model writes as 0.
+
+Optional keys for `grid` and `nuts` variables:
+
+- `source_variable`: name of the variable in the file, if it is stored under a different `name`.
+- `transform`: `log10` stores log10(max(value, `transform_floor`)) instead of the value. For `aggregation: mean`, the means over coarse cells are taken before the transform.
+- `transform_floor`: lower limit before the logarithm (default 1, must be > 0).
 
 `filename` can be a list of files, which are combined along `time`. For downloads, `url` and `filehash` must then be lists of the same length. For `host: "local"`, `url` can be the folder that holds the files.
 

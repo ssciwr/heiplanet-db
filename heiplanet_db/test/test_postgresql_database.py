@@ -1857,6 +1857,11 @@ def test_get_var_values_nuts(
     assert len(result_dict) == 2
     assert result_dict["DE11"] == get_varnuts_dataset["t2m"][0, 0]
     assert result_dict["DE22"] == get_varnuts_dataset["t2m"][1, 0]
+    # a level whose regions are not first in the table keeps its own values
+    result_dict = postdb.get_var_values_nuts(
+        get_session, time_point=(2023, 1), var_name="t2m", grid_resolution="NUTS3"
+    )
+    assert result_dict == {"DE501": get_varnuts_dataset["t2m"][2, 0]}
     # none cases
     # no time points
     with pytest.raises(HTTPException):
@@ -2303,3 +2308,88 @@ def test_upgrade_schema_from_old_tables(get_engine_with_tables):
     assert "uq_time_grid_var_res" in constraints
     assert "fk_resolution_id" in constraints
     assert "uq_time_grid_var" not in constraints
+
+
+def test_normalize_db_url():
+    assert (
+        postdb.normalize_db_url("postgresql://u:p@db:5432/x")
+        == "postgresql+psycopg2://u:p@db:5432/x"
+    )
+    assert (
+        postdb.normalize_db_url("postgres://u:p@db/x")
+        == "postgresql+psycopg2://u:p@db/x"
+    )
+    # an explicit driver is kept
+    for url in ["postgresql+psycopg://u@db/x", "postgresql+psycopg2://u@db/x"]:
+        assert postdb.normalize_db_url(url) == url
+
+
+def test_apply_transform():
+    values = np.array([np.nan, 0.0, 0.5, 1.0, 10.0, 1e9])
+    out = postdb.apply_transform(values, "log10", floor=1.0)
+    assert np.isnan(out[0])
+    np.testing.assert_allclose(out[1:], [0.0, 0.0, 0.0, 1.0, 9.0])
+    np.testing.assert_allclose(
+        postdb.apply_transform(values, "log10", floor=0.1)[1:3], [-1.0, np.log10(0.5)]
+    )
+    assert postdb.apply_transform(values, None) is values
+    # works lazily on xarray objects
+    da = xr.DataArray(values).chunk()
+    np.testing.assert_allclose(postdb.apply_transform(da, "log10").values[1:], out[1:])
+    with pytest.raises(ValueError, match="Unknown transform"):
+        postdb.apply_transform(values, "sqrt")
+    with pytest.raises(ValueError, match="must be > 0"):
+        postdb.apply_transform(values, "log10", floor=0)
+
+
+def test_insert_var_values_by_resolution_transform_after_mean(
+    get_engine_with_tables, get_session
+):
+    ds = _fine_grid_ds(n_time=1)
+    # spread over orders of magnitude, with values below the floor
+    values = 10.0 ** (np.arange(25).reshape(1, 5, 5) / 3.0 - 2.0)
+    ds["adults"].values[:] = values
+    postdb.insert_var_types(
+        get_session,
+        [{"name": "adults", "unit": "log10", "aggregation": "mean"}],
+    )
+    postdb.insert_grid_points(get_session, ds.latitude.values, ds.longitude.values)
+    postdb.insert_time_points(get_session, [(ds.time.values, False)])
+    postdb.insert_resolution_groups(get_session, resolutions=np.array([0.1, 0.2]))
+    grid_id_map, time_id_map, var_id_map = postdb.get_id_maps(get_session)
+    resolution_id_map = postdb.get_resolution_id_map(get_session)
+    with pytest.raises(ValueError, match="Unknown transform"):
+        postdb.insert_var_values_by_resolution(
+            get_engine_with_tables,
+            ds,
+            "adults",
+            grid_id_map,
+            time_id_map,
+            var_id_map,
+            resolution_id_map,
+            transform="sqrt",
+        )
+    postdb.insert_var_values_by_resolution(
+        get_engine_with_tables,
+        ds,
+        "adults",
+        grid_id_map,
+        time_id_map,
+        var_id_map,
+        resolution_id_map,
+        transform="log10",
+        transform_floor=1.0,
+    )
+    postdb.assign_grid_resolution_group_to_grid_point(get_session)
+    plan = postdb._block_mean_plan(ds.latitude.values, ds.longitude.values, 0.2)
+    expected_coarse = np.log10(np.maximum(postdb.block_mean(values, plan), 1.0))
+    # the log is taken of the mean, not the mean of the logs
+    coarse = postdb.get_var_value(
+        get_session, "adults", 0.2, 0.2, 2023, 1, 1, resolution=0.2
+    )
+    np.testing.assert_allclose(coarse, expected_coarse[0, 1, 1])
+    assert not np.isclose(coarse, np.log10(np.maximum(values[0, 1:4, 1:4], 1)).mean())
+    native = postdb.get_var_value(get_session, "adults", 0.4, 0.0, 2023, 1, 1)
+    assert native == 0.0  # 10**-2 is below the floor
+    native = postdb.get_var_value(get_session, "adults", 0.0, 0.4, 2023, 1, 1)
+    np.testing.assert_allclose(native, np.log10(values[0, 4, 4]))

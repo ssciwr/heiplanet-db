@@ -30,6 +30,15 @@ class GridVar:
     paths: list[Path]
     aggregation: str = "subsample"
     mask_by: str | None = None
+    # name of the variable in the file(s), if it differs from `name`
+    source_name: str | None = None
+    # transform applied before storing (after aggregating), e.g. "log10"
+    transform: str | None = None
+    transform_floor: float = 1.0
+
+    @property
+    def file_variable(self) -> str:
+        return self.source_name or self.name
 
 
 @dataclass
@@ -38,6 +47,13 @@ class NutsVar:
 
     name: str
     path: Path
+    source_name: str | None = None
+    transform: str | None = None
+    transform_floor: float = 1.0
+
+    @property
+    def file_variable(self) -> str:
+        return self.source_name or self.name
 
 
 def read_production_config(dict_path: str | Traversable | Path | None = None) -> dict:
@@ -189,17 +205,22 @@ def open_grid_dataset(grid_var: GridVar) -> xr.Dataset:
         grid_var (GridVar): Variable to open.
 
     Returns:
-        xr.Dataset: Dataset with only this variable, as (time, latitude, longitude).
+        xr.Dataset: Dataset with only this variable, named `grid_var.name`, as
+            (time, latitude, longitude). Values are not transformed yet.
     """
     check_paths(grid_var.paths)
     if len(grid_var.paths) == 1:
         ds = xr.open_dataset(grid_var.paths[0], chunks={})
     else:
         ds = xr.open_mfdataset(grid_var.paths, combine="by_coords", chunks={})
-    if grid_var.name not in ds:
-        raise ValueError(f"Variable {grid_var.name} not found in {grid_var.paths}.")
+    source = grid_var.file_variable
+    if source not in ds:
+        raise ValueError(f"Variable {source} not found in {grid_var.paths}.")
+    ds = ds[[source]]
+    if source != grid_var.name:
+        ds = ds.rename({source: grid_var.name})
     # some model outputs are written as (longitude, latitude, time)
-    return ds[[grid_var.name]].transpose("time", "latitude", "longitude", ...)
+    return ds.transpose("time", "latitude", "longitude", ...)
 
 
 def _check_same_grid(datasets: dict[str, xr.Dataset]) -> xr.Dataset:
@@ -230,6 +251,7 @@ def insert_grid_var_values(engine: engine.Engine, grid_vars: list[GridVar]) -> i
     for gv in grid_vars:
         if gv.aggregation not in AGGREGATIONS:
             raise ValueError(f"Unknown aggregation {gv.aggregation} for {gv.name}.")
+        db.apply_transform(np.array([1.0]), gv.transform, gv.transform_floor)
         if gv.mask_by is not None and gv.mask_by not in names:
             raise ValueError(
                 f"{gv.name} is masked by {gv.mask_by}, which is not a gridded "
@@ -268,6 +290,7 @@ def insert_grid_var_values(engine: engine.Engine, grid_vars: list[GridVar]) -> i
         if gv.aggregation == "subsample":
             # rechunk the dataset
             ds = ds.chunk({"time": 1, "latitude": 180, "longitude": 360})
+            ds = db.apply_transform(ds, gv.transform, gv.transform_floor)
             db.insert_var_values(
                 engine, ds, gv.name, grid_id_map, time_id_map, var_type_id_map
             )
@@ -284,6 +307,8 @@ def insert_grid_var_values(engine: engine.Engine, grid_vars: list[GridVar]) -> i
                 var_type_id_map,
                 resolution_id_map,
                 mask=mask,
+                transform=gv.transform,
+                transform_floor=gv.transform_floor,
             )
     # assign resolution groups to grid points
     print("Assigning resolution groups to grid points.")
@@ -307,11 +332,19 @@ def insert_nuts_var_values(engine: engine.Engine, nuts_vars: list[NutsVar]) -> i
     id_map_session.close()
     datasets: dict[Path, xr.Dataset] = {}
     for nv in nuts_vars:
+        db.apply_transform(np.array([1.0]), nv.transform, nv.transform_floor)
+    for nv in nuts_vars:
         if nv.path not in datasets:
             datasets[nv.path] = xr.open_dataset(nv.path, chunks={})
+        source = nv.file_variable
+        if source not in datasets[nv.path]:
+            raise ValueError(f"Variable {source} not found in {nv.path}.")
+        da = db.apply_transform(
+            datasets[nv.path][source], nv.transform, nv.transform_floor
+        )
         db.insert_var_value_nuts(
             engine,
-            datasets[nv.path],
+            da.to_dataset(name=nv.name),
             var_name=nv.name,
             time_id_map=time_id_map,
             var_id_map=var_type_id_map,
@@ -496,6 +529,9 @@ def main(drop_tables: bool = False, config_path: str | None = None) -> None:
                         paths=paths,
                         aggregation=var.get("aggregation", "subsample"),
                         mask_by=var.get("mask_by"),
+                        source_name=var.get("source_variable"),
+                        transform=var.get("transform"),
+                        transform_floor=float(var.get("transform_floor", 1.0)),
                     )
                 )
                 print(f"Gridded data for {var['name']}: {[str(p) for p in paths]}")
@@ -504,7 +540,15 @@ def main(drop_tables: bool = False, config_path: str | None = None) -> None:
                     raise ValueError(
                         f"NUTS data for {var['name']} must be a single file."
                     )
-                nuts_vars.append(NutsVar(name=var["name"], path=paths[0]))
+                nuts_vars.append(
+                    NutsVar(
+                        name=var["name"],
+                        path=paths[0],
+                        source_name=var.get("source_variable"),
+                        transform=var.get("transform"),
+                        transform_floor=float(var.get("transform_floor", 1.0)),
+                    )
+                )
                 print(f"NUTS data for {var['name']}: {paths[0]}")
             else:
                 raise ValueError(

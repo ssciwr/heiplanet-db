@@ -707,11 +707,18 @@ def test_production_config_2014_2018():
         vt["name"]: vt for vt in prod.get_var_types_from_config(config["data_to_fetch"])
     }
     assert var_types["R0"]["aggregation"] == "subsample"
-    assert var_types["adults"]["aggregation"] == "mean"
-    assert var_types["adults"]["unit"] == "mosquitoes per 625 km²"
+    assert var_types["adults_log10"]["aggregation"] == "mean"
+    assert var_types["adults_log10"]["unit"] == "log10(mosquitoes per 625 km²)"
     pmodel = config["data_to_fetch"][2]
     assert len(pmodel["filename"]) == 5
-    assert pmodel["var_name"][0]["mask_by"] == "R0"
+    grid_var = pmodel["var_name"][0]
+    assert grid_var["mask_by"] == "R0"
+    assert grid_var["source_variable"] == "adults"
+    assert grid_var["transform"] == "log10"
+    nuts_var = config["data_to_fetch"][3]["var_name"][1]
+    assert nuts_var["name"] == "adults_log10"
+    assert nuts_var["source_variable"] == "adults"
+    assert nuts_var["transform"] == "log10"
 
 
 # --- loading gridded variables ---
@@ -829,3 +836,160 @@ def test_insert_grid_var_values_end_to_end(get_engine_with_tables, tmp_path):
     # adults at 0.2: 3x3 coarse cells; the column at lon 0.0 still has land
     # (lon 0.1) in its window, so all 9 exist and the mean ignores the ocean
     assert summary[("adults", 0.2)] == [36, 2.0, 2.0]
+
+
+def test_main_parses_source_variable_and_transform(tmp_path: Path):
+    fake_config = _make_minimal_definition_config(tmp_path)
+    for name in ["p.nc", "nuts.nc"]:
+        (tmp_path / name).touch()
+    var = {"unit": "u", "description": "d"}
+    transform = {"source_variable": "adults", "transform": "log10"}
+    fake_config["data_to_fetch"] += [
+        {
+            "var_name": [
+                {
+                    "type": "grid",
+                    "name": "adults_log10",
+                    "aggregation": "mean",
+                    "transform_floor": 0.5,
+                    **transform,
+                    **var,
+                }
+            ],
+            "filename": "p.nc",
+            "host": "local",
+            "url": str(tmp_path),
+        },
+        {
+            "var_name": [{"type": "nuts", "name": "adults_log10", **transform, **var}],
+            "filename": "nuts.nc",
+            "host": "local",
+            "url": str(tmp_path),
+        },
+    ]
+    kwargs = _main_with_config(fake_config, tmp_path).call_args.kwargs
+    assert kwargs["grid_vars"] == [
+        prod.GridVar(
+            "adults_log10",
+            [(tmp_path / "p.nc").resolve()],
+            aggregation="mean",
+            source_name="adults",
+            transform="log10",
+            transform_floor=0.5,
+        )
+    ]
+    assert kwargs["nuts_vars"] == [
+        prod.NutsVar(
+            "adults_log10",
+            (tmp_path / "nuts.nc").resolve(),
+            source_name="adults",
+            transform="log10",
+        )
+    ]
+
+
+def test_open_grid_dataset_renames_source_variable(tmp_path: Path):
+    _, paths = _write_grid_files(tmp_path)
+    ds = prod.open_grid_dataset(
+        prod.GridVar("adults_log10", paths, source_name="adults")
+    )
+    assert list(ds.data_vars) == ["adults_log10"]
+    assert ds["adults_log10"].dims == ("time", "latitude", "longitude")
+
+
+def test_insert_grid_and_nuts_values_with_transform(get_engine_with_tables, tmp_path):
+    import numpy as np
+    import xarray as xr
+
+    from heiplanet_db import postgresql_database as db
+
+    engine = get_engine_with_tables
+    r0_path, paths = _write_grid_files(tmp_path)
+    nuts_path = tmp_path / "nuts.nc"
+    xr.Dataset(
+        {"adults": (("NUTS_ID", "time"), np.array([[100.0, 0.5]]))},
+        coords={
+            "NUTS_ID": ["DE11"],
+            "time": np.array(["2023-01-01", "2023-02-01"], dtype="datetime64[ns]"),
+        },
+    ).to_netcdf(nuts_path)
+    session = db.create_session(engine)
+    db.insert_var_types(
+        session,
+        [
+            {"name": "R0", "unit": "1", "description": "r0"},
+            {"name": "adults_log10", "unit": "log10", "aggregation": "mean"},
+            {"name": "R0_log10", "unit": "log10"},
+        ],
+    )
+    db.insert_resolution_groups(session, resolutions=np.array([0.1, 0.2]))
+    session.close()
+    grid_vars = [
+        prod.GridVar("R0", [r0_path]),
+        # subsample path with a transform: R0 = 1 everywhere -> log10 = 0
+        prod.GridVar("R0_log10", [r0_path], source_name="R0", transform="log10"),
+        prod.GridVar(
+            "adults_log10",
+            paths,
+            aggregation="mean",
+            mask_by="R0",
+            source_name="adults",
+            transform="log10",
+        ),
+    ]
+    prod.insert_grid_var_values(engine, grid_vars)
+    # NUTS definitions are needed for the foreign key
+    import geopandas as gpd
+    from shapely.geometry import Polygon
+
+    gdf = gpd.GeoDataFrame(
+        {
+            "NUTS_ID": ["DE11"],
+            "LEVL_CODE": [2],
+            "CNTR_CODE": ["DE"],
+            "NAME_LATN": ["x"],
+            "NUTS_NAME": ["x"],
+            "MOUNT_TYPE": [0.0],
+            "URBN_TYPE": [1.0],
+            "COAST_TYPE": [1.0],
+        },
+        geometry=[Polygon([(0, 0), (1, 0), (1, 1), (0, 1)])],
+        crs="EPSG:4326",
+    )
+    (tmp_path / "shp").mkdir()
+    gdf.to_file(tmp_path / "shp" / "nuts.shp", driver="ESRI Shapefile")
+    db.insert_nuts_def(engine, tmp_path / "shp")
+    prod.insert_nuts_var_values(
+        engine,
+        [
+            prod.NutsVar(
+                "adults_log10", nuts_path, source_name="adults", transform="log10"
+            )
+        ],
+    )
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT vt.name, rg.resolution, COUNT(*), MIN(vv.value), "
+                "MAX(vv.value) FROM var_value vv "
+                "JOIN var_type vt ON vt.id = vv.var_id "
+                "LEFT JOIN resolution_group rg ON rg.id = vv.resolution_id "
+                "GROUP BY vt.name, rg.resolution ORDER BY vt.name, rg.resolution"
+            )
+        ).all()
+        nuts = dict(
+            conn.execute(
+                text(
+                    "SELECT tp.month, v.value FROM var_value_nuts v "
+                    "JOIN time_point tp ON tp.id = v.time_id"
+                )
+            ).all()
+        )
+    summary = {(n, None if r is None else float(r)): rest for n, r, *rest in rows}
+    log2 = float(np.log10(2.0))
+    assert summary[("R0_log10", None)] == [80, 0.0, 0.0]
+    assert summary[("adults_log10", 0.1)][0] == 80
+    np.testing.assert_allclose(summary[("adults_log10", 0.1)][1:], [log2, log2])
+    np.testing.assert_allclose(summary[("adults_log10", 0.2)][1:], [log2, log2])
+    # 100 -> 2, 0.5 is below the floor -> 0
+    assert nuts == {1: 2.0, 2: 0.0}
