@@ -367,6 +367,7 @@ def reset_production_data(engine: engine.Engine) -> None:
                 TRUNCATE TABLE
                     grid_point_resolution,
                     var_value_nuts,
+                    var_coverage,
                     var_value,
                     grid_point,
                     time_point,

@@ -36,6 +36,10 @@ services:
       - "autovacuum_max_workers=4"
       - "-c"
       - "autovacuum_naptime=10s"
+      # parallel hash joins keep their hash tables in /dev/shm (shm_size), which
+      # is too small for requests over the whole globe at 0.2 degree
+      - "-c"
+      - "enable_parallel_hash=off"
     ports:
       - "5445:5432"
     env_file: ./.env

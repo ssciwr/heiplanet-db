@@ -6,6 +6,7 @@ import time
 from collections.abc import Generator
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from pathlib import Path
+from typing import ClassVar
 
 import geopandas as gpd
 import numpy as np
@@ -23,9 +24,11 @@ from sqlalchemy import (
     Numeric,
     String,
     UniqueConstraint,
+    and_,
     create_engine,
     engine,
     func,
+    or_,
     text,
 )
 from sqlalchemy.exc import SQLAlchemyError
@@ -169,19 +172,29 @@ class VarValue(Base):
 
     __tablename__ = "var_value"
 
-    id: Mapped[int] = mapped_column(BigInteger(), primary_key=True, autoincrement=True)
-    grid_id: Mapped[int] = mapped_column(Integer(), ForeignKey("grid_point.id"))
-    time_id: Mapped[int] = mapped_column(Integer(), ForeignKey("time_point.id"))
-    var_id: Mapped[int] = mapped_column(Integer(), ForeignKey("var_type.id"))
-    # not sure if we should put resolution id here, since the same grid point
-    # can belong to different resolution groups
-    # so we have a separate many-to-many relationship table between grid points and resolution groups
-    # however, this makes lookup somewhat more complex and maybe slower
-    value: Mapped[float] = mapped_column(Float())
+    # This table holds hundreds of millions of rows, so it has no surrogate
+    # key: rows are identified by the unique constraint below. The columns are
+    # ordered so that PostgreSQL needs no alignment padding (4 x int4, float8).
+    # The foreign keys are declared once, in __table_args__.
+    grid_id: Mapped[int] = mapped_column(Integer())
+    time_id: Mapped[int] = mapped_column(Integer())
+    var_id: Mapped[int] = mapped_column(Integer())
     # NULL for variables with aggregation "subsample" (one value per grid point,
     # shared by all resolutions); set for variables whose value depends on the
     # resolution (aggregation "mean"), one row per resolution group
     resolution_id: Mapped[int | None] = mapped_column(Integer(), nullable=True)
+    value: Mapped[float] = mapped_column(Float())
+
+    __mapper_args__: ClassVar[dict] = {
+        # identity for the ORM only; the database enforces it with
+        # uq_time_grid_var_res (resolution_id may be NULL)
+        "primary_key": [time_id, grid_id, var_id, resolution_id],
+    }
+
+    def __init__(self, **kw):
+        # part of the ORM identity, so it must be set even when it is NULL
+        kw.setdefault("resolution_id", None)
+        super().__init__(**kw)
 
     __table_args__ = (
         UniqueConstraint(
@@ -214,6 +227,56 @@ class VarValue(Base):
             ["resolution_id"],
             ["resolution_group.id"],
             name="fk_resolution_id",
+            ondelete="CASCADE",
+        ),
+    )
+
+
+class VarCoverage(Base):
+    """Grid points where a variable has a value at every time point.
+
+    Values equal to 0 at these grid points are not stored in `var_value`; a
+    missing row there means 0. Outside of them, a missing row means that there
+    is no data (e.g. ocean cells), and zeros are stored. This keeps the many
+    zeros of the model output (e.g. no mosquitoes in winter) out of the
+    database. Like `var_value`, `resolution_id` is NULL for variables with
+    aggregation "subsample".
+    """
+
+    __tablename__ = "var_coverage"
+
+    var_id: Mapped[int] = mapped_column(Integer())
+    resolution_id: Mapped[int | None] = mapped_column(Integer(), nullable=True)
+    grid_id: Mapped[int] = mapped_column(Integer())
+
+    __mapper_args__: ClassVar[dict] = {"primary_key": [var_id, resolution_id, grid_id]}
+
+    def __init__(self, **kw):
+        # part of the ORM identity, so it must be set even when it is NULL
+        kw.setdefault("resolution_id", None)
+        super().__init__(**kw)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "var_id",
+            "resolution_id",
+            "grid_id",
+            name="uq_coverage_var_res_grid",
+            postgresql_nulls_not_distinct=True,
+        ),
+        ForeignKeyConstraint(
+            ["var_id"], ["var_type.id"], name="fk_coverage_var_id", ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["resolution_id"],
+            ["resolution_group.id"],
+            name="fk_coverage_resolution_id",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["grid_id"],
+            ["grid_point.id"],
+            name="fk_coverage_grid_id",
             ondelete="CASCADE",
         ),
     )
@@ -351,6 +414,13 @@ def upgrade_schema(engine: engine.Engine):
             "NOT NULL DEFAULT 'subsample';"
         ),
         "ALTER TABLE var_value ADD COLUMN IF NOT EXISTS resolution_id INTEGER;",
+        # rows are identified by uq_time_grid_var_res; the surrogate key and its
+        # index took about 15 % of the database
+        "ALTER TABLE var_value DROP COLUMN IF EXISTS id;",
+        # duplicates of fk_grid_id, fk_time_id and fk_var_id
+        "ALTER TABLE var_value DROP CONSTRAINT IF EXISTS var_value_grid_id_fkey;",
+        "ALTER TABLE var_value DROP CONSTRAINT IF EXISTS var_value_time_id_fkey;",
+        "ALTER TABLE var_value DROP CONSTRAINT IF EXISTS var_value_var_id_fkey;",
         "ALTER TABLE var_value DROP CONSTRAINT IF EXISTS uq_time_grid_var;",
         """
         DO $$
@@ -898,6 +968,20 @@ def insert_var_values(
     var_id = var_id_map.get(var_name)
     if var_id is None:
         raise ValueError(f"Variable {var_name} not found in var_type table.")
+    _check_no_coverage(engine, var_id, var_name)
+
+    # grid points with a value at every time point: zeros there are not stored
+    covered = ds[var_name].notnull().all("time").compute()
+    ds = ds.assign({var_name: drop_covered_zeros(ds[var_name], covered)})
+    n_covered = insert_var_coverage(
+        engine,
+        var_id,
+        ds.latitude.values,
+        ds.longitude.values,
+        covered.values,
+        grid_id_map,
+    )
+    print(f"Coverage of {var_name}: {n_covered} grid points.")
 
     print(f"Start inserting {var_name} values in streaming chunks...")
     t_start_insert = time.time()
@@ -1115,6 +1199,105 @@ def block_mean(values: np.ndarray, plan: dict) -> np.ndarray:
     return out
 
 
+def block_valid(valid: np.ndarray, plan: dict) -> np.ndarray:
+    """Coarse cells for which `block_mean` gives a value.
+
+    Args:
+        valid (np.ndarray): Boolean fine-grid array (lat, lon), True where the
+            fine cell has a value.
+        plan (dict): Plan from `_block_mean_plan`.
+
+    Returns:
+        np.ndarray: Boolean array (coarse lat, coarse lon).
+    """
+    if plan["factor"] == 1:
+        return valid.astype(bool)
+    weight = valid * plan["area_weight"][:, None]
+    return (plan["lat_matrix"] @ weight @ plan["lon_matrix_t"]) > 0
+
+
+def drop_covered_zeros(values, covered):
+    """Set values that are 0 at covered grid points to NaN, so they are not stored.
+
+    Args:
+        values: numpy array or xarray object over (time, latitude, longitude).
+        covered: Boolean (latitude, longitude) array, see `VarCoverage`.
+
+    Returns:
+        The values with those zeros replaced by NaN, same type as `values`.
+    """
+    drop = (values == 0) & covered
+    if isinstance(values, xr.DataArray):
+        return values.where(~drop)
+    return np.where(drop, np.nan, values)
+
+
+def _check_no_coverage(engine: engine.Engine, var_id: int, var_name: str) -> None:
+    """Raise if values of a variable were already inserted with coverage.
+
+    The coverage of a variable is computed over all its time points at once, so
+    a variable cannot be inserted in several parts.
+    """
+    with engine.connect() as conn:
+        exists = conn.execute(
+            text("SELECT 1 FROM var_coverage WHERE var_id = :v LIMIT 1"),
+            {"v": int(var_id)},
+        ).first()
+    if exists:
+        raise ValueError(
+            f"Values of {var_name} are already in the database; a variable has "
+            "to be inserted in one go (truncate the tables to reload it)."
+        )
+
+
+def insert_var_coverage(
+    engine: engine.Engine,
+    var_id: int,
+    lats: np.ndarray,
+    lons: np.ndarray,
+    covered: np.ndarray,
+    grid_id_map: dict,
+    resolution_id: int | None = None,
+    batch_size: int = 100_000,
+) -> int:
+    """Store the grid points where a variable has a value at every time point.
+
+    Args:
+        engine (engine.Engine): SQLAlchemy engine object.
+        var_id (int): Variable type ID.
+        lats (np.ndarray): Latitudes of `covered`.
+        lons (np.ndarray): Longitudes of `covered`.
+        covered (np.ndarray): Boolean (lat, lon) array.
+        grid_id_map (dict): Mapping of (latitude, longitude) to grid point ID.
+        resolution_id (int | None): Resolution group, None for variables with
+            aggregation "subsample".
+        batch_size (int): Rows per insert statement.
+
+    Returns:
+        int: Number of grid points stored.
+    """
+    lat_i, lon_i = np.nonzero(covered)
+    rows = []
+    for i, j in zip(lat_i, lon_i):
+        grid_id = grid_id_map.get((_q(lats[i]), _q(lons[j])))
+        if grid_id is None:
+            print(f"Missing grid_id for ({lats[i]}, {lons[j]})")
+            continue
+        rows.append(
+            {
+                "var_id": int(var_id),
+                "resolution_id": None if resolution_id is None else int(resolution_id),
+                "grid_id": int(grid_id),
+            }
+        )
+    with engine.begin() as conn:
+        for start in range(0, len(rows), batch_size):
+            conn.execute(
+                VarCoverage.__table__.insert(), rows[start : start + batch_size]
+            )
+    return len(rows)
+
+
 def insert_var_values_by_resolution(
     engine: engine.Engine,
     ds: xr.Dataset,
@@ -1187,24 +1370,54 @@ def insert_var_values_by_resolution(
         ):
             raise ValueError(f"The mask for {var_name} is on a different grid.")
 
-    total = 0
-    n_time = data.sizes["time"]
-    for t0 in range(0, n_time, VAR_TIME_CHUNK):
-        chunk = data.isel(time=slice(t0, min(t0 + VAR_TIME_CHUNK, n_time)))
-        times = chunk.time.values
-        values = chunk.values.astype(np.float64)
-        if mask is not None:
-            try:
-                mask_values = mask.sel(time=times).values.astype(bool)
-            except KeyError as e:
-                raise ValueError(
-                    f"The mask for {var_name} does not cover all time points."
-                ) from e
-            values = np.where(mask_values, values, np.nan)
+    _check_no_coverage(engine, var_id, var_name)
 
+    def masked_chunks():
+        n_time = data.sizes["time"]
+        for t0 in range(0, n_time, VAR_TIME_CHUNK):
+            chunk = data.isel(time=slice(t0, min(t0 + VAR_TIME_CHUNK, n_time)))
+            times = chunk.time.values
+            values = chunk.values.astype(np.float64)
+            if mask is not None:
+                try:
+                    mask_values = mask.sel(time=times).values.astype(bool)
+                except KeyError as e:
+                    raise ValueError(
+                        f"The mask for {var_name} does not cover all time points."
+                    ) from e
+                values = np.where(mask_values, values, np.nan)
+            yield t0, times, values
+
+    # first pass: coarse cells that have a value at every time point
+    covered = {
+        resolution_id: np.ones(
+            (len(plan["latitude"]), len(plan["longitude"])), dtype=bool
+        )
+        for _, resolution_id, plan in plans
+    }
+    for _, _, values in masked_chunks():
+        for _, resolution_id, plan in plans:
+            for t in range(values.shape[0]):
+                covered[resolution_id] &= block_valid(np.isfinite(values[t]), plan)
+    for resolution, resolution_id, plan in plans:
+        n_covered = insert_var_coverage(
+            engine,
+            var_id,
+            plan["latitude"],
+            plan["longitude"],
+            covered[resolution_id],
+            grid_id_map,
+            resolution_id=resolution_id,
+        )
+        print(f"Coverage of {var_name} at {resolution} degree: {n_covered} points.")
+
+    # second pass: values, without the zeros at covered grid points
+    total = 0
+    for t0, times, values in masked_chunks():
         for resolution, resolution_id, plan in plans:
             coarse = values if plan["factor"] == 1 else block_mean(values, plan)
             coarse = apply_transform(coarse, transform, transform_floor)
+            coarse = drop_covered_zeros(coarse, covered[resolution_id])
             coarse_ds = xr.Dataset(
                 {var_name: (("time", "latitude", "longitude"), coarse)},
                 coords={
@@ -1539,7 +1752,36 @@ def get_var_value(
             | (ResolutionGroup.resolution == resolution)
         )
     result = query.order_by(ResolutionGroup.resolution.asc().nulls_first()).first()
-    return result.value if result else None
+    if result is not None:
+        return result.value
+
+    # no stored value: 0 if the grid point is covered (see VarCoverage)
+    time_exists = (
+        session.query(TimePoint.id)
+        .filter(TimePoint.year == year, TimePoint.month == month, TimePoint.day == day)
+        .first()
+    )
+    if time_exists is None:
+        return None
+    coverage = (
+        session.query(VarCoverage.grid_id)
+        .join(GridPoint, VarCoverage.grid_id == GridPoint.id)
+        .join(VarType, VarCoverage.var_id == VarType.id)
+        .outerjoin(ResolutionGroup, VarCoverage.resolution_id == ResolutionGroup.id)
+        .filter(
+            GridPoint.latitude == lat,
+            GridPoint.longitude == lon,
+            VarType.name == var_name,
+        )
+    )
+    if resolution is not None:
+        coverage = coverage.filter(
+            (VarCoverage.resolution_id.is_(None))
+            | (ResolutionGroup.resolution == resolution)
+        )
+    # like the values: the finest resolution unless one is requested
+    covered = coverage.order_by(ResolutionGroup.resolution.asc().nulls_first()).first()
+    return 0.0 if covered is not None else None
 
 
 def get_var_value_nuts(
@@ -1781,10 +2023,24 @@ def get_var_values_cartesian(
             status_code=400, detail="No id found for specified resolution."
         )
 
-    # get the grid points and their ids
-    grid_points = get_grid_points(session, area, resolution_id)
-
-    if not grid_points:
+    # grid points of the requested resolution in the requested area
+    grid_query = session.query(GridPoint.id).join(
+        GridPointResolution,
+        and_(
+            GridPointResolution.grid_id == GridPoint.id,
+            GridPointResolution.resolution_id == resolution_id,
+        ),
+    )
+    if area is not None:
+        north, west, south, east = area
+        area_filter = and_(
+            GridPoint.latitude <= north,
+            GridPoint.latitude >= south,
+            GridPoint.longitude >= west,
+            GridPoint.longitude <= east,
+        )
+        grid_query = grid_query.filter(area_filter)
+    if grid_query.first() is None:
         print(
             "No grid points found in the specified area or with the specified resolution."
         )
@@ -1792,8 +2048,6 @@ def get_var_values_cartesian(
             status_code=400,
             detail="No grid points found in specified area or with the specified resolution.",
         )
-    # get grid ids for lookup
-    grid_ids = [grid_point.id for grid_point in grid_points]
 
     # get the var type
     if not var_name:
@@ -1811,25 +2065,49 @@ def get_var_values_cartesian(
     # variables that are aggregated per resolution store one row per
     # resolution group; the others store a single row shared by all resolutions
     if var_type.aggregation == "subsample":
-        resolution_filter = VarValue.resolution_id.is_(None)
+        value_resolution = VarValue.resolution_id.is_(None)
+        coverage_resolution = VarCoverage.resolution_id.is_(None)
     else:
-        resolution_filter = VarValue.resolution_id == resolution_id
+        value_resolution = VarValue.resolution_id == resolution_id
+        coverage_resolution = VarCoverage.resolution_id == resolution_id
 
-    # now query all variable values with their latitude and longitude for this time point
-    # get variable values for each grid point and time point
-    # Query with JOIN to get lat, lon, and value directly
-    values = (
-        session.query(GridPoint.latitude, GridPoint.longitude, VarValue.value)
-        .join(GridPoint, VarValue.grid_id == GridPoint.id)
-        .filter(
-            VarValue.grid_id.in_(grid_ids),
-            VarValue.time_id == time_id,
-            VarValue.var_id == var_id,
-            resolution_filter,
+    # values of the grid points; at covered grid points a missing row means 0
+    # (see VarCoverage), elsewhere it means that there is no data
+    query = (
+        session.query(
+            GridPoint.latitude,
+            GridPoint.longitude,
+            func.coalesce(VarValue.value, 0.0),
         )
-        .order_by(GridPoint.latitude, GridPoint.longitude)  # Ensure consistent ordering
-        .all()
+        .join(
+            GridPointResolution,
+            and_(
+                GridPointResolution.grid_id == GridPoint.id,
+                GridPointResolution.resolution_id == resolution_id,
+            ),
+        )
+        .outerjoin(
+            VarValue,
+            and_(
+                VarValue.grid_id == GridPoint.id,
+                VarValue.time_id == time_id,
+                VarValue.var_id == var_id,
+                value_resolution,
+            ),
+        )
+        .outerjoin(
+            VarCoverage,
+            and_(
+                VarCoverage.grid_id == GridPoint.id,
+                VarCoverage.var_id == var_id,
+                coverage_resolution,
+            ),
+        )
+        .filter(or_(VarValue.value.isnot(None), VarCoverage.grid_id.isnot(None)))
     )
+    if area is not None:
+        query = query.filter(area_filter)
+    values = query.order_by(GridPoint.latitude, GridPoint.longitude).all()
     # Convert directly to list of tuples
     values_list = [(np.float64(lat), np.float64(lon), val) for lat, lon, val in values]
 
@@ -1928,13 +2206,24 @@ def get_var_values_cartesian_for_download(
             )
             .all()
         )
-        if vt.aggregation != "subsample" and values:
+        covered_ids = [
+            (row.grid_id, row.resolution_id)
+            for row in session.query(VarCoverage.grid_id, VarCoverage.resolution_id)
+            .filter(
+                VarCoverage.var_id == vt.id,
+                VarCoverage.grid_id.in_(grid_ids.keys()),
+            )
+            .all()
+        ]
+        if vt.aggregation != "subsample":
             finest_id = min(
-                {vv.resolution_id for vv in values if vv.resolution_id is not None},
+                {vv.resolution_id for vv in values if vv.resolution_id is not None}
+                | {rid for _, rid in covered_ids if rid is not None},
                 key=lambda rid: resolution_by_id[rid],
                 default=None,
             )
             values = [vv for vv in values if vv.resolution_id == finest_id]
+            covered_ids = [(gid, rid) for gid, rid in covered_ids if rid == finest_id]
 
         # dummy values array
         values_array = np.full(
@@ -1942,6 +2231,10 @@ def get_var_values_cartesian_for_download(
             np.nan,
             dtype=np.float64,
         )
+        # covered grid points without a stored value are 0 (see VarCoverage)
+        for grid_id, _ in covered_ids:
+            lat_index, lon_index = grid_ids[grid_id]
+            values_array[:, lat_index, lon_index] = 0.0
 
         # fill the values array with the variable values
         for vv in values:

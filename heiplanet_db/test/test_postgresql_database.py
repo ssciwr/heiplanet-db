@@ -2085,6 +2085,8 @@ def test_insert_var_values_transposes_lon_lat_time(monkeypatch):
         captured["dims"] = ds_in["t2m"].dims
 
     monkeypatch.setattr(postdb, "generate_threaded_inserts", _fake_threaded)
+    monkeypatch.setattr(postdb, "_check_no_coverage", lambda *a: None)
+    monkeypatch.setattr(postdb, "insert_var_coverage", lambda *a, **k: 0)
     postdb.insert_var_values(object(), ds, "t2m", {}, {}, {"t2m": 1})
     assert captured["dims"] == ("time", "latitude", "longitude")
 
@@ -2276,6 +2278,14 @@ def test_upgrade_schema_from_old_tables(get_engine_with_tables):
         conn.execute(text("ALTER TABLE var_value DROP CONSTRAINT fk_resolution_id"))
         conn.execute(text("ALTER TABLE var_value DROP COLUMN resolution_id"))
         conn.execute(text("ALTER TABLE var_type DROP COLUMN aggregation"))
+        # surrogate key and duplicate foreign keys of older versions
+        conn.execute(text("ALTER TABLE var_value ADD COLUMN id BIGSERIAL PRIMARY KEY"))
+        conn.execute(
+            text(
+                "ALTER TABLE var_value ADD CONSTRAINT var_value_grid_id_fkey "
+                "FOREIGN KEY (grid_id) REFERENCES grid_point (id)"
+            )
+        )
         conn.execute(
             text(
                 "ALTER TABLE var_value ADD CONSTRAINT uq_time_grid_var "
@@ -2308,6 +2318,10 @@ def test_upgrade_schema_from_old_tables(get_engine_with_tables):
     assert "uq_time_grid_var_res" in constraints
     assert "fk_resolution_id" in constraints
     assert "uq_time_grid_var" not in constraints
+    assert ("var_value", "id") not in columns
+    assert "var_value_pkey" not in constraints
+    assert "var_value_grid_id_fkey" not in constraints
+    assert "fk_grid_id" in constraints
 
 
 def test_normalize_db_url():
@@ -2393,3 +2407,130 @@ def test_insert_var_values_by_resolution_transform_after_mean(
     assert native == 0.0  # 10**-2 is below the floor
     native = postdb.get_var_value(get_session, "adults", 0.0, 0.4, 2023, 1, 1)
     np.testing.assert_allclose(native, np.log10(values[0, 4, 4]))
+
+
+def test_block_valid_and_drop_covered_zeros():
+    lats = np.round(np.arange(0.4, -0.05, -0.1), 1)
+    lons = np.round(np.arange(0.0, 0.45, 0.1), 1)
+    plan = postdb._block_mean_plan(lats, lons, 0.2)
+    valid = np.zeros((5, 5), dtype=bool)
+    valid[0, 0] = True  # only in the window of the coarse cell (0.4, 0.0)
+    coarse = postdb.block_valid(valid, plan)
+    values = np.full((1, 5, 5), np.nan)
+    values[0, 0, 0] = 1.0
+    np.testing.assert_array_equal(
+        coarse, np.isfinite(postdb.block_mean(values, plan)[0])
+    )
+    native = postdb._block_mean_plan(lats, lons, 0.1)
+    np.testing.assert_array_equal(postdb.block_valid(valid, native), valid)
+
+    covered = np.array([[True, False]])
+    out = postdb.drop_covered_zeros(np.array([[[0.0, 0.0]], [[1.0, 0.0]]]), covered)
+    np.testing.assert_array_equal(np.isnan(out), [[[True, False]], [[False, False]]])
+    da = xr.DataArray(np.array([[[0.0, 0.0]]]), dims=("time", "lat", "lon"))
+    out = postdb.drop_covered_zeros(da, xr.DataArray(covered, dims=("lat", "lon")))
+    assert np.isnan(out.values[0, 0, 0]) and out.values[0, 0, 1] == 0.0
+
+
+def _zeros_ds(var_name):
+    """5x5 grid, 2 time points: zeros and positive values on land, an ocean
+    column, and one cell that is NaN only at the second time point."""
+    ds = _fine_grid_ds(var_name=var_name, n_time=2)
+    values = ds[var_name].values
+    values[:, :, :2] = 0.0  # zeros on land
+    values[:, :, 4] = np.nan  # ocean
+    values[1, 2, 3] = np.nan  # missing at one time point only
+    values[0, 2, 3] = 0.0  # ... and 0 at the other one
+    return ds
+
+
+def _cartesian_values(session, var_name, month, resolution):
+    result = postdb.get_var_values_cartesian(
+        session, (2023, month), grid_resolution=resolution, var_name=var_name
+    )["latitude, longitude, var_value"]
+    return {(round(float(a), 1), round(float(o), 1)): v for a, o, v in result}
+
+
+def test_insert_var_values_skips_covered_zeros(get_engine_with_tables, get_session):
+    ds = _zeros_ds("t2m")
+    postdb.insert_var_types(get_session, [{"name": "t2m", "unit": "K"}])
+    postdb.insert_grid_points(get_session, ds.latitude.values, ds.longitude.values)
+    postdb.insert_time_points(get_session, [(ds.time.values, False)])
+    postdb.insert_resolution_groups(get_session, resolutions=np.array([0.1, 0.2]))
+    postdb.assign_grid_resolution_group_to_grid_point(get_session)
+    grid_id_map, time_id_map, var_id_map = postdb.get_id_maps(get_session)
+    postdb.insert_var_values(
+        get_engine_with_tables, ds, "t2m", grid_id_map, time_id_map, var_id_map
+    )
+    with get_engine_with_tables.connect() as conn:
+        n_rows = conn.execute(text("SELECT COUNT(*) FROM var_value")).scalar()
+        n_coverage = conn.execute(text("SELECT COUNT(*) FROM var_coverage")).scalar()
+    # 4 land columns, minus the cell that is NaN once
+    assert n_coverage == 19
+    # stored: positive values (2 columns x 5 rows x 2 times, minus the cell
+    # that is 0 once and NaN once) and the 0 of that uncovered cell
+    assert n_rows == 20 - 2 + 1
+    for month in (1, 2):
+        got = _cartesian_values(get_session, "t2m", month, 0.1)
+        expected = {
+            (round(float(a), 1), round(float(o), 1)): float(v)
+            for (a, o), v in ds["t2m"].isel(time=month - 1).to_series().items()
+            if np.isfinite(v)
+        }
+        assert got == expected
+    assert postdb.get_var_value(get_session, "t2m", 0.4, 0.0, 2023, 1, 1) == 0.0
+    assert postdb.get_var_value(get_session, "t2m", 0.2, 0.3, 2023, 1, 1) == 0.0
+    assert postdb.get_var_value(get_session, "t2m", 0.2, 0.3, 2023, 2, 1) is None
+    assert postdb.get_var_value(get_session, "t2m", 0.4, 0.4, 2023, 1, 1) is None
+    assert postdb.get_var_value(get_session, "t2m", 0.4, 0.0, 2024, 1, 1) is None
+    # a variable is inserted in one go
+    with pytest.raises(ValueError, match="already in the database"):
+        postdb.insert_var_values(
+            get_engine_with_tables, ds, "t2m", grid_id_map, time_id_map, var_id_map
+        )
+
+
+def test_insert_var_values_by_resolution_skips_covered_zeros(
+    get_engine_with_tables, get_session
+):
+    ds = _zeros_ds("adults")
+    _seed_mean_var(get_session, get_engine_with_tables, ds)
+    for resolution in (0.1, 0.2):
+        plan = postdb._block_mean_plan(ds.latitude.values, ds.longitude.values, 0.2)
+        for month in (1, 2):
+            values = ds["adults"].values[month - 1 : month]
+            got = _cartesian_values(get_session, "adults", month, resolution)
+            if resolution == 0.1:
+                expected_grid, lats, lons = values[0], ds.latitude, ds.longitude
+            else:
+                expected_grid = postdb.block_mean(values, plan)[0]
+                lats, lons = plan["latitude"], plan["longitude"]
+            expected = {
+                (round(float(a), 1), round(float(o), 1)): float(expected_grid[i, j])
+                for i, a in enumerate(np.asarray(lats))
+                for j, o in enumerate(np.asarray(lons))
+                if np.isfinite(expected_grid[i, j])
+            }
+            assert got.keys() == expected.keys()
+            np.testing.assert_allclose(
+                [got[k] for k in expected], list(expected.values())
+            )
+    with get_engine_with_tables.connect() as conn:
+        zeros = conn.execute(
+            text("SELECT COUNT(*) FROM var_value WHERE value = 0")
+        ).scalar()
+    # only the uncovered cell keeps its 0 (at 0.1 degree; at 0.2 degree its
+    # coarse cell always has other valid cells)
+    assert zeros == 1
+
+
+def test_download_fills_covered_zeros(get_engine_with_tables, get_session, tmp_path):
+    ds = _zeros_ds("adults")
+    _seed_mean_var(get_session, get_engine_with_tables, ds)
+    out = tmp_path / "out.nc"
+    postdb.get_var_values_cartesian_for_download(
+        get_session, (2023, 1), (2023, 2), var_names=["adults"], netcdf_file=str(out)
+    )
+    with xr.open_dataset(out) as result:
+        got = result["adults"].sel(latitude=ds.latitude, longitude=ds.longitude)
+        np.testing.assert_array_equal(got.values, ds["adults"].values)

@@ -298,6 +298,8 @@ From the `heiplanet-db/` root directory:
 docker build -t heiplanet-db .
 ```
 
+`.dockerignore` keeps `.env` files, local data folders (`.data_heiplanet_db`), tests and docs out of the image, so a locally built image contains no credentials and stays small (about 0.85 GB).
+
 This creates a local image tagged as `heiplanet-db` containing:
 - Python backend application
 - Data processing pipeline
@@ -467,7 +469,29 @@ An additional configuration is available for long-term historical analysis cover
 - Requires the gold files from heiplanet-data locally. `docker-compose.yaml` mounts `../heiplanet-data/.data_heiplanet_db/gold` read-only at `/data/gold`, which is where the `host: "local"` entries look (`url: "/data/gold"`). For a run outside Docker, set `url` to that folder.
 - `adults` is a density (mosquitoes per 625 km²), so it is stored separately for every grid resolution: the value at a coarse grid point is the area-weighted mean of the 0.1° cells in its cell. This adds about a third more rows than the 0.1° values alone.
 - The values span about 10 orders of magnitude, which a linear colour scale cannot show. They are therefore stored as `adults_log10` = log10(max(adults, 1)), so values below 1 mosquito per 625 km² become 0. The means are taken before the logarithm. The frontend has to request `adults_log10`.
-- About 310 million rows in `var_value` (about 130 million for `R0`, 180 million for `adults`). Plan for several hours of loading and tens of GB of database storage.
+- About 310 million values (133 million for `R0`, 176 million for `adults_log10`). Most of them are 0 (57 % of `R0`, 73 % of `adults_log10`); these are not stored, see [Zeros and coverage](#zeros-and-coverage).
+
+**Measured resources** (full load on a workstation, loader limited to 4 CPUs like the target server, settings from `docker-compose.yaml`, November 2026):
+
+| | Value |
+|---|---|
+| Loading time | 1 h 19 min |
+| Database data directory after loading (also the peak during loading) | 17 GB: `var_value` 10 GB (103 million rows: 5.1 GB table, 4.9 GB index), grid tables 2 GB, `var_coverage` 0.4 GB, WAL 4.1 GB |
+| Docker images | 0.85 GB (`heiplanet-db`), 0.6 GB (`postgis`), 0.1 GB (frontend) |
+| Input files (gold) | 3.8 GB |
+| Peak memory, loader (`production-runner`) | 4.4 GiB |
+| Peak memory, database | 1.9 GiB (limit 4 GiB) |
+| Memory, API | 0.2 GiB idle; a global request at 0.2° (570,000 points) temporarily needs about 1.5 GiB |
+| API response, global 2° / 1° / 0.5° / 0.2° | 0.3-0.8 s / 0.6-1.4 s / 1.3-2.4 s / 4-6 s |
+| API response, Europe 0.2°, Germany 0.1° | under 1 s |
+
+In total about 23 GB of disk, plus the operating system. Memory fits into 8 GB; during loading, the loader and the database together use about 6.3 GiB, so do not run other memory-heavy jobs at the same time.
+
+On a server with 30 GB of disk:
+
+- Copy the gold files to the server only for loading and delete them afterwards (3.8 GB). Alternatively, load on another machine and move the database with `pg_dump -Fc` / `pg_restore`; the restore needs the same space as the database.
+- The WAL keeps up to `max_wal_size` (4 GB in `docker-compose.yaml`) after loading. Setting `max_wal_size=1GB` saves about 3 GB, at the cost of more checkpoints and a somewhat slower load.
+- Remove unused Docker images and build cache (`docker system prune`).
 
 #### Configuration keys for variables
 
@@ -492,9 +516,19 @@ Optional keys for `grid` and `nuts` variables:
 - `transform`: `log10` stores log10(max(value, `transform_floor`)) instead of the value. For `aggregation: mean`, the means over coarse cells are taken before the transform.
 - `transform_floor`: lower limit before the logarithm (default 1, must be > 0).
 
+#### Zeros and coverage
+
+For every `grid` variable, the loader stores in `var_coverage` the grid points where the variable has a value at every time point (per resolution for `aggregation: mean`). At these grid points, values that are exactly 0 are not stored in `var_value`; the API returns 0 for them. Outside of them (e.g. ocean cells), a missing row means that there is no data, and zeros are stored. API responses and downloads are the same as if all zeros were stored.
+
+Because the coverage is computed over all time points of a variable, a variable has to be loaded in one go (all its files in one `data_to_fetch` entry). Loading it a second time without truncating the tables raises an error.
+
 `filename` can be a list of files, which are combined along `time`. For downloads, `url` and `filehash` must then be lists of the same length. For `host: "local"`, `url` can be the folder that holds the files.
 
-Databases created by an earlier version are updated automatically (new columns `var_type.aggregation` and `var_value.resolution_id`) when the production runner starts without `--drop-tables`.
+Databases created by an earlier version are updated automatically when the production runner starts without `--drop-tables`: new columns `var_type.aggregation` and `var_value.resolution_id`, new table `var_coverage`, and the column `var_value.id` (with its index) and duplicate foreign keys are removed. The column order of `var_value` is only optimal for tables created from scratch, so for a large reload use `--drop-tables`:
+
+```bash
+docker compose --profile init run --rm production-runner python -m heiplanet_db.production --drop-tables
+```
 
 ### Deploying with a Configuration
 

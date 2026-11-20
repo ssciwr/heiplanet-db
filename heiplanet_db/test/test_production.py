@@ -987,7 +987,24 @@ def test_insert_grid_and_nuts_values_with_transform(get_engine_with_tables, tmp_
         )
     summary = {(n, None if r is None else float(r)): rest for n, r, *rest in rows}
     log2 = float(np.log10(2.0))
-    assert summary[("R0_log10", None)] == [80, 0.0, 0.0]
+    # R0 = 1 everywhere -> log10 = 0 at every covered grid point: no rows,
+    # only the coverage
+    assert ("R0_log10", None) not in summary
+    with engine.connect() as conn:
+        coverage = dict(
+            conn.execute(
+                text(
+                    "SELECT vt.name, COUNT(*) FROM var_coverage c "
+                    "JOIN var_type vt ON vt.id = c.var_id GROUP BY vt.name"
+                )
+            ).all()
+        )
+    # 5 x 5 grid, first column is ocean
+    assert coverage["R0_log10"] == 20
+    session = db.create_session(engine)
+    assert db.get_var_value(session, "R0_log10", 0.0, 0.1, 2023, 1, 1) == 0.0
+    assert db.get_var_value(session, "R0_log10", 0.0, 0.0, 2023, 1, 1) is None
+    session.close()
     assert summary[("adults_log10", 0.1)][0] == 80
     np.testing.assert_allclose(summary[("adults_log10", 0.1)][1:], [log2, log2])
     np.testing.assert_allclose(summary[("adults_log10", 0.2)][1:], [log2, log2])
