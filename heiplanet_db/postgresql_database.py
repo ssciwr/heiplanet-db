@@ -1680,6 +1680,7 @@ def get_var_values_nuts(
     )
     # now get all the nuts ids associated with the values
     nuts_ids = [v.nuts_id for v in values]
+    print("Number of nuts_ids befire filtering", len(nuts_ids))
     if not nuts_ids:
         print("No NUTS id's found in the database.")
         raise HTTPException(
@@ -1688,13 +1689,27 @@ def get_var_values_nuts(
     # filter the nuts ids to the desired resolution
     # this could also be done based on the NutsDef table "levl_code"
     nuts_ids = filter_nuts_ids_for_resolution(nuts_ids, grid_resolution)
+    print("Amount of values", len(values))
+    print("Number of nuts_ids after filtering", len(nuts_ids))
     if not nuts_ids:
         print(f"No {grid_resolution} NUTS id's found in the database.")
         raise HTTPException(
             status_code=400,
             detail=f"No {grid_resolution} NUTS ids found in the database.",
         )
+
+    # For example::
+    if grid_resolution == "NUTS3":
+        croatia_nuts3_values = {
+            v.nuts_id: v.value
+            for v in values
+            if v.nuts_id.startswith("HR") and len(v.nuts_id) == 5
+        }
+        print("Expected Croatia NUTS3 values:")
+        for nuts_id, value in sorted(croatia_nuts3_values.items()):
+            print(f"{nuts_id}: {value}")
     # create a dict with NUTS_id: var_value
+    # I would propose this solution/change to the below: mydict = {v.nuts_id: v.value for v in values if v.nuts_id in nuts_ids}
     mydict = {nuts_id: v.value for v, nuts_id in zip(values, nuts_ids)}
     return mydict
 
