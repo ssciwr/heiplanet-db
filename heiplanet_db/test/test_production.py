@@ -485,6 +485,88 @@ def test_autovacuum_restoration_on_failure(get_engine_with_tables):
                 )
 
 
+def test_failed_load_with_bad_data_keeps_original_error(get_engine_with_tables):
+    """If the constraints cannot be restored after a failed load, the load's
+    own error is raised and autovacuum is still re-enabled."""
+    engine = get_engine_with_tables
+
+    def insert_bad_row_and_fail(*_args, **_kwargs):
+        # a row with unknown IDs: restoring the foreign keys fails
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO var_value (grid_id, time_id, var_id, value) "
+                    "VALUES (999, 999, 99, 1.0)"
+                )
+            )
+        raise RuntimeError("Insertion failed")
+
+    try:
+        with (
+            patch(
+                "heiplanet_db.production.insert_grid_var_values",
+                side_effect=insert_bad_row_and_fail,
+            ),
+            pytest.raises(RuntimeError, match="Insertion failed"),
+        ):
+            prod.load_data_with_optimization(
+                engine, grid_vars=[prod.GridVar("R0", [Path("dummy.nc")])]
+            )
+
+        with engine.connect() as conn:
+            for table in ["grid_point", "time_point", "var_value", "var_value_nuts"]:
+                reloptions = conn.execute(
+                    text("SELECT reloptions FROM pg_class WHERE relname = :t"),
+                    {"t": table},
+                ).scalar()
+                assert "autovacuum_enabled=true" in (reloptions or []), table
+            # the constraints could not be restored
+            assert (
+                conn.execute(
+                    text("SELECT 1 FROM pg_constraint WHERE conname = 'fk_grid_id'")
+                ).first()
+                is None
+            )
+    finally:
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM var_value"))
+        prod.db.add_bulk_load_constraints(engine)
+
+
+def test_constraint_error_after_successful_load_is_raised(get_engine_with_tables):
+    engine = get_engine_with_tables
+
+    def insert_bad_row(*_args, **_kwargs):
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO var_value (grid_id, time_id, var_id, value) "
+                    "VALUES (999, 999, 99, 1.0)"
+                )
+            )
+
+    try:
+        with (
+            patch(
+                "heiplanet_db.production.insert_grid_var_values",
+                side_effect=insert_bad_row,
+            ),
+            pytest.raises(Exception, match="fk_"),
+        ):
+            prod.load_data_with_optimization(
+                engine, grid_vars=[prod.GridVar("R0", [Path("dummy.nc")])]
+            )
+        with engine.connect() as conn:
+            reloptions = conn.execute(
+                text("SELECT reloptions FROM pg_class WHERE relname = 'var_value'")
+            ).scalar()
+        assert "autovacuum_enabled=true" in (reloptions or [])
+    finally:
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM var_value"))
+        prod.db.add_bulk_load_constraints(engine)
+
+
 def test_autovacuum_restoration_on_success(get_engine_with_tables):
     engine = get_engine_with_tables
 

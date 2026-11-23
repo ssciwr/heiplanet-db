@@ -1723,27 +1723,41 @@ def get_var_value(
     lat = _q(lat)
     lon = _q(lon)
 
-    query = (
-        session.query(VarValue)
+    var_type = session.query(VarType).filter(VarType.name == var_name).first()
+    if var_type is None:
+        return None
+    # one row per (grid point, time point) for "subsample" variables; for the
+    # others, look at a single resolution only. Falling back to the next
+    # coarser resolution when a row is missing would be wrong: a missing row
+    # at a covered grid point means 0, not "ask the coarser cell".
+    if var_type.aggregation == "subsample":
+        value_resolution = VarValue.resolution_id.is_(None)
+        coverage_resolution = VarCoverage.resolution_id.is_(None)
+    else:
+        if resolution is None:
+            resolution_id = _finest_resolution_id(session, var_type.id)
+        else:
+            resolution_id = get_resolution_id(session, resolution)
+        if resolution_id is None:
+            return None
+        value_resolution = VarValue.resolution_id == resolution_id
+        coverage_resolution = VarCoverage.resolution_id == resolution_id
+
+    result = (
+        session.query(VarValue.value)
         .join(GridPoint, VarValue.grid_id == GridPoint.id)
         .join(TimePoint, VarValue.time_id == TimePoint.id)
-        .join(VarType, VarValue.var_id == VarType.id)
-        .outerjoin(ResolutionGroup, VarValue.resolution_id == ResolutionGroup.id)
         .filter(
             GridPoint.latitude == lat,
             GridPoint.longitude == lon,
             TimePoint.year == year,
             TimePoint.month == month,
             TimePoint.day == day,
-            VarType.name == var_name,
+            VarValue.var_id == var_type.id,
+            value_resolution,
         )
+        .first()
     )
-    if resolution is not None:
-        query = query.filter(
-            (VarValue.resolution_id.is_(None))
-            | (ResolutionGroup.resolution == resolution)
-        )
-    result = query.order_by(ResolutionGroup.resolution.asc().nulls_first()).first()
     if result is not None:
         return result.value
 
@@ -1755,25 +1769,50 @@ def get_var_value(
     )
     if time_exists is None:
         return None
-    coverage = (
+    covered = (
         session.query(VarCoverage.grid_id)
         .join(GridPoint, VarCoverage.grid_id == GridPoint.id)
-        .join(VarType, VarCoverage.var_id == VarType.id)
-        .outerjoin(ResolutionGroup, VarCoverage.resolution_id == ResolutionGroup.id)
         .filter(
             GridPoint.latitude == lat,
             GridPoint.longitude == lon,
-            VarType.name == var_name,
+            VarCoverage.var_id == var_type.id,
+            coverage_resolution,
         )
+        .first()
     )
-    if resolution is not None:
-        coverage = coverage.filter(
-            (VarCoverage.resolution_id.is_(None))
-            | (ResolutionGroup.resolution == resolution)
-        )
-    # like the values: the finest resolution unless one is requested
-    covered = coverage.order_by(ResolutionGroup.resolution.asc().nulls_first()).first()
     return 0.0 if covered is not None else None
+
+
+def _finest_resolution_id(session: Session, var_id: int) -> int | None:
+    """Finest resolution group at which a variable stored per resolution has data.
+
+    `var_coverage` is checked first: it is small and indexed by var_id. Only if
+    the variable has no coverage at all is `var_value` searched, which may scan
+    a large part of the table.
+
+    Args:
+        session (Session): SQLAlchemy session object.
+        var_id (int): Variable type ID.
+
+    Returns:
+        int | None: Resolution group ID, None if the variable has no data.
+    """
+    resolution_ids = [
+        rid
+        for (rid,) in session.query(ResolutionGroup.id).order_by(
+            ResolutionGroup.resolution.asc()
+        )
+    ]
+    for table in (VarCoverage, VarValue):
+        for rid in resolution_ids:
+            exists = (
+                session.query(table.var_id)
+                .filter(table.var_id == var_id, table.resolution_id == rid)
+                .first()
+            )
+            if exists is not None:
+                return rid
+    return None
 
 
 def get_var_value_nuts(

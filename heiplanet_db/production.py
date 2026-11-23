@@ -584,6 +584,38 @@ def main(drop_tables: bool = False, config_path: str | None = None) -> None:
     load_data_with_optimization(engine, grid_vars=grid_vars, nuts_vars=nuts_vars)
 
 
+def _restore_after_bulk_load(engine: engine.Engine, after_error: bool) -> None:
+    """Re-enable autovacuum and restore the constraints after a bulk load.
+
+    Autovacuum is re-enabled first, so it is back on even if the constraints
+    cannot be restored. Restoring them fails if the loaded data has duplicate
+    rows or unknown IDs. After a successful load that error is raised. After a
+    failed load it is only reported, so that it does not hide the error that
+    stopped the load; the constraints then stay missing until the data is
+    fixed and `db.add_bulk_load_constraints` is run.
+
+    Args:
+        engine (engine.Engine): SQLAlchemy engine object.
+        after_error (bool): Whether the load itself failed.
+    """
+    print("DEBUG: Re-enabling autovacuum on all tables...")
+    with engine.begin() as conn:
+        for table in ("grid_point", "time_point", "var_value", "var_value_nuts"):
+            conn.execute(text(f"ALTER TABLE {table} SET (autovacuum_enabled = true);"))
+    print("DEBUG: Autovacuum re-enabled on all tables.")
+
+    print("Restoring the constraints of var_value and var_coverage...")
+    try:
+        db.add_bulk_load_constraints(engine)
+    except Exception as e:
+        if not after_error:
+            raise
+        print(
+            "Warning: could not restore the constraints of var_value and "
+            f"var_coverage after the failed load: {e}"
+        )
+
+
 def load_data_with_optimization(
     engine: engine.Engine,
     grid_vars: list[GridVar] | None = None,
@@ -621,26 +653,12 @@ def load_data_with_optimization(
         if nuts_vars:
             insert_nuts_var_values(engine, nuts_vars)
             print("DEBUG: insert_nuts_var_values completed.")
-        print("DEBUG: All variable value inserts done, entering finally block.")
-
-    finally:
-        # Re-enable autovacuum and run VACUUM ANALYZE on all tables
-        # This block is executed even if an error occurs in the try block
-        print("Restoring the constraints of var_value and var_coverage...")
-        db.add_bulk_load_constraints(engine)
-        print("DEBUG: Re-enabling autovacuum on all tables...")
-        with engine.begin() as conn:
-            conn.execute(
-                text("ALTER TABLE grid_point SET (autovacuum_enabled = true);")
-            )
-            conn.execute(
-                text("ALTER TABLE time_point SET (autovacuum_enabled = true);")
-            )
-            conn.execute(text("ALTER TABLE var_value SET (autovacuum_enabled = true);"))
-            conn.execute(
-                text("ALTER TABLE var_value_nuts SET (autovacuum_enabled = true);")
-            )
-        print("DEBUG: Autovacuum re-enabled on all tables.")
+        print("DEBUG: All variable value inserts done.")
+    except BaseException:
+        # restore what we can, but let the original error propagate
+        _restore_after_bulk_load(engine, after_error=True)
+        raise
+    _restore_after_bulk_load(engine, after_error=False)
 
     # Run VACUUM in autocommit mode (outside transaction)
     print("DEBUG: Running VACUUM ANALYZE...")

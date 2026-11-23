@@ -1866,6 +1866,49 @@ def test_insert_var_values_by_resolution_transform_after_mean(
     np.testing.assert_allclose(native, np.log10(values[0, 4, 4]))
 
 
+def test_get_var_value_mean_var_does_not_fall_back_to_coarser_resolution(
+    get_engine_with_tables, get_session
+):
+    ds = _fine_grid_ds()
+    # a covered zero at (0.2, 0.2): not stored at 0.1, but the 0.2 mean around
+    # it is positive and stored
+    ds["adults"].values[:, 2, 2] = 0.0
+    # (0.4, 0.4) has no data at 0.1, but its 0.2 cell has a value
+    mask = xr.ones_like(ds["adults"], dtype=bool)
+    mask[{"latitude": 0, "longitude": 4}] = False
+    _seed_mean_var(get_session, get_engine_with_tables, ds, mask=mask)
+
+    coarse = postdb.get_var_value(
+        get_session, "adults", 0.2, 0.2, 2023, 1, 1, resolution=0.2
+    )
+    assert coarse > 0
+    # without a resolution: the native value (0), not the coarse mean
+    assert postdb.get_var_value(get_session, "adults", 0.2, 0.2, 2023, 1, 1) == 0.0
+    assert (
+        postdb.get_var_value(
+            get_session, "adults", 0.2, 0.2, 2023, 1, 1, resolution=0.1
+        )
+        == 0.0
+    )
+    # no native data: None, not the value of the coarse cell
+    assert (
+        postdb.get_var_value(
+            get_session, "adults", 0.4, 0.4, 2023, 1, 1, resolution=0.2
+        )
+        is not None
+    )
+    assert postdb.get_var_value(get_session, "adults", 0.4, 0.4, 2023, 1, 1) is None
+    # a resolution the variable is not stored at
+    assert (
+        postdb.get_var_value(
+            get_session, "adults", 0.2, 0.2, 2023, 1, 1, resolution=0.25
+        )
+        is None
+    )
+    # unknown variable
+    assert postdb.get_var_value(get_session, "nope", 0.2, 0.2, 2023, 1, 1) is None
+
+
 def test_block_valid_and_drop_covered_zeros():
     lats = np.round(np.arange(0.4, -0.05, -0.1), 1)
     lons = np.round(np.arange(0.0, 0.45, 0.1), 1)
