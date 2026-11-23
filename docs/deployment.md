@@ -40,15 +40,6 @@ The `<tag>` can be a specific version number, `latest` for the most recent relea
   - **Data Pipeline**: ETL (Extract, Transform, Load) processes for ingesting surveillance data
   - **Data Validation**: Quality checks and integrity verification
 
-name = "mailcom"
-license = {text = "MIT License"}
-readme = "README.md"
-description = "Pseudonymize email content in Romance languages"
-requires-python = ">=3.9"
-classifiers = [
-    "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
-    "Operating System :: OS Independent",
 The `<tag>` can be a version number, `latest`, or a branch name. Using a locally built image allows customization of the data configuration, enabling you to modify which datasets are ingested or add new data sources.
 
 

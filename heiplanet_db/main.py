@@ -59,7 +59,8 @@ allowed_origins = [
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    db.initialize_database(db_url, replace=False)
+    # schema upgrades are left to the production runner (see initialize_database)
+    db.initialize_database(db_url, replace=False, upgrade=False)
     yield
 
 

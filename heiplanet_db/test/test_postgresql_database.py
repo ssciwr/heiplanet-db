@@ -1489,6 +1489,37 @@ def test_copy_var_values(get_session, get_engine_with_tables):
     get_session.commit()
 
 
+def test_initialize_database_without_upgrade_keeps_bulk_load_state(
+    get_engine_with_tables,
+):
+    """The API initializes the database with upgrade=False, which must not
+    re-create the constraints that a running bulk load has dropped."""
+    engine = get_engine_with_tables
+    db_url = engine.url.render_as_string(hide_password=False)
+
+    def has_unique_constraint():
+        with engine.connect() as conn:
+            return (
+                conn.execute(
+                    text(
+                        "SELECT 1 FROM pg_constraint "
+                        "WHERE conname = 'uq_time_grid_var_res'"
+                    )
+                ).first()
+                is not None
+            )
+
+    postdb.drop_bulk_load_constraints(engine)
+    try:
+        postdb.initialize_database(db_url, replace=False, upgrade=False)
+        assert not has_unique_constraint()
+        # the production runner upgrades, and so re-creates it
+        postdb.initialize_database(db_url, replace=False)
+        assert has_unique_constraint()
+    finally:
+        postdb.add_bulk_load_constraints(engine)
+
+
 def test_bulk_load_constraints_drop_and_add(get_session, get_engine_with_tables):
     engine = get_engine_with_tables
 
@@ -1907,6 +1938,38 @@ def test_get_var_value_mean_var_does_not_fall_back_to_coarser_resolution(
     )
     # unknown variable
     assert postdb.get_var_value(get_session, "nope", 0.2, 0.2, 2023, 1, 1) is None
+
+
+def test_download_mean_var_does_not_fall_back_to_coarser_resolution(
+    get_engine_with_tables, get_session, tmp_path
+):
+    ds = _fine_grid_ds()
+    # (0.4, 0.4) has no data at 0.1, but its 0.2 cell has a value
+    mask = xr.ones_like(ds["adults"], dtype=bool)
+    mask[{"latitude": 0, "longitude": 4}] = False
+    _seed_mean_var(get_session, get_engine_with_tables, ds, mask=mask)
+    assert (
+        postdb.get_var_value(
+            get_session, "adults", 0.4, 0.4, 2023, 1, 1, resolution=0.2
+        )
+        is not None
+    )
+
+    # an area that holds only that grid point
+    out_file = tmp_path / "download.nc"
+    postdb.get_var_values_cartesian_for_download(
+        get_session,
+        start_time_point=(2023, 1),
+        end_time_point=(2023, 2),
+        area=(0.4, 0.4, 0.4, 0.4),
+        var_names=["adults"],
+        netcdf_file=str(out_file),
+    )
+    with xr.open_dataset(out_file) as downloaded:
+        got = downloaded["adults"].values
+    assert got.shape == (2, 1, 1)
+    # like get_var_value: no native data, not the coarse mean
+    assert np.isnan(got).all()
 
 
 def test_block_valid_and_drop_covered_zeros():

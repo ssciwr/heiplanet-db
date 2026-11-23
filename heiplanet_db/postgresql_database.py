@@ -550,7 +550,7 @@ def normalize_db_url(db_url: str) -> str:
     return db_url
 
 
-def initialize_database(db_url: str, replace: bool = False):
+def initialize_database(db_url: str, replace: bool = False, upgrade: bool = True):
     """
     Initialize the database by creating the engine and tables, and installing PostGIS.
     If replace is True, it will drop and recreate the tables.
@@ -558,6 +558,11 @@ def initialize_database(db_url: str, replace: bool = False):
     Args:
         db_url (str): Database URL for SQLAlchemy.
         replace (bool): Whether to drop and recreate the tables. Defaults to False.
+        upgrade (bool): Whether to bring existing tables up to date with
+            `upgrade_schema` (only if replace is False). Defaults to True.
+            The API passes False: `upgrade_schema` takes exclusive locks and
+            re-creates the constraints that a running bulk load has dropped,
+            so only the production runner upgrades the schema.
     """
     # create engine
     engine = create_engine(
@@ -572,7 +577,8 @@ def initialize_database(db_url: str, replace: bool = False):
         create_or_replace_tables(engine)
     else:
         create_tables(engine)
-        upgrade_schema(engine)
+        if upgrade:
+            upgrade_schema(engine)
 
     print("Database initialized successfully.")
 
@@ -2276,39 +2282,41 @@ def get_var_values_cartesian_for_download(
         }
     )
 
-    # variables stored per resolution are exported at their finest resolution
-    resolution_by_id = {rid: res for res, rid in get_resolution_id_map(session).items()}
-
     # get variable values for each grid point and time point
     for vt in var_types:
         var_name = vt.name
+        # variables stored per resolution are exported at the finest resolution
+        # of the variable (as in get_var_value), not the finest one that
+        # happens to have rows in the requested area
+        resolution_id = (
+            None
+            if vt.aggregation == "subsample"
+            else _finest_resolution_id(session, vt.id)
+        )
         values = (
             session.query(VarValue)
             .filter(
                 VarValue.grid_id.in_(grid_ids.keys()),
                 VarValue.time_id.in_(time_ids.keys()),
                 VarValue.var_id == vt.id,
+                VarValue.resolution_id.is_(None)
+                if resolution_id is None
+                else VarValue.resolution_id == resolution_id,
             )
             .all()
         )
         covered_ids = [
-            (row.grid_id, row.resolution_id)
-            for row in session.query(VarCoverage.grid_id, VarCoverage.resolution_id)
+            row.grid_id
+            for row in session.query(VarCoverage.grid_id)
             .filter(
                 VarCoverage.var_id == vt.id,
                 VarCoverage.grid_id.in_(grid_ids.keys()),
+                VarCoverage.resolution_id.is_(None)
+                if resolution_id is None
+                else VarCoverage.resolution_id == resolution_id,
             )
             .all()
         ]
-        if vt.aggregation != "subsample":
-            finest_id = min(
-                {vv.resolution_id for vv in values if vv.resolution_id is not None}
-                | {rid for _, rid in covered_ids if rid is not None},
-                key=lambda rid: resolution_by_id[rid],
-                default=None,
-            )
-            values = [vv for vv in values if vv.resolution_id == finest_id]
-            covered_ids = [(gid, rid) for gid, rid in covered_ids if rid == finest_id]
 
         # dummy values array
         values_array = np.full(
@@ -2317,7 +2325,7 @@ def get_var_values_cartesian_for_download(
             dtype=np.float64,
         )
         # covered grid points without a stored value are 0 (see VarCoverage)
-        for grid_id, _ in covered_ids:
+        for grid_id in covered_ids:
             lat_index, lon_index = grid_ids[grid_id]
             values_array[:, lat_index, lon_index] = 0.0
 

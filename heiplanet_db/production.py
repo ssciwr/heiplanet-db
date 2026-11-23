@@ -487,14 +487,14 @@ def _fetch_file(
             f"File {filename} already exists in the data lake "
             f"at level {data_level}, skipping download."
         )
-        return path
-    entry = dict(data)
-    entry["filename"] = filename
-    if url is not None:
-        entry["url"] = url
-    if filehash is not None:
-        entry["filehash"] = filehash
-    get_data_files(entry, config, data_level)
+    else:
+        entry = dict(data)
+        entry["filename"] = filename
+        if url is not None:
+            entry["url"] = url
+        if filehash is not None:
+            entry["filehash"] = filehash
+        get_data_files(entry, config, data_level)
     return path
 
 
