@@ -507,6 +507,17 @@ Optional keys for `grid` and `nuts` variables:
 - `transform`: `log10` stores log10(max(value, `transform_floor`)) instead of the value. For `aggregation: mean`, the means over coarse cells are taken before the transform.
 - `transform_floor`: lower limit before the logarithm (default 1, must be > 0).
 
+#### Grid alignment
+
+The grid points of a coarser resolution are the points whose latitude and longitude, multiplied by 10 and rounded to an integer, are multiples of the resolution × 10 (e.g. every second 0.1° point for 0.2°). This rule is applied in two places:
+
+- in the database (PostgreSQL `ROUND`, which rounds halves away from zero), when grid points are assigned to the resolution groups (`grid_point_resolution`), and
+- in Python (`np.round`, which rounds halves to the nearest even number), when the area-weighted means of `aggregation: mean` variables are computed.
+
+Both give the same points as long as the grid coordinates lie on whole tenths of a degree (e.g. 90.0, 89.9, …, -179.9), as in the current J-Model and P-Model data. On a grid that is offset by half a step, with cell centres at x.x5 (e.g. 0.05, 0.15, …), the coordinates × 10 end in .5 and the two roundings can select different points. The means of `aggregation: mean` variables are then stored at grid points that do not belong to the resolution group, and the API returns no values for these variables at coarser resolutions. `subsample` variables are not affected.
+
+Before loading data on such a grid, shift or regrid it to whole tenths of a degree, or make both places use the same rounding.
+
 #### Zeros and coverage
 
 For every `grid` variable, the loader stores in `var_coverage` the grid points where the variable has a value at every time point (per resolution for `aggregation: mean`). At these grid points, values that are exactly 0 are not stored in `var_value`; the API returns 0 for them. Outside of them (e.g. ocean cells), a missing row means that there is no data, and zeros are stored. API responses and downloads are the same as if all zeros were stored.
