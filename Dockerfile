@@ -7,15 +7,11 @@
 # Last update: 28.07.2025
 FROM python:3.11-slim AS application
 
-# Install system dependencies for PostgreSQL client and geospatial libraries
-RUN apt-get update && apt-get install -y \
-    curl \
-    g++ \
-    gcc \
-    libgdal-dev \
-    libgeos-dev \
-    libpq-dev \
-    libproj-dev \
+# All Python dependencies ship as binary wheels (GDAL, GEOS and PROJ are bundled
+# in pyogrio, shapely and pyproj; libpq in psycopg2-binary), so no compilers or
+# -dev packages are needed. postgresql-client provides psql and pg_isready for
+# maintenance from inside the container.
+RUN apt-get update && apt-get install -y --no-install-recommends \
     postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
