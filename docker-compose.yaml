@@ -36,6 +36,10 @@ services:
       - "autovacuum_max_workers=4"
       - "-c"
       - "autovacuum_naptime=10s"
+      # parallel hash joins keep their hash tables in /dev/shm (shm_size), which
+      # is too small for requests over the whole globe at 0.2 degree
+      - "-c"
+      - "enable_parallel_hash=off"
     ports:
       - "5445:5432"
     env_file: ./.env
@@ -62,7 +66,7 @@ services:
         condition: service_started
     env_file: ./.env
     volumes:
-      - ./heiplanet_db/data/production_config.yml:/heiplanet_db/production.yaml
+      - ./heiplanet_db/data/production_config_2014-2018.yml:/heiplanet_db/production.yaml
     command: [ "api" ] # Run FastAPI server
     restart: "no"
     networks:
@@ -79,7 +83,9 @@ services:
         condition: service_healthy
     env_file: ./.env
     volumes:
-      - ./heiplanet_db/data/production_config.yml:/heiplanet_db/production.yaml
+      - ./heiplanet_db/data/production_config_2014-2018.yml:/heiplanet_db/production.yaml
+      # gold data from heiplanet-data, read by the `host: local` config entries
+      - ../heiplanet-data/.data_heiplanet_db/gold:/data/gold:ro
     command: [ "production" ]
     restart: "no" # Run once
     networks:

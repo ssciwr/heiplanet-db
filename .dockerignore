@@ -1,0 +1,21 @@
+# Only the package sources, README.md and pyproject.toml go into the image.
+# Keep secrets, data and scratch files out of the build context.
+.git
+.github
+.env
+**/.env
+**/.data_heiplanet_db
+**/__pycache__
+**/*.pyc
+heiplanet_db/test
+heiplanet_db/out
+heiplanet_db/tempdata*
+heiplanet_db/temppdata
+tempdata*
+temppdata
+temp
+docs
+notebooks
+nginx
+*.md
+!README.md
