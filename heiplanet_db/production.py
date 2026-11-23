@@ -591,9 +591,13 @@ def load_data_with_optimization(
 ) -> None:
     """
     Load data into the database with autovacuum disabled for performance.
-    Ensures autovacuum is re-enabled even if an error occurs.
+    The unique and foreign key constraints of var_value and var_coverage are
+    dropped during the load and created again afterwards, which is much faster
+    and gives a smaller index. Ensures autovacuum and the constraints are
+    restored even if an error occurs.
     """
     try:
+        db.drop_bulk_load_constraints(engine)
         # Disable autovacuum globally for all tables during bulk load
         with engine.begin() as conn:
             conn.execute(
@@ -622,6 +626,8 @@ def load_data_with_optimization(
     finally:
         # Re-enable autovacuum and run VACUUM ANALYZE on all tables
         # This block is executed even if an error occurs in the try block
+        print("Restoring the constraints of var_value and var_coverage...")
+        db.add_bulk_load_constraints(engine)
         print("DEBUG: Re-enabling autovacuum on all tables...")
         with engine.begin() as conn:
             conn.execute(

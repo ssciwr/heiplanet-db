@@ -1,10 +1,10 @@
 import gc
+import io
 import json
 import math
 import os
+import struct
 import time
-from collections.abc import Generator
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from pathlib import Path
 from typing import ClassVar
 
@@ -15,13 +15,14 @@ import xarray as xr
 from fastapi import HTTPException
 from geoalchemy2 import Geometry, WKBElement
 from sqlalchemy import (
+    REAL,
     BigInteger,
     Float,
     ForeignKey,
     ForeignKeyConstraint,
-    Index,
     Integer,
     Numeric,
+    SmallInteger,
     String,
     UniqueConstraint,
     and_,
@@ -34,17 +35,14 @@ from sqlalchemy import (
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.orm.session import Session, sessionmaker
-from tqdm import tqdm
+from sqlalchemy.schema import AddConstraint
 
 CRS = 4326
-STR_POINT = "SRID={};POINT({} {})"
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "10000"))
-MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "4"))
 VAR_TIME_CHUNK = int(os.environ.get("VAR_TIME_CHUNK", "6"))
 GRID_LAT_CHUNK = int(os.environ.get("GRID_LAT_CHUNK", "45"))
 GRID_LON_CHUNK = int(os.environ.get("GRID_LON_CHUNK", "360"))
 ROUND_DIGITS = int(os.environ.get("ROUND_DIGITS", "4"))
-TIMEOUT = int(os.environ.get("TIMEOUT", "300"))
 
 
 def _q(value):
@@ -107,23 +105,9 @@ class GridPoint(Base):
     latitude: Mapped[float] = mapped_column(Numeric(precision=8, scale=4))
     longitude: Mapped[float] = mapped_column(Numeric(precision=8, scale=4))
 
-    # Geometry column for PostGIS
-    point: Mapped[Geometry] = mapped_column(Geometry("POINT", srid=CRS), nullable=True)
-
-    __table_args__ = (
-        Index("idx_point_gridpoint", "point", postgresql_using="gist"),
-        UniqueConstraint("latitude", "longitude", name="uq_lat_lon"),
-    )
-
-    def __init__(self, latitude, longitude, **kw):
-        super().__init__(**kw)
-        self.latitude = latitude
-        self.longitude = longitude
-        # add value of point automatically,
-        # only works when using the constructor, i.e. session.add()
-        self.point = func.ST_GeomFromText(
-            STR_POINT.format(str(CRS), self.longitude, self.latitude)
-        )
+    # There is no PostGIS point column: no query used it, and with its spatial
+    # index it took about 0.9 GB for the global 0.1 degree grid.
+    __table_args__ = (UniqueConstraint("latitude", "longitude", name="uq_lat_lon"),)
 
 
 class TimePoint(Base):
@@ -174,16 +158,19 @@ class VarValue(Base):
 
     # This table holds hundreds of millions of rows, so it has no surrogate
     # key: rows are identified by the unique constraint below. The columns are
-    # ordered so that PostgreSQL needs no alignment padding (4 x int4, float8).
+    # as narrow as the data allows and ordered so that PostgreSQL needs no
+    # alignment padding (int4, int4, int2, int2, float4: 16 bytes of data, 44
+    # bytes per row with the tuple header). float4 keeps about 7 significant
+    # digits, more than the maps and the downloads need.
     # The foreign keys are declared once, in __table_args__.
     grid_id: Mapped[int] = mapped_column(Integer())
     time_id: Mapped[int] = mapped_column(Integer())
-    var_id: Mapped[int] = mapped_column(Integer())
+    var_id: Mapped[int] = mapped_column(SmallInteger())
     # NULL for variables with aggregation "subsample" (one value per grid point,
     # shared by all resolutions); set for variables whose value depends on the
     # resolution (aggregation "mean"), one row per resolution group
-    resolution_id: Mapped[int | None] = mapped_column(Integer(), nullable=True)
-    value: Mapped[float] = mapped_column(Float())
+    resolution_id: Mapped[int | None] = mapped_column(SmallInteger(), nullable=True)
+    value: Mapped[float] = mapped_column(REAL())
 
     __mapper_args__: ClassVar[dict] = {
         # identity for the ORM only; the database enforces it with
@@ -245,8 +232,8 @@ class VarCoverage(Base):
 
     __tablename__ = "var_coverage"
 
-    var_id: Mapped[int] = mapped_column(Integer())
-    resolution_id: Mapped[int | None] = mapped_column(Integer(), nullable=True)
+    var_id: Mapped[int] = mapped_column(SmallInteger())
+    resolution_id: Mapped[int | None] = mapped_column(SmallInteger(), nullable=True)
     grid_id: Mapped[int] = mapped_column(Integer())
 
     __mapper_args__: ClassVar[dict] = {"primary_key": [var_id, resolution_id, grid_id]}
@@ -441,11 +428,100 @@ def upgrade_schema(engine: engine.Engine):
             END IF;
         END $$;
         """,
+        # unused PostGIS point; dropping it also drops its two GiST indexes
+        "ALTER TABLE grid_point DROP COLUMN IF EXISTS point;",
+        # narrower types (rewrites the tables once, so only when needed)
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'var_value' AND (
+                    (column_name = 'value' AND data_type <> 'real')
+                    OR (column_name IN ('var_id', 'resolution_id')
+                        AND data_type <> 'smallint')
+                )
+            ) THEN
+                ALTER TABLE var_value
+                    ALTER COLUMN var_id TYPE smallint,
+                    ALTER COLUMN resolution_id TYPE smallint,
+                    ALTER COLUMN value TYPE real;
+            END IF;
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'var_coverage'
+                    AND column_name IN ('var_id', 'resolution_id')
+                    AND data_type <> 'smallint'
+            ) THEN
+                ALTER TABLE var_coverage
+                    ALTER COLUMN var_id TYPE smallint,
+                    ALTER COLUMN resolution_id TYPE smallint;
+            END IF;
+        END $$;
+        """,
     ]
     with engine.begin() as conn:
         for statement in statements:
             conn.execute(text(statement))
     print("Database schema up to date.")
+
+
+# tables that receive hundreds of millions of rows in a bulk load
+BULK_LOAD_TABLES = ("var_value", "var_coverage")
+
+
+def _bulk_load_constraints(table_name: str) -> list:
+    """Unique and foreign key constraints of a table, as declared in the model."""
+    table = Base.metadata.tables[table_name]
+    return [
+        c
+        for c in table.constraints
+        if isinstance(c, (UniqueConstraint, ForeignKeyConstraint))
+    ]
+
+
+def drop_bulk_load_constraints(engine: engine.Engine) -> None:
+    """Drop the unique and foreign key constraints of `BULK_LOAD_TABLES`.
+
+    With the constraints in place, PostgreSQL checks every row against four
+    other tables and keeps a unique index up to date while rows arrive in no
+    particular order; a load is then about 25 times slower and the index about
+    20 % larger. Restore them with `add_bulk_load_constraints` after the load,
+    which validates all rows at once.
+
+    Needs an exclusive lock on the referenced tables, so no other transaction
+    may use them meanwhile.
+
+    Args:
+        engine (engine.Engine): SQLAlchemy engine object.
+    """
+    with engine.begin() as conn:
+        for table_name in BULK_LOAD_TABLES:
+            for constraint in _bulk_load_constraints(table_name):
+                conn.execute(
+                    text(
+                        f"ALTER TABLE {table_name} "
+                        f"DROP CONSTRAINT IF EXISTS {constraint.name};"
+                    )
+                )
+
+
+def add_bulk_load_constraints(engine: engine.Engine) -> None:
+    """(Re)create the missing constraints of `BULK_LOAD_TABLES`.
+
+    Fails if the loaded data contains duplicate rows or unknown IDs.
+
+    Args:
+        engine (engine.Engine): SQLAlchemy engine object.
+    """
+    with engine.begin() as conn:
+        existing = {
+            row[0] for row in conn.execute(text("SELECT conname FROM pg_constraint"))
+        }
+        for table_name in BULK_LOAD_TABLES:
+            for constraint in _bulk_load_constraints(table_name):
+                if constraint.name not in existing:
+                    conn.execute(AddConstraint(constraint))
 
 
 def normalize_db_url(db_url: str) -> str:
@@ -602,7 +678,6 @@ def insert_grid_points(session: Session, latitudes: np.ndarray, longitudes: np.n
                 {
                     "latitude": _q(lat),
                     "longitude": _q(lon),
-                    "point": STR_POINT.format(str(CRS), _q(lon), _q(lat)),
                 }
                 for lat in lat_slice
                 for lon in lon_slice
@@ -935,13 +1010,179 @@ def convert_yearly_to_monthly(ds: xr.Dataset) -> xr.Dataset:
     return ds.reindex(time=new_time_points, method="ffill")
 
 
-def insert_batch(batch: list[VarValue], engine: engine.Engine, VarClass: type[Base]):
-    session = create_session(engine)
+_PGCOPY_HEADER = b"PGCOPY\n\xff\r\n\x00" + struct.pack("!ii", 0, 0)
+_PGCOPY_TRAILER = struct.pack("!h", -1)
+
+
+def _pgcopy_binary(columns: list[tuple[str, np.ndarray | None]]) -> bytes:
+    """Encode rows in the binary format of PostgreSQL's COPY.
+
+    Args:
+        columns (list[tuple[str, np.ndarray | None]]): One (dtype, values) pair
+            per column, in table column order. `dtype` is a big-endian numpy
+            type matching the column exactly (">i4" for integer, ">i2" for
+            smallint, ">f4" for real). `values` is a 1D array with one entry
+            per row, or None for a column that is NULL in every row.
+
+    Returns:
+        bytes: The COPY data, including header and trailer.
+    """
+    n_rows = next((len(v) for _, v in columns if v is not None), 0)
+    fields = [("n_fields", ">i2")]
+    for k, (dtype, values) in enumerate(columns):
+        fields.append((f"len{k}", ">i4"))
+        if values is not None:
+            fields.append((f"val{k}", dtype))
+    rows = np.empty(n_rows, dtype=np.dtype(fields))
+    rows["n_fields"] = len(columns)
+    for k, (dtype, values) in enumerate(columns):
+        if values is None:
+            rows[f"len{k}"] = -1
+        else:
+            if len(values) != n_rows:
+                raise ValueError("All COPY columns must have the same length.")
+            rows[f"len{k}"] = np.dtype(dtype).itemsize
+            rows[f"val{k}"] = values
+    return _PGCOPY_HEADER + rows.tobytes() + _PGCOPY_TRAILER
+
+
+def copy_rows(
+    engine: engine.Engine,
+    table: str,
+    column_names: list[str],
+    columns: list[tuple[str, np.ndarray | None]],
+) -> int:
+    """Insert rows with a binary COPY, in one transaction.
+
+    Much faster than INSERT statements, and no Python object is created per
+    row. See `_pgcopy_binary` for `columns`.
+
+    Args:
+        engine (engine.Engine): SQLAlchemy engine object.
+        table (str): Table name.
+        column_names (list[str]): Names of the columns in `columns`.
+        columns (list[tuple[str, np.ndarray | None]]): Column data.
+
+    Returns:
+        int: Number of rows inserted.
+    """
+    data = _pgcopy_binary(columns)
+    n_rows = next((len(v) for _, v in columns if v is not None), 0)
+    if n_rows == 0:
+        return 0
+    connection = engine.raw_connection()
     try:
-        add_data_list_bulk(session, batch, VarClass)
-        session.commit()
+        with connection.cursor() as cursor:
+            cursor.copy_expert(
+                f"COPY {table} ({', '.join(column_names)}) "
+                "FROM STDIN WITH (FORMAT BINARY)",
+                io.BytesIO(data),
+            )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
     finally:
-        session.close()
+        connection.close()
+    return n_rows
+
+
+def grid_id_array(lats: np.ndarray, lons: np.ndarray, grid_id_map: dict) -> np.ndarray:
+    """Look up the grid point IDs of a regular (latitude, longitude) grid once.
+
+    Args:
+        lats (np.ndarray): Latitudes.
+        lons (np.ndarray): Longitudes.
+        grid_id_map (dict): Mapping of (latitude, longitude) to grid point ID.
+
+    Returns:
+        np.ndarray: int64 array (len(lats), len(lons)) of grid point IDs, -1
+            where the grid point is missing from `grid_id_map`.
+    """
+    ids = np.full((len(lats), len(lons)), -1, dtype=np.int64)
+    q_lons = [_q(lon) for lon in lons]
+    for i, lat in enumerate(lats):
+        q_lat = _q(lat)
+        ids[i] = [grid_id_map.get((q_lat, q_lon), -1) for q_lon in q_lons]
+    n_missing = int((ids < 0).sum())
+    if n_missing:
+        print(f"Warning: {n_missing} grid points are not in the database.")
+    return ids
+
+
+def time_id_array(times: np.ndarray, time_id_map: dict) -> np.ndarray:
+    """Look up the time point IDs of `times`.
+
+    Args:
+        times (np.ndarray): datetime64 values.
+        time_id_map (dict): Mapping of datetime64 to time point ID.
+
+    Returns:
+        np.ndarray: int64 array of time point IDs.
+    """
+    ids = []
+    for t_val in times:
+        time_key = _normalize_time_key(t_val)
+        time_id = time_id_map.get(time_key)
+        if time_id is None:
+            raise ValueError(f"Time point {time_key} is not in the database.")
+        ids.append(time_id)
+    return np.array(ids, dtype=np.int64)
+
+
+def copy_var_values(
+    engine: engine.Engine,
+    values: np.ndarray,
+    grid_ids: np.ndarray,
+    time_ids: np.ndarray,
+    var_id: int,
+    resolution_id: int | None = None,
+) -> int:
+    """Insert the non-NaN values of a (time, latitude, longitude) array.
+
+    Args:
+        engine (engine.Engine): SQLAlchemy engine object.
+        values (np.ndarray): Values over (time, latitude, longitude).
+        grid_ids (np.ndarray): Grid point IDs over (latitude, longitude), -1
+            for grid points that are not in the database (skipped).
+        time_ids (np.ndarray): Time point IDs, one per time step.
+        var_id (int): Variable type ID.
+        resolution_id (int | None): Resolution group of the values, None for
+            variables with aggregation "subsample".
+
+    Returns:
+        int: Number of values inserted.
+    """
+    values = np.asarray(values)
+    if values.ndim != 3 or values.shape[1:] != grid_ids.shape:
+        raise ValueError(
+            f"Values of shape {values.shape} do not match the grid {grid_ids.shape}."
+        )
+    if len(time_ids) != values.shape[0]:
+        raise ValueError("One time point ID per time step is needed.")
+    total = 0
+    known = grid_ids >= 0
+    for t in range(values.shape[0]):
+        keep = known & np.isfinite(values[t])
+        n_rows = int(keep.sum())
+        if n_rows == 0:
+            continue
+        resolution = None
+        if resolution_id is not None:
+            resolution = np.full(n_rows, resolution_id)
+        total += copy_rows(
+            engine,
+            "var_value",
+            ["grid_id", "time_id", "var_id", "resolution_id", "value"],
+            [
+                (">i4", grid_ids[keep]),
+                (">i4", np.full(n_rows, time_ids[t])),
+                (">i2", np.full(n_rows, var_id)),
+                (">i2", resolution),
+                (">f4", values[t][keep]),
+            ],
+        )
+    return total
 
 
 def insert_var_values(
@@ -970,9 +1211,11 @@ def insert_var_values(
         raise ValueError(f"Variable {var_name} not found in var_type table.")
     _check_no_coverage(engine, var_id, var_name)
 
+    grid_ids = grid_id_array(ds.latitude.values, ds.longitude.values, grid_id_map)
+
     # grid points with a value at every time point: zeros there are not stored
     covered = ds[var_name].notnull().all("time").compute()
-    ds = ds.assign({var_name: drop_covered_zeros(ds[var_name], covered)})
+    data = drop_covered_zeros(ds[var_name], covered)
     n_covered = insert_var_coverage(
         engine,
         var_id,
@@ -980,24 +1223,27 @@ def insert_var_values(
         ds.longitude.values,
         covered.values,
         grid_id_map,
+        grid_ids=grid_ids,
     )
     print(f"Coverage of {var_name}: {n_covered} grid points.")
 
     print(f"Start inserting {var_name} values in streaming chunks...")
     t_start_insert = time.time()
 
-    generate_threaded_inserts(
-        VAR_TIME_CHUNK,
-        GRID_LAT_CHUNK,
-        GRID_LON_CHUNK,
-        ds,
-        var_name,
-        grid_id_map,
-        time_id_map,
-        var_id,
-        engine,
-    )
-    print("all threaded inserts completed.")
+    total = 0
+    n_time = data.sizes["time"]
+    for t0 in range(0, n_time, VAR_TIME_CHUNK):
+        chunk = data.isel(time=slice(t0, min(t0 + VAR_TIME_CHUNK, n_time)))
+        total += copy_var_values(
+            engine,
+            chunk.values,
+            grid_ids,
+            time_id_array(chunk.time.values, time_id_map),
+            var_id,
+        )
+        del chunk
+        gc.collect()
+    print(f"Values of {var_name} inserted. Total: {total}")
     return t_yearly_to_monthly, t_start_insert
 
 
@@ -1258,7 +1504,7 @@ def insert_var_coverage(
     covered: np.ndarray,
     grid_id_map: dict,
     resolution_id: int | None = None,
-    batch_size: int = 100_000,
+    grid_ids: np.ndarray | None = None,
 ) -> int:
     """Store the grid points where a variable has a value at every time point.
 
@@ -1271,31 +1517,27 @@ def insert_var_coverage(
         grid_id_map (dict): Mapping of (latitude, longitude) to grid point ID.
         resolution_id (int | None): Resolution group, None for variables with
             aggregation "subsample".
-        batch_size (int): Rows per insert statement.
+        grid_ids (np.ndarray | None): Grid point IDs of (lats, lons) from
+            `grid_id_array`, looked up from `grid_id_map` if None.
 
     Returns:
         int: Number of grid points stored.
     """
-    lat_i, lon_i = np.nonzero(covered)
-    rows = []
-    for i, j in zip(lat_i, lon_i):
-        grid_id = grid_id_map.get((_q(lats[i]), _q(lons[j])))
-        if grid_id is None:
-            print(f"Missing grid_id for ({lats[i]}, {lons[j]})")
-            continue
-        rows.append(
-            {
-                "var_id": int(var_id),
-                "resolution_id": None if resolution_id is None else int(resolution_id),
-                "grid_id": int(grid_id),
-            }
-        )
-    with engine.begin() as conn:
-        for start in range(0, len(rows), batch_size):
-            conn.execute(
-                VarCoverage.__table__.insert(), rows[start : start + batch_size]
-            )
-    return len(rows)
+    if grid_ids is None:
+        grid_ids = grid_id_array(lats, lons, grid_id_map)
+    keep = np.asarray(covered, dtype=bool) & (grid_ids >= 0)
+    n_rows = int(keep.sum())
+    resolution = None if resolution_id is None else np.full(n_rows, resolution_id)
+    return copy_rows(
+        engine,
+        "var_coverage",
+        ["var_id", "resolution_id", "grid_id"],
+        [
+            (">i2", np.full(n_rows, var_id)),
+            (">i2", resolution),
+            (">i4", grid_ids[keep]),
+        ],
+    )
 
 
 def insert_var_values_by_resolution(
@@ -1371,6 +1613,10 @@ def insert_var_values_by_resolution(
             raise ValueError(f"The mask for {var_name} is on a different grid.")
 
     _check_no_coverage(engine, var_id, var_name)
+    grid_ids = {
+        resolution_id: grid_id_array(plan["latitude"], plan["longitude"], grid_id_map)
+        for _, resolution_id, plan in plans
+    }
 
     def masked_chunks():
         n_time = data.sizes["time"]
@@ -1408,34 +1654,24 @@ def insert_var_values_by_resolution(
             covered[resolution_id],
             grid_id_map,
             resolution_id=resolution_id,
+            grid_ids=grid_ids[resolution_id],
         )
         print(f"Coverage of {var_name} at {resolution} degree: {n_covered} points.")
 
     # second pass: values, without the zeros at covered grid points
     total = 0
     for t0, times, values in masked_chunks():
+        time_ids = time_id_array(times, time_id_map)
         for resolution, resolution_id, plan in plans:
             coarse = values if plan["factor"] == 1 else block_mean(values, plan)
             coarse = apply_transform(coarse, transform, transform_floor)
             coarse = drop_covered_zeros(coarse, covered[resolution_id])
-            coarse_ds = xr.Dataset(
-                {var_name: (("time", "latitude", "longitude"), coarse)},
-                coords={
-                    "time": times,
-                    "latitude": plan["latitude"],
-                    "longitude": plan["longitude"],
-                },
-            )
-            total += generate_threaded_inserts(
-                VAR_TIME_CHUNK,
-                GRID_LAT_CHUNK,
-                GRID_LON_CHUNK,
-                coarse_ds,
-                var_name,
-                grid_id_map,
-                time_id_map,
-                var_id,
+            total += copy_var_values(
                 engine,
+                coarse,
+                grid_ids[resolution_id],
+                time_ids,
+                var_id,
                 resolution_id=resolution_id,
             )
             print(
@@ -1447,250 +1683,6 @@ def insert_var_values_by_resolution(
 
     print(f"Values of {var_name} inserted for all resolutions. Total: {total}")
     return total
-
-
-def generate_threaded_inserts(
-    t_chunk: int,
-    lat_chunk: int,
-    lon_chunk: int,
-    ds: xr.Dataset,
-    var_name: str,
-    grid_id_map: dict,
-    time_id_map: dict,
-    var_id: int,
-    engine: engine.Engine,
-    resolution_id: int | None = None,
-) -> int:
-    """Generate threaded inserts for variable values.
-
-    At most ``2 * MAX_WORKERS`` batches are queued at any time, so memory use
-    stays bounded and ``TIMEOUT`` applies to each wait for a free slot rather
-    than to the whole backlog.
-
-    Args:
-        t_chunk (int): Time chunk size.
-        lat_chunk (int): Latitude chunk size.
-        lon_chunk (int): Longitude chunk size.
-        ds (xr.Dataset): xarray dataset.
-        var_name (str): Variable name.
-        grid_id_map (dict): Grid ID map.
-        time_id_map (dict): Time ID map.
-        var_id (int): Variable ID.
-        engine (engine.Engine): SQLAlchemy engine object.
-        resolution_id (int | None): Resolution group the values belong to.
-            None (default) for variables that are not stored per resolution.
-    Returns:
-        int: Total number of variable values inserted.
-    """
-    max_pending = 2 * MAX_WORKERS
-    pending: set = set()
-    total_values_inserted = 0
-
-    def _raise_failures(done: set) -> None:
-        for future in done:
-            try:
-                future.result()  # Ensure exceptions are raised
-            except Exception as e:
-                print(f"Error in batch: {e}")
-                raise
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        for ds_chunk in _yield_chunks(ds, t_chunk, lat_chunk, lon_chunk):
-            var_values = _process_chunk(
-                ds_chunk, var_name, grid_id_map, time_id_map, var_id
-            )
-            if not var_values:
-                continue
-            if resolution_id is not None:
-                for entry in var_values:
-                    entry["resolution_id"] = int(resolution_id)
-
-            for i in range(0, len(var_values), BATCH_SIZE // 2):
-                if len(pending) >= max_pending:
-                    done, pending = wait(
-                        pending, timeout=TIMEOUT, return_when=FIRST_COMPLETED
-                    )
-                    if not done:
-                        raise TimeoutError(
-                            f"No insert batch finished within {TIMEOUT} s."
-                        )
-                    _raise_failures(done)
-                batch = var_values[i : i + BATCH_SIZE // 2]
-                pending.add(executor.submit(insert_batch, batch, engine, VarValue))
-                total_values_inserted += len(batch)
-            del var_values
-            gc.collect()
-
-        # Wait for the remaining futures to complete with timeout
-        print(f"Waiting for {len(pending)} remaining batches to complete...")
-        _raise_failures(
-            set(tqdm(as_completed(pending, timeout=TIMEOUT), total=len(pending)))
-        )
-
-    print(f"Values of {var_name} inserted. Total: {total_values_inserted}")
-    return total_values_inserted
-
-
-def _yield_chunks(
-    ds: xr.Dataset, t_chunk: int, lat_chunk: int, lon_chunk: int
-) -> Generator[xr.Dataset, None, None]:
-    """Yield chunks of the dataset."""
-    # the dimension is (time, latitude, longitude)
-    for t_idx in range(0, ds.sizes["time"], t_chunk):
-        for lat_idx in range(0, ds.sizes["latitude"], lat_chunk):
-            for lon_idx in range(0, ds.sizes["longitude"], lon_chunk):
-                t_end = min(t_idx + t_chunk, ds.sizes["time"])
-                lat_end = min(lat_idx + lat_chunk, ds.sizes["latitude"])
-                lon_end = min(lon_idx + lon_chunk, ds.sizes["longitude"])
-
-                yield ds.isel(
-                    time=slice(t_idx, t_end),
-                    latitude=slice(lat_idx, lat_end),
-                    longitude=slice(lon_idx, lon_end),
-                )
-
-
-def _process_chunk(
-    ds_chunk: xr.Dataset,
-    var_name: str,
-    grid_id_map: dict,
-    time_id_map: dict,
-    var_id: int,
-) -> list[dict]:
-    """Process a chunk of the dataset and return variable values for insertion."""
-    var_data = ds_chunk[var_name].load()
-    # drop all empty latitude rows
-    var_data = var_data.dropna(dim="latitude", how="all")
-    # skip inserting if the chunk is empty
-    if var_data.size == 0:
-        return []
-
-    # make sure time has the correct format for db insertion
-    # so that values can be requested correctly later
-    times = var_data.time.values.astype("datetime64[ns]")
-    lats = var_data.latitude.values
-    lons = var_data.longitude.values
-    values = var_data.values
-
-    # skip insertion if chunk is somehow corrupted
-    # I think this case should not happen
-    # maybe this is where the values go missing
-    if values.ndim != 3:
-        return []
-
-    return get_var_values_mapping(
-        times, time_id_map, grid_id_map, var_id, lats, lons, values
-    )
-
-
-def _build_var_value_entry(
-    grid_id: int, time_id: int, var_id: int, value: float
-) -> dict:
-    """Build a single variable value entry dictionary for database insertion.
-
-    Args:
-        grid_id: Grid point ID.
-        time_id: Time point ID.
-        var_id: Variable type ID.
-        value: Variable value.
-
-    Returns:
-        Dictionary with keys: grid_id, time_id, var_id, value.
-    """
-    return {
-        "grid_id": int(grid_id),
-        "time_id": int(time_id),
-        "var_id": int(var_id),
-        "value": float(value),
-    }
-
-
-def _process_time_point(
-    t_i: int,
-    t_val: np.datetime64,
-    time_id_map: dict,
-    grid_id_map: dict,
-    var_id: int,
-    lats: np.ndarray,
-    lons: np.ndarray,
-    values: np.ndarray,
-) -> list[dict]:
-    """Process a single time point and return variable value entries.
-
-    Args:
-        t_i: Time index.
-        t_val: Time value (datetime64).
-        time_id_map: Mapping of datetime64 to time point ID.
-        grid_id_map: Mapping of (latitude, longitude) to grid point ID.
-        var_id: Variable type ID.
-        lats: Array of latitudes.
-        lons: Array of longitudes.
-        values: 3D array of variable values (time, lat, lon).
-
-    Returns:
-        List of variable value entry dictionaries.
-    """
-    time_key = _normalize_time_key(t_val)
-    time_id = time_id_map.get(time_key)
-    if time_id is None:
-        print(
-            f"Missing time_id for {time_key}. Available keys sample: {list(time_id_map.keys())[:5]}"
-        )
-        return []
-
-    var_values = []
-    for lat_i in range(len(lats)):
-        lat_val = _q(lats[lat_i])
-        for lon_i in range(len(lons)):
-            lon_val = _q(lons[lon_i])
-            val = float(values[t_i, lat_i, lon_i])
-
-            if np.isnan(val):
-                continue
-
-            grid_id = grid_id_map.get((lat_val, lon_val))
-            if grid_id is None:
-                print(f"Missing grid_id for ({lat_val}, {lon_val})")
-                continue
-
-            var_values.append(_build_var_value_entry(grid_id, time_id, var_id, val))
-
-    return var_values
-
-
-def get_var_values_mapping(
-    times: np.ndarray,
-    time_id_map: dict,
-    grid_id_map: dict,
-    var_id: int,
-    lats: np.ndarray,
-    lons: np.ndarray,
-    values: np.ndarray,
-) -> list[dict]:
-    """Get variable values mapping for database insertion.
-
-    Args:
-        times (np.ndarray): Array of time points.
-        time_id_map (dict): Mapping of datetime64 to time point ID.
-        grid_id_map (dict): Mapping of (latitude, longitude) to grid point ID.
-        var_id (int): Variable type ID.
-        lats (np.ndarray): Array of latitudes.
-        lons (np.ndarray): Array of longitudes.
-        values (np.ndarray): Array of variable values.
-    Returns:
-        list[dict]: List of variable values mapping for database insertion.
-    """
-    var_values = []
-    # Loop order: time, lat, lon to match xarray dimension order (time, latitude, longitude)
-    for t_i in range(len(times)):
-        entries = _process_time_point(
-            t_i, times[t_i], time_id_map, grid_id_map, var_id, lats, lons, values
-        )
-        var_values.extend(entries)
-
-    del var_id, times, lats, lons, values
-    gc.collect()
-    return var_values
 
 
 def get_var_value(
@@ -2339,10 +2331,18 @@ def get_grid_ids_in_nuts(
     if nuts_regions.empty:
         return []
 
-    sql = """
-    SELECT id, point as geometry
+    # the points are built from latitude/longitude, and only for the grid
+    # points in the bounding box of the regions, not for the whole grid
+    west, south, east, north = nuts_regions.to_crs(epsg=CRS).total_bounds
+    sql = text(f"""
+    SELECT id,
+        ST_SetSRID(
+            ST_MakePoint(longitude::float8, latitude::float8), {CRS}
+        ) AS geometry
     FROM grid_point
-    """
+    WHERE latitude BETWEEN :south AND :north
+        AND longitude BETWEEN :west AND :east
+    """)
 
     # turn the grid points into a GeoDataFrame
     grid_points_gdf = gpd.read_postgis(
@@ -2350,7 +2350,16 @@ def get_grid_ids_in_nuts(
         engine,
         geom_col="geometry",
         crs=f"EPSG:{CRS!s}",
+        params={
+            "south": float(south),
+            "north": float(north),
+            "west": float(west),
+            "east": float(east),
+        },
     )
+    if grid_points_gdf.empty:
+        return []
+    nuts_regions = nuts_regions.to_crs(epsg=CRS)
 
     # filter grid points that intersect with NUTS regions
     filtered_grid_points_gdf = gpd.sjoin(
