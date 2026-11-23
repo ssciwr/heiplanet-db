@@ -26,7 +26,7 @@ db_url = os.environ.get("DB_URL")
 # because the engine is created before the tests are run.
 if not db_url:
     raise ValueError("DB_URL environment variable is not set.")
-engine = create_engine(db_url)
+engine = create_engine(db.normalize_db_url(db_url))
 
 # get the IP address from the environment variable
 ip_address = os.environ.get("IP_ADDRESS")
@@ -59,7 +59,8 @@ allowed_origins = [
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    db.initialize_database(db_url, replace=False)
+    # schema upgrades are left to the production runner (see initialize_database)
+    db.initialize_database(db_url, replace=False, upgrade=False)
     yield
 
 
