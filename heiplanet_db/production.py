@@ -425,51 +425,148 @@ def fetch_files(data: dict, config: dict, data_level: str) -> list[Path]:
     """
     filenames = _as_list(data.get("filename"))
     urls = _as_list(data.get("url"))
-    filehashes = _as_list(data.get("filehash"))
-
-    def _check_lengths(*items: tuple[str, list]) -> None:
-        for key, values in items:
-            if len(filenames) > 1 and values and len(values) != len(filenames):
-                raise ValueError(f"{key} must list one entry per file for {filenames}.")
-
     if "local" in data.get("host", ""):
-        if len(urls) == 1 and Path(urls[0]).is_dir():
-            paths = [(Path(urls[0]) / f).resolve() for f in filenames]
-        elif urls:
-            _check_lengths(("url", urls))
-            paths = [Path(u).resolve() for u in urls]
-        else:
-            paths = [
-                (Path(config["datalake"][data_level]) / f).resolve() for f in filenames
-            ]
-        missing = [str(p) for p in paths if not p.is_file()]
-        if missing:
-            raise FileNotFoundError(f"Local data files not found: {missing}")
-        print(f"Using local files {[str(p) for p in paths]}.")
-        return paths
+        return _local_files(filenames, urls, Path(config["datalake"][data_level]))
+    filehashes = _as_list(data.get("filehash"))
+    _check_lengths(filenames, url=urls, filehash=filehashes)
+    return [
+        _fetch_file(
+            data,
+            config,
+            data_level,
+            filename,
+            url=_entry_for_file(urls, i, len(filenames)),
+            filehash=_entry_for_file(filehashes, i, len(filenames)),
+        )
+        for i, filename in enumerate(filenames)
+    ]
 
-    _check_lengths(("url", urls), ("filehash", filehashes))
 
-    paths = []
-    for i, filename in enumerate(filenames):
-        path = (Path(config["datalake"][data_level]) / filename).resolve()
-        if path.is_file():
-            print(
-                f"File {filename} already exists in the data lake "
-                f"at level {data_level}, skipping download."
-            )
-        else:
-            entry = dict(data)
-            entry["filename"] = filename
-            if urls:
-                entry["url"] = urls[i] if len(filenames) > 1 else urls[0]
-            if filehashes:
-                entry["filehash"] = (
-                    filehashes[i] if len(filenames) > 1 else filehashes[0]
-                )
-            get_data_files(entry, config, data_level)
-        paths.append(path)
+def _check_lengths(filenames: list, **lists: list) -> None:
+    """With several files, each given list must have one entry per file."""
+    for key, values in lists.items():
+        if len(filenames) > 1 and values and len(values) != len(filenames):
+            raise ValueError(f"{key} must list one entry per file for {filenames}.")
+
+
+def _entry_for_file(values: list, i: int, n_files: int):
+    """The entry of a per-file config list for file `i` (None if not given)."""
+    if not values:
+        return None
+    return values[i] if n_files > 1 else values[0]
+
+
+def _local_files(filenames: list, urls: list, datalake_dir: Path) -> list[Path]:
+    """Paths of local files: from `urls` (files or one folder), else the data lake."""
+    if len(urls) == 1 and Path(urls[0]).is_dir():
+        paths = [(Path(urls[0]) / f).resolve() for f in filenames]
+    elif urls:
+        _check_lengths(filenames, url=urls)
+        paths = [Path(u).resolve() for u in urls]
+    else:
+        paths = [(datalake_dir / f).resolve() for f in filenames]
+    missing = [str(p) for p in paths if not p.is_file()]
+    if missing:
+        raise FileNotFoundError(f"Local data files not found: {missing}")
+    print(f"Using local files {[str(p) for p in paths]}.")
     return paths
+
+
+def _fetch_file(
+    data: dict,
+    config: dict,
+    data_level: str,
+    filename: str,
+    url: str | None,
+    filehash: str | None,
+) -> Path:
+    """Download one file into the data lake unless it is already there."""
+    path = (Path(config["datalake"][data_level]) / filename).resolve()
+    if path.is_file():
+        print(
+            f"File {filename} already exists in the data lake "
+            f"at level {data_level}, skipping download."
+        )
+        return path
+    entry = dict(data)
+    entry["filename"] = filename
+    if url is not None:
+        entry["url"] = url
+    if filehash is not None:
+        entry["filehash"] = filehash
+    get_data_files(entry, config, data_level)
+    return path
+
+
+def _resolve_config_path(config_path: str | None) -> str | None:
+    """Prefer an explicit path, then $CONFIG_FILE, then the container mount.
+
+    None means the package default config.
+    """
+    if config_path is not None:
+        return config_path
+    env_config = os.getenv("CONFIG_FILE")
+    if env_config:
+        return env_config
+    if Path("/heiplanet_db/production.yaml").is_file():
+        return "/heiplanet_db/production.yaml"
+    return None
+
+
+def _collect_var(
+    var: dict,
+    paths: list[Path],
+    grid_vars: list[GridVar],
+    nuts_vars: list[NutsVar],
+) -> Path | None:
+    """Register one `var_name` entry of the config.
+
+    Gridded and NUTS variables are appended to `grid_vars` / `nuts_vars`. For a
+    NUTS definition, the shapefile archive is extracted.
+
+    Returns:
+        Path | None: The extracted shapefile folder for a definition, else None.
+    """
+    var_type = var.get("type")
+    if var_type in DEFINITION_TYPES:
+        # extract file and set the path to the NUTS shapefiles
+        shapefile_path = paths[0]
+        shapefile_folder_path = shapefile_path.with_suffix("")
+        with zipfile.ZipFile(shapefile_path, "r") as zip_ref:
+            print(f"Extracting zip archive to {shapefile_folder_path}.")
+            zip_ref.extractall(shapefile_folder_path)
+        return shapefile_folder_path
+    if var_type in GRID_TYPES:
+        grid_vars.append(
+            GridVar(
+                name=var["name"],
+                paths=paths,
+                aggregation=var.get("aggregation", "subsample"),
+                mask_by=var.get("mask_by"),
+                source_name=var.get("source_variable"),
+                transform=var.get("transform"),
+                transform_floor=float(var.get("transform_floor", 1.0)),
+            )
+        )
+        print(f"Gridded data for {var['name']}: {[str(p) for p in paths]}")
+        return None
+    if var_type in NUTS_TYPES:
+        if len(paths) != 1:
+            raise ValueError(f"NUTS data for {var['name']} must be a single file.")
+        nuts_vars.append(
+            NutsVar(
+                name=var["name"],
+                path=paths[0],
+                source_name=var.get("source_variable"),
+                transform=var.get("transform"),
+                transform_floor=float(var.get("transform_floor", 1.0)),
+            )
+        )
+        print(f"NUTS data for {var['name']}: {paths[0]}")
+        return None
+    raise ValueError(
+        f"Unknown type {var_type} for {var.get('name')} in the configuration."
+    )
 
 
 def main(drop_tables: bool = False, config_path: str | None = None) -> None:
@@ -490,16 +587,8 @@ def main(drop_tables: bool = False, config_path: str | None = None) -> None:
             container path `/heiplanet_db/production.yaml` if available; otherwise
             falls back to the built-in default config. Defaults to None.
     """
-    # determine configuration path, preferring an explicit argument, then env var,
-    # then the default container mount path; finally fall back to package default
-    if config_path is None:
-        env_config = os.getenv("CONFIG_FILE")
-        if env_config:
-            config_path = env_config
-        elif Path("/heiplanet_db/production.yaml").is_file():
-            config_path = "/heiplanet_db/production.yaml"
     # set up production database and data lake using the provided config
-    config = read_production_config(config_path)
+    config = read_production_config(_resolve_config_path(config_path))
     shapefile_folder_path = None
     grid_vars: list[GridVar] = []
     nuts_vars: list[NutsVar] = []
@@ -512,50 +601,10 @@ def main(drop_tables: bool = False, config_path: str | None = None) -> None:
         # set the data level, default to bronze if not specified
         data_level = data["var_name"][0].get("level", "bronze")
         paths = fetch_files(data, config, data_level)
-
         for var in data["var_name"]:
-            var_type = var.get("type")
-            if var_type in DEFINITION_TYPES:
-                # extract file and set the path to the NUTS shapefiles
-                shapefile_path = paths[0]
-                # make sure the shapefile folder is unzipped
-                shapefile_folder_path = shapefile_path.with_suffix("")
-                with zipfile.ZipFile(shapefile_path, "r") as zip_ref:
-                    print(f"Extracting zip archive to {shapefile_folder_path}.")
-                    zip_ref.extractall(shapefile_folder_path)
-            elif var_type in GRID_TYPES:
-                grid_vars.append(
-                    GridVar(
-                        name=var["name"],
-                        paths=paths,
-                        aggregation=var.get("aggregation", "subsample"),
-                        mask_by=var.get("mask_by"),
-                        source_name=var.get("source_variable"),
-                        transform=var.get("transform"),
-                        transform_floor=float(var.get("transform_floor", 1.0)),
-                    )
-                )
-                print(f"Gridded data for {var['name']}: {[str(p) for p in paths]}")
-            elif var_type in NUTS_TYPES:
-                if len(paths) != 1:
-                    raise ValueError(
-                        f"NUTS data for {var['name']} must be a single file."
-                    )
-                nuts_vars.append(
-                    NutsVar(
-                        name=var["name"],
-                        path=paths[0],
-                        source_name=var.get("source_variable"),
-                        transform=var.get("transform"),
-                        transform_floor=float(var.get("transform_floor", 1.0)),
-                    )
-                )
-                print(f"NUTS data for {var['name']}: {paths[0]}")
-            else:
-                raise ValueError(
-                    f"Unknown type {var_type} for {var.get('name')} in the "
-                    "configuration."
-                )
+            shapefile_folder_path = (
+                _collect_var(var, paths, grid_vars, nuts_vars) or shapefile_folder_path
+            )
     # now the files are in the silver stage, feed into database
     if not shapefile_folder_path:
         raise ValueError(

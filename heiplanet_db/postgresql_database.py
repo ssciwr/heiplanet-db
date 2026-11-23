@@ -38,6 +38,12 @@ from sqlalchemy.orm.session import Session, sessionmaker
 from sqlalchemy.schema import AddConstraint
 
 CRS = 4326
+# foreign key targets
+GRID_POINT_ID = "grid_point.id"
+TIME_POINT_ID = "time_point.id"
+VAR_TYPE_ID = "var_type.id"
+RESOLUTION_GROUP_ID = "resolution_group.id"
+NUTS_DEF_ID = "nuts_def.nuts_id"
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "10000"))
 VAR_TIME_CHUNK = int(os.environ.get("VAR_TIME_CHUNK", "6"))
 GRID_LAT_CHUNK = int(os.environ.get("GRID_LAT_CHUNK", "45"))
@@ -194,25 +200,25 @@ class VarValue(Base):
         ),
         ForeignKeyConstraint(
             ["grid_id"],
-            ["grid_point.id"],
+            [GRID_POINT_ID],
             name="fk_grid_id",
             ondelete="CASCADE",
         ),
         ForeignKeyConstraint(
             ["time_id"],
-            ["time_point.id"],
+            [TIME_POINT_ID],
             name="fk_time_id",
             ondelete="CASCADE",
         ),
         ForeignKeyConstraint(
             ["var_id"],
-            ["var_type.id"],
+            [VAR_TYPE_ID],
             name="fk_var_id",
             ondelete="CASCADE",
         ),
         ForeignKeyConstraint(
             ["resolution_id"],
-            ["resolution_group.id"],
+            [RESOLUTION_GROUP_ID],
             name="fk_resolution_id",
             ondelete="CASCADE",
         ),
@@ -252,17 +258,17 @@ class VarCoverage(Base):
             postgresql_nulls_not_distinct=True,
         ),
         ForeignKeyConstraint(
-            ["var_id"], ["var_type.id"], name="fk_coverage_var_id", ondelete="CASCADE"
+            ["var_id"], [VAR_TYPE_ID], name="fk_coverage_var_id", ondelete="CASCADE"
         ),
         ForeignKeyConstraint(
             ["resolution_id"],
-            ["resolution_group.id"],
+            [RESOLUTION_GROUP_ID],
             name="fk_coverage_resolution_id",
             ondelete="CASCADE",
         ),
         ForeignKeyConstraint(
             ["grid_id"],
-            ["grid_point.id"],
+            [GRID_POINT_ID],
             name="fk_coverage_grid_id",
             ondelete="CASCADE",
         ),
@@ -278,28 +284,28 @@ class VarValueNuts(Base):
     __tablename__ = "var_value_nuts"
 
     id: Mapped[int] = mapped_column(BigInteger(), primary_key=True, autoincrement=True)
-    nuts_id: Mapped[String] = mapped_column(String(), ForeignKey("nuts_def.nuts_id"))
-    time_id: Mapped[int] = mapped_column(Integer(), ForeignKey("time_point.id"))
-    var_id: Mapped[int] = mapped_column(Integer(), ForeignKey("var_type.id"))
+    nuts_id: Mapped[String] = mapped_column(String(), ForeignKey(NUTS_DEF_ID))
+    time_id: Mapped[int] = mapped_column(Integer(), ForeignKey(TIME_POINT_ID))
+    var_id: Mapped[int] = mapped_column(Integer(), ForeignKey(VAR_TYPE_ID))
     value: Mapped[float] = mapped_column(Float())
 
     __table_args__ = (
         UniqueConstraint("time_id", "nuts_id", "var_id", name="uq_time_nuts_var"),
         ForeignKeyConstraint(
             ["nuts_id"],
-            ["nuts_def.nuts_id"],
+            [NUTS_DEF_ID],
             name="fk_nuts_id",
             ondelete="CASCADE",
         ),
         ForeignKeyConstraint(
             ["time_id"],
-            ["time_point.id"],
+            [TIME_POINT_ID],
             name="fk_time_id_nuts",
             ondelete="CASCADE",
         ),
         ForeignKeyConstraint(
             ["var_id"],
-            ["var_type.id"],
+            [VAR_TYPE_ID],
             name="fk_var_id_nuts",
             ondelete="CASCADE",
         ),
@@ -327,10 +333,10 @@ class GridPointResolution(Base):
     __tablename__ = "grid_point_resolution"
 
     grid_id: Mapped[int] = mapped_column(
-        Integer(), ForeignKey("grid_point.id"), primary_key=True
+        Integer(), ForeignKey(GRID_POINT_ID), primary_key=True
     )
     resolution_id: Mapped[int] = mapped_column(
-        Integer(), ForeignKey("resolution_group.id"), primary_key=True
+        Integer(), ForeignKey(RESOLUTION_GROUP_ID), primary_key=True
     )
 
 
@@ -1292,7 +1298,8 @@ def apply_transform(values, transform: str | None, floor: float = 1.0):
         raise ValueError(
             f"Unknown transform {transform}; use one of {sorted(TRANSFORMS)}."
         )
-    if not floor > 0:
+    # also rejects NaN
+    if not np.isfinite(floor) or floor <= 0:
         raise ValueError("The floor for a log10 transform must be > 0.")
     # np.maximum keeps NaN (np.fmax would replace it by the floor)
     return np.log10(np.maximum(values, floor))
@@ -1540,6 +1547,99 @@ def insert_var_coverage(
     )
 
 
+def _resolution_plans(
+    lats: np.ndarray,
+    lons: np.ndarray,
+    resolution_id_map: dict[float, int],
+    var_name: str,
+) -> list[tuple[float, int, dict]]:
+    """Aggregation plans for the resolution groups that fit the data grid.
+
+    Args:
+        lats (np.ndarray): Latitudes of the data.
+        lons (np.ndarray): Longitudes of the data.
+        resolution_id_map (dict[float, int]): Mapping of resolution to group ID.
+        var_name (str): Variable name, for messages.
+
+    Returns:
+        list[tuple[float, int, dict]]: (resolution, resolution_id, plan), finest
+            first. The first one is always the native resolution.
+    """
+    plans = []
+    for resolution, resolution_id in sorted(resolution_id_map.items()):
+        plan = _block_mean_plan(lats, lons, resolution)
+        if plan is None:
+            print(
+                f"Skipping {resolution} degree resolution for {var_name}: "
+                "not a multiple of the data grid step."
+            )
+            continue
+        plans.append((resolution, resolution_id, plan))
+    if not plans or plans[0][2]["factor"] != 1:
+        raise ValueError(
+            f"No resolution group matches the grid step of {var_name}; "
+            "add it to the resolution groups."
+        )
+    return plans
+
+
+def _align_mask(
+    mask: xr.DataArray | None, lats: np.ndarray, lons: np.ndarray, var_name: str
+) -> xr.DataArray | None:
+    """Order a mask as (time, latitude, longitude) and check its grid."""
+    if mask is None:
+        return None
+    mask = mask.transpose("time", "latitude", "longitude")
+    if not (
+        np.array_equal(mask.latitude.values, lats)
+        and np.array_equal(mask.longitude.values, lons)
+    ):
+        raise ValueError(f"The mask for {var_name} is on a different grid.")
+    return mask
+
+
+def _masked_chunks(data: xr.DataArray, mask: xr.DataArray | None, var_name: str):
+    """Yield (first time index, times, float64 values) per chunk of time steps.
+
+    Values where `mask` is False are set to NaN.
+    """
+    n_time = data.sizes["time"]
+    for t0 in range(0, n_time, VAR_TIME_CHUNK):
+        chunk = data.isel(time=slice(t0, min(t0 + VAR_TIME_CHUNK, n_time)))
+        times = chunk.time.values
+        values = chunk.values.astype(np.float64)
+        if mask is not None:
+            try:
+                mask_values = mask.sel(time=times).values.astype(bool)
+            except KeyError as e:
+                raise ValueError(
+                    f"The mask for {var_name} does not cover all time points."
+                ) from e
+            values = np.where(mask_values, values, np.nan)
+        yield t0, times, values
+
+
+def _coverage_by_resolution(
+    data: xr.DataArray,
+    mask: xr.DataArray | None,
+    plans: list[tuple[float, int, dict]],
+    var_name: str,
+) -> dict[int, np.ndarray]:
+    """Coarse cells that have a value at every time point, per resolution ID."""
+    covered = {
+        resolution_id: np.ones(
+            (len(plan["latitude"]), len(plan["longitude"])), dtype=bool
+        )
+        for _, resolution_id, plan in plans
+    }
+    for _, _, values in _masked_chunks(data, mask, var_name):
+        valid = np.isfinite(values)
+        for _, resolution_id, plan in plans:
+            for valid_t in valid:
+                covered[resolution_id] &= block_valid(valid_t, plan)
+    return covered
+
+
 def insert_var_values_by_resolution(
     engine: engine.Engine,
     ds: xr.Dataset,
@@ -1588,29 +1688,8 @@ def insert_var_values_by_resolution(
     lats = data.latitude.values
     lons = data.longitude.values
 
-    plans = []
-    for resolution, resolution_id in sorted(resolution_id_map.items()):
-        plan = _block_mean_plan(lats, lons, resolution)
-        if plan is None:
-            print(
-                f"Skipping {resolution} degree resolution for {var_name}: "
-                "not a multiple of the data grid step."
-            )
-            continue
-        plans.append((resolution, resolution_id, plan))
-    if not plans or plans[0][2]["factor"] != 1:
-        raise ValueError(
-            f"No resolution group matches the grid step of {var_name}; "
-            "add it to the resolution groups."
-        )
-
-    if mask is not None:
-        mask = mask.transpose("time", "latitude", "longitude")
-        if not (
-            np.array_equal(mask.latitude.values, lats)
-            and np.array_equal(mask.longitude.values, lons)
-        ):
-            raise ValueError(f"The mask for {var_name} is on a different grid.")
+    plans = _resolution_plans(lats, lons, resolution_id_map, var_name)
+    mask = _align_mask(mask, lats, lons, var_name)
 
     _check_no_coverage(engine, var_id, var_name)
     grid_ids = {
@@ -1618,33 +1697,8 @@ def insert_var_values_by_resolution(
         for _, resolution_id, plan in plans
     }
 
-    def masked_chunks():
-        n_time = data.sizes["time"]
-        for t0 in range(0, n_time, VAR_TIME_CHUNK):
-            chunk = data.isel(time=slice(t0, min(t0 + VAR_TIME_CHUNK, n_time)))
-            times = chunk.time.values
-            values = chunk.values.astype(np.float64)
-            if mask is not None:
-                try:
-                    mask_values = mask.sel(time=times).values.astype(bool)
-                except KeyError as e:
-                    raise ValueError(
-                        f"The mask for {var_name} does not cover all time points."
-                    ) from e
-                values = np.where(mask_values, values, np.nan)
-            yield t0, times, values
-
     # first pass: coarse cells that have a value at every time point
-    covered = {
-        resolution_id: np.ones(
-            (len(plan["latitude"]), len(plan["longitude"])), dtype=bool
-        )
-        for _, resolution_id, plan in plans
-    }
-    for _, _, values in masked_chunks():
-        for _, resolution_id, plan in plans:
-            for t in range(values.shape[0]):
-                covered[resolution_id] &= block_valid(np.isfinite(values[t]), plan)
+    covered = _coverage_by_resolution(data, mask, plans, var_name)
     for resolution, resolution_id, plan in plans:
         n_covered = insert_var_coverage(
             engine,
@@ -1660,7 +1714,7 @@ def insert_var_values_by_resolution(
 
     # second pass: values, without the zeros at covered grid points
     total = 0
-    for t0, times, values in masked_chunks():
+    for t0, times, values in _masked_chunks(data, mask, var_name):
         time_ids = time_id_array(times, time_id_map)
         for resolution, resolution_id, plan in plans:
             coarse = values if plan["factor"] == 1 else block_mean(values, plan)

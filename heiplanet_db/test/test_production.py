@@ -451,20 +451,18 @@ def test_main():
         pytest.fail(f"Main function raised an exception: {e}")
 
 
-def test_autovacuum_restoration_on_failure(get_engine_with_tables):
+def test_autovacuum_restoration_on_failure(get_engine_with_tables, monkeypatch):
     engine = get_engine_with_tables
 
     # Mock insert_grid_var_values to raise an exception
-    with (
-        patch(
-            "heiplanet_db.production.insert_grid_var_values",
-            side_effect=RuntimeError("Insertion failed"),
-        ),
-        pytest.raises(RuntimeError, match="Insertion failed"),
-    ):
-        prod.load_data_with_optimization(
-            engine, grid_vars=[prod.GridVar("R0", [Path("dummy.nc")])]
-        )
+    grid_vars = [prod.GridVar("R0", [Path("dummy.nc")])]
+    monkeypatch.setattr(
+        prod,
+        "insert_grid_var_values",
+        MagicMock(side_effect=RuntimeError("Insertion failed")),
+    )
+    with pytest.raises(RuntimeError, match="Insertion failed"):
+        prod.load_data_with_optimization(engine, grid_vars=grid_vars)
 
     # Verify autovacuum is enabled for all tables
     with engine.connect() as conn:
@@ -485,7 +483,9 @@ def test_autovacuum_restoration_on_failure(get_engine_with_tables):
                 )
 
 
-def test_failed_load_with_bad_data_keeps_original_error(get_engine_with_tables):
+def test_failed_load_with_bad_data_keeps_original_error(
+    get_engine_with_tables, monkeypatch
+):
     """If the constraints cannot be restored after a failed load, the load's
     own error is raised and autovacuum is still re-enabled."""
     engine = get_engine_with_tables
@@ -501,17 +501,11 @@ def test_failed_load_with_bad_data_keeps_original_error(get_engine_with_tables):
             )
         raise RuntimeError("Insertion failed")
 
+    grid_vars = [prod.GridVar("R0", [Path("dummy.nc")])]
     try:
-        with (
-            patch(
-                "heiplanet_db.production.insert_grid_var_values",
-                side_effect=insert_bad_row_and_fail,
-            ),
-            pytest.raises(RuntimeError, match="Insertion failed"),
-        ):
-            prod.load_data_with_optimization(
-                engine, grid_vars=[prod.GridVar("R0", [Path("dummy.nc")])]
-            )
+        monkeypatch.setattr(prod, "insert_grid_var_values", insert_bad_row_and_fail)
+        with pytest.raises(RuntimeError, match="Insertion failed"):
+            prod.load_data_with_optimization(engine, grid_vars=grid_vars)
 
         with engine.connect() as conn:
             for table in ["grid_point", "time_point", "var_value", "var_value_nuts"]:
@@ -533,7 +527,9 @@ def test_failed_load_with_bad_data_keeps_original_error(get_engine_with_tables):
         prod.db.add_bulk_load_constraints(engine)
 
 
-def test_constraint_error_after_successful_load_is_raised(get_engine_with_tables):
+def test_constraint_error_after_successful_load_is_raised(
+    get_engine_with_tables, monkeypatch
+):
     engine = get_engine_with_tables
 
     def insert_bad_row(*_args, **_kwargs):
@@ -545,17 +541,11 @@ def test_constraint_error_after_successful_load_is_raised(get_engine_with_tables
                 )
             )
 
+    grid_vars = [prod.GridVar("R0", [Path("dummy.nc")])]
     try:
-        with (
-            patch(
-                "heiplanet_db.production.insert_grid_var_values",
-                side_effect=insert_bad_row,
-            ),
-            pytest.raises(Exception, match="fk_"),
-        ):
-            prod.load_data_with_optimization(
-                engine, grid_vars=[prod.GridVar("R0", [Path("dummy.nc")])]
-            )
+        monkeypatch.setattr(prod, "insert_grid_var_values", insert_bad_row)
+        with pytest.raises(Exception, match="fk_"):
+            prod.load_data_with_optimization(engine, grid_vars=grid_vars)
         with engine.connect() as conn:
             reloptions = conn.execute(
                 text("SELECT reloptions FROM pg_class WHERE relname = 'var_value'")
@@ -843,16 +833,15 @@ def test_open_grid_dataset_multi_file(tmp_path: Path):
     ds = prod.open_grid_dataset(prod.GridVar("adults", paths))
     assert ds["adults"].dims == ("time", "latitude", "longitude")
     assert ds.sizes["time"] == 4
+    eggs = prod.GridVar("eggs", paths)
     with pytest.raises(ValueError, match="not found"):
-        prod.open_grid_dataset(prod.GridVar("eggs", paths))
+        prod.open_grid_dataset(eggs)
 
 
 def test_insert_grid_var_values_mask_by_unknown(tmp_path: Path):
+    grid_vars = [prod.GridVar("adults", [], aggregation="mean", mask_by="R0")]
     with pytest.raises(ValueError, match="masked by R0"):
-        prod.insert_grid_var_values(
-            engine=None,
-            grid_vars=[prod.GridVar("adults", [], aggregation="mean", mask_by="R0")],
-        )
+        prod.insert_grid_var_values(engine=None, grid_vars=grid_vars)
 
 
 def test_insert_grid_var_values_different_grids(tmp_path: Path):
@@ -861,14 +850,12 @@ def test_insert_grid_var_values_different_grids(tmp_path: Path):
 
     with xr.open_dataset(paths[0]) as ds:
         ds.isel(latitude=slice(0, 4)).to_netcdf(tmp_path / "small.nc")
+    grid_vars = [
+        prod.GridVar("R0", [r0_path]),
+        prod.GridVar("adults", [tmp_path / "small.nc"]),
+    ]
     with pytest.raises(ValueError, match="different grid"):
-        prod.insert_grid_var_values(
-            engine=None,
-            grid_vars=[
-                prod.GridVar("R0", [r0_path]),
-                prod.GridVar("adults", [tmp_path / "small.nc"]),
-            ],
-        )
+        prod.insert_grid_var_values(engine=None, grid_vars=grid_vars)
 
 
 def test_insert_grid_var_values_end_to_end(get_engine_with_tables, tmp_path):

@@ -395,8 +395,7 @@ def test_extract_time_point():
         np.datetime64("2023-02-01 00:00:00"): (2023, 2, 1),
     }
     for time_point, expected_data in time_points.items():
-        year, month, day, _, _, _ = postdb.extract_time_point(time_point)
-        assert (year, month, day) == expected_data
+        assert postdb.extract_time_point(time_point)[:3] == expected_data
 
 
 def test_extract_time_point_invalid():
@@ -1367,8 +1366,9 @@ def test__to_time_lat_lon():
     assert out["adults"].dims == ("time", "latitude", "longitude")
     with pytest.raises(ValueError, match="not found"):
         postdb._to_time_lat_lon(ds, "missing")
+    ds_no_time = ds.isel(time=0, drop=True)
     with pytest.raises(ValueError, match="must have dims"):
-        postdb._to_time_lat_lon(ds.isel(time=0, drop=True), "adults")
+        postdb._to_time_lat_lon(ds_no_time, "adults")
 
 
 def test_insert_var_values_transposes_lon_lat_time(monkeypatch):
@@ -1929,7 +1929,8 @@ def test_block_valid_and_drop_covered_zeros():
     np.testing.assert_array_equal(np.isnan(out), [[[True, False]], [[False, False]]])
     da = xr.DataArray(np.array([[[0.0, 0.0]]]), dims=("time", "lat", "lon"))
     out = postdb.drop_covered_zeros(da, xr.DataArray(covered, dims=("lat", "lon")))
-    assert np.isnan(out.values[0, 0, 0]) and out.values[0, 0, 1] == 0.0
+    assert np.isnan(out.values[0, 0, 0])
+    assert out.values[0, 0, 1] == 0.0
 
 
 def _zeros_ds(var_name):
