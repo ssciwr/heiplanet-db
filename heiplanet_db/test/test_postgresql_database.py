@@ -13,6 +13,7 @@ from sqlalchemy.orm.session import Session
 from testcontainers.postgres import PostgresContainer
 
 from heiplanet_db import postgresql_database as postdb
+from heiplanet_db import tiles
 
 # for local docker desktop,
 # environ["DOCKER_HOST"] is "unix:///home/[user]/.docker/desktop/docker.sock"
@@ -2098,3 +2099,158 @@ def test_download_fills_covered_zeros(get_engine_with_tables, get_session, tmp_p
     with xr.open_dataset(out) as result:
         got = result["adults"].sel(latitude=ds.latitude, longitude=ds.longitude)
         np.testing.assert_array_equal(got.values, ds["adults"].values)
+
+
+# --- tiled storage ---------------------------------------------------------
+
+
+def _seed_tiles(session, engine, ds, aggregation, tile_size=2, **kwargs):
+    """Insert var type, time points, resolution groups and `adults` as tiles."""
+    postdb.insert_var_types(
+        session,
+        [{"name": "adults", "unit": "-", "aggregation": aggregation}],
+    )
+    postdb.insert_time_points(session, [(ds.time.values, False)])
+    postdb.insert_resolution_groups(session, resolutions=np.array([0.1, 0.2, 0.25]))
+    _, time_id_map, var_id_map = postdb.get_id_maps(session)
+    resolution_id_map = postdb.get_resolution_id_map(session)
+    total = postdb.insert_var_tiles(
+        engine,
+        ds,
+        "adults",
+        time_id_map,
+        var_id_map,
+        resolution_id_map,
+        aggregation=aggregation,
+        tile_size=tile_size,
+        **kwargs,
+    )
+    return total, resolution_id_map
+
+
+def _read_tiles(session, resolution_id, time_id=1):
+    grid = session.get(postdb.GridDefinition, resolution_id).to_grid()
+    rows = session.execute(
+        text(
+            "SELECT tile_row, tile_col, data FROM var_tile "
+            "WHERE resolution_id = :r AND time_id = :t"
+        ),
+        {"r": resolution_id, "t": time_id},
+    ).all()
+    return grid, tiles.tiles_to_array(
+        rows, grid.tile_size, 0, grid.n_lat, 0, grid.n_lon
+    )
+
+
+def test_var_tile_schema(get_engine_with_tables, get_session):
+    compression = get_session.execute(
+        text(
+            "SELECT attcompression FROM pg_attribute "
+            "WHERE attrelid = 'var_tile'::regclass AND attname = 'data'"
+        )
+    ).scalar()
+    assert compression == "l"  # lz4
+    # values decoded in SQL match numpy's float32
+    expected = np.array([1.0, -2.0, 0.15625, 1e-40, np.inf, 3.4e38], dtype="<f4")
+    got = get_session.execute(
+        text("SELECT tile_value(:d, k) FROM generate_series(0, 5) AS k ORDER BY k"),
+        {"d": expected.tobytes()},
+    ).scalars()
+    np.testing.assert_array_equal(np.array(list(got), dtype="<f4"), expected)
+    nan = get_session.execute(
+        text("SELECT tile_value(:d, 0) = 'NaN'::real"),
+        {"d": np.array([np.nan], dtype="<f4").tobytes()},
+    ).scalar()
+    assert nan
+
+
+def test_insert_var_tiles_mean(get_engine_with_tables, get_session):
+    ds = _fine_grid_ds(lon_lat_time=True)
+    mask = xr.ones_like(ds["adults"], dtype=bool)
+    mask[{"longitude": 4, "latitude": 0}] = False  # (lat 0.4, lon 0.4)
+    total, resolution_id_map = _seed_tiles(
+        get_session,
+        get_engine_with_tables,
+        ds,
+        "mean",
+        mask=mask,
+        transform="log10",
+    )
+    # 0.1: 5x5 cells in 3x3 tiles of 2, but the corner tile holds only the
+    # masked cell and is skipped; 0.2: 3x3 cells in 2x2 tiles; per time step
+    assert total == 2 * (8 + 4)
+
+    values = ds["adults"].transpose("time", "latitude", "longitude").values
+    values = np.where(
+        mask.transpose("time", "latitude", "longitude").values, values, np.nan
+    )
+    plan = postdb._block_mean_plan(ds.latitude.values, ds.longitude.values, 0.2)
+    expected = np.log10(postdb.block_mean(values, plan))
+
+    grid, native = _read_tiles(get_session, resolution_id_map[0.1])
+    assert (grid.n_lat, grid.n_lon, grid.tile_size) == (5, 5, 2)
+    np.testing.assert_allclose([grid.lat0, grid.lon0, grid.step], [0.0, 0.0, 0.1])
+    # stored with ascending latitude
+    np.testing.assert_allclose(native, np.log10(values[0, ::-1]), rtol=1e-6)
+    assert np.isnan(native[4, 4])
+
+    grid, coarse = _read_tiles(get_session, resolution_id_map[0.2], time_id=2)
+    assert (grid.n_lat, grid.n_lon, grid.step) == (3, 3, 0.2)
+    np.testing.assert_allclose(coarse, expected[1, ::-1], rtol=1e-6)
+    # 0.25 is not a multiple of 0.1: no grid, no tiles
+    assert get_session.get(postdb.GridDefinition, resolution_id_map[0.25]) is None
+
+    # the debug view returns one row per value
+    rows = get_session.execute(
+        text(
+            "SELECT latitude, longitude, value FROM var_value_v "
+            "WHERE resolution_id = :r AND time_id = 1"
+        ),
+        {"r": resolution_id_map[0.1]},
+    ).all()
+    assert len(rows) == 24
+    lookup = {(float(la), float(lo)): v for la, lo, v in rows}
+    np.testing.assert_allclose(lookup[(0.2, 0.3)], np.log10(values[0, 2, 3]), rtol=1e-6)
+
+    # a variable on another grid is rejected
+    shifted = ds.assign_coords(longitude=ds.longitude + 1.0)
+    get_session.execute(text("UPDATE var_type SET name = 'other'"))
+    get_session.commit()
+    with pytest.raises(ValueError, match="differs from the stored one"):
+        postdb.insert_var_tiles(
+            get_engine_with_tables,
+            shifted.rename({"adults": "other"}),
+            "other",
+            {},
+            {"other": 1},
+            resolution_id_map,
+        )
+
+
+def test_insert_var_tiles_subsample(get_engine_with_tables, get_session):
+    ds = _fine_grid_ds()
+    total, resolution_id_map = _seed_tiles(
+        get_session, get_engine_with_tables, ds, "subsample", tile_size=100
+    )
+    # one tile per resolution and time step
+    assert total == 2 * 2
+    values = ds["adults"].values
+    _, native = _read_tiles(get_session, resolution_id_map[0.1], time_id=2)
+    np.testing.assert_array_equal(native, values[1, ::-1])
+    # every second point, ascending: latitudes 0.0, 0.2, 0.4
+    _, coarse = _read_tiles(get_session, resolution_id_map[0.2])
+    np.testing.assert_array_equal(coarse, values[0, ::-2][:, ::2])
+
+
+def test_insert_var_tiles_errors(get_engine_with_tables):
+    ds = _fine_grid_ds()
+    with pytest.raises(ValueError, match="Unknown aggregation"):
+        postdb.insert_var_tiles(
+            get_engine_with_tables, ds, "adults", {}, {}, {}, aggregation="sum"
+        )
+    with pytest.raises(ValueError, match="not found in var_type"):
+        postdb.insert_var_tiles(get_engine_with_tables, ds, "adults", {}, {}, {})
+    with pytest.raises(ValueError, match="No resolution group matches"):
+        postdb.insert_var_tiles(
+            get_engine_with_tables, ds, "adults", {}, {"adults": 1}, {0.2: 1}
+        )

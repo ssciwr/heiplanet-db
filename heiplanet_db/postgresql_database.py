@@ -15,12 +15,14 @@ import xarray as xr
 from fastapi import HTTPException
 from geoalchemy2 import Geometry, WKBElement
 from sqlalchemy import (
+    DDL,
     REAL,
     BigInteger,
     Float,
     ForeignKey,
     ForeignKeyConstraint,
     Integer,
+    LargeBinary,
     Numeric,
     SmallInteger,
     String,
@@ -28,6 +30,7 @@ from sqlalchemy import (
     and_,
     create_engine,
     engine,
+    event,
     func,
     or_,
     text,
@@ -36,6 +39,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.orm.session import Session, sessionmaker
 from sqlalchemy.schema import AddConstraint
+
+from heiplanet_db import tiles
 
 CRS = 4326
 # foreign key targets
@@ -49,6 +54,8 @@ VAR_TIME_CHUNK = int(os.environ.get("VAR_TIME_CHUNK", "6"))
 GRID_LAT_CHUNK = int(os.environ.get("GRID_LAT_CHUNK", "45"))
 GRID_LON_CHUNK = int(os.environ.get("GRID_LON_CHUNK", "360"))
 ROUND_DIGITS = int(os.environ.get("ROUND_DIGITS", "4"))
+# how gridded values are stored, see `VarTile` and `resolve_storage`
+STORAGES = {"rows", "tiles"}
 
 
 def _q(value):
@@ -338,6 +345,119 @@ class GridPointResolution(Base):
     resolution_id: Mapped[int] = mapped_column(
         Integer(), ForeignKey(RESOLUTION_GROUP_ID), primary_key=True
     )
+
+
+class GridDefinition(Base):
+    """The regular grid of one resolution group, for tiled storage.
+
+    Grid points are implicit: cell (i, j) lies at
+    (lat0 + i * step, lon0 + j * step), both axes ascending. See
+    `heiplanet_db.tiles.GridDef`.
+    """
+
+    __tablename__ = "grid_def"
+
+    resolution_id: Mapped[int] = mapped_column(
+        SmallInteger(),
+        ForeignKey(RESOLUTION_GROUP_ID, ondelete="CASCADE"),
+        primary_key=True,
+    )
+    lat0: Mapped[float] = mapped_column(Float(), nullable=False)
+    lon0: Mapped[float] = mapped_column(Float(), nullable=False)
+    step: Mapped[float] = mapped_column(Float(), nullable=False)
+    n_lat: Mapped[int] = mapped_column(Integer(), nullable=False)
+    n_lon: Mapped[int] = mapped_column(Integer(), nullable=False)
+    tile_size: Mapped[int] = mapped_column(SmallInteger(), nullable=False)
+
+    def to_grid(self) -> tiles.GridDef:
+        return tiles.GridDef(
+            lat0=self.lat0,
+            lon0=self.lon0,
+            step=self.step,
+            n_lat=self.n_lat,
+            n_lon=self.n_lon,
+            tile_size=self.tile_size,
+        )
+
+
+class VarTile(Base):
+    """Values of a variable on one tile of a grid at one time point.
+
+    `data` holds tile_size × tile_size float32 values (little endian,
+    row-major, see `heiplanet_db.tiles`), NaN where there is no data. Tiles
+    without any data are not stored. PostgreSQL compresses the column with lz4.
+    """
+
+    __tablename__ = "var_tile"
+
+    var_id: Mapped[int] = mapped_column(
+        SmallInteger(), ForeignKey(VAR_TYPE_ID, ondelete="CASCADE"), primary_key=True
+    )
+    resolution_id: Mapped[int] = mapped_column(
+        SmallInteger(),
+        ForeignKey("grid_def.resolution_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    time_id: Mapped[int] = mapped_column(
+        Integer(), ForeignKey(TIME_POINT_ID, ondelete="CASCADE"), primary_key=True
+    )
+    tile_row: Mapped[int] = mapped_column(SmallInteger(), primary_key=True)
+    tile_col: Mapped[int] = mapped_column(SmallInteger(), primary_key=True)
+    data: Mapped[bytes] = mapped_column(LargeBinary(), nullable=False)
+
+
+# Decodes value k of a tile (float32, little endian) in SQL, for the debug
+# view below. Slow, but only meant for ad-hoc inspection.
+_TILE_VALUE_FUNCTION = """
+CREATE OR REPLACE FUNCTION tile_value(data bytea, k integer) RETURNS real
+LANGUAGE sql IMMUTABLE STRICT AS $$
+    SELECT CASE
+        WHEN e = 255 AND m = 0 THEN
+            (CASE WHEN s = 1 THEN '-Infinity' ELSE 'Infinity' END)::real
+        WHEN e = 255 THEN 'NaN'::real
+        WHEN e = 0 THEN ((1 - 2 * s) * m * 2.0::float8 ^ (-149))::real
+        ELSE ((1 - 2 * s) * (1 + m / 8388608.0::float8)
+              * 2.0::float8 ^ (e - 127))::real
+    END
+    FROM (
+        SELECT (b >> 31) & 1 AS s, (b >> 23) & 255 AS e, b & 8388607 AS m
+        FROM (
+            -- | and << have the same precedence in PostgreSQL
+            SELECT get_byte(data, 4 * k)::bigint
+                | (get_byte(data, 4 * k + 1)::bigint << 8)
+                | (get_byte(data, 4 * k + 2)::bigint << 16)
+                | (get_byte(data, 4 * k + 3)::bigint << 24) AS b
+        ) AS raw
+    ) AS parts
+$$;
+"""
+
+# One row per stored value, like the old var_value table. For debugging only.
+# (DDL formats the statement with %, hence the %% for the modulo operator.)
+_VAR_VALUE_VIEW = """
+CREATE OR REPLACE VIEW var_value_v AS
+SELECT t.var_id, t.resolution_id, t.time_id,
+       round((g.lat0 + i * g.step)::numeric, 4) AS latitude,
+       round((g.lon0 + j * g.step)::numeric, 4) AS longitude,
+       tile_value(t.data, c.k) AS value
+FROM var_tile t
+JOIN grid_def g USING (resolution_id)
+CROSS JOIN LATERAL generate_series(0, g.tile_size * g.tile_size - 1) AS c(k)
+CROSS JOIN LATERAL (
+    SELECT t.tile_row * g.tile_size + c.k / g.tile_size AS i,
+           t.tile_col * g.tile_size + c.k %% g.tile_size AS j
+) AS cell
+WHERE i < g.n_lat AND j < g.n_lon AND tile_value(t.data, c.k) <> 'NaN'::real;
+"""
+
+event.listen(
+    VarTile.__table__,
+    "after_create",
+    DDL("ALTER TABLE var_tile ALTER COLUMN data SET COMPRESSION lz4"),
+)
+event.listen(VarTile.__table__, "after_create", DDL(_TILE_VALUE_FUNCTION))
+event.listen(VarTile.__table__, "after_create", DDL(_VAR_VALUE_VIEW))
+event.listen(VarTile.__table__, "before_drop", DDL("DROP VIEW IF EXISTS var_value_v"))
 
 
 def install_postgis(engine: engine.Engine):
@@ -1745,6 +1865,225 @@ def insert_var_values_by_resolution(
     return total
 
 
+def _ascending(
+    values: np.ndarray, lats: np.ndarray, lons: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Flip a (..., lat, lon) array so that both axes are ascending."""
+    if len(lats) > 1 and lats[0] > lats[-1]:
+        values, lats = values[..., ::-1, :], lats[::-1]
+    if len(lons) > 1 and lons[0] > lons[-1]:
+        values, lons = values[..., ::-1], lons[::-1]
+    return values, lats, lons
+
+
+def _plan_grid(plan: dict, resolution: float, tile_size: int) -> tiles.GridDef:
+    """The grid of a resolution plan, both axes ascending."""
+    lats = np.sort(plan["latitude"].astype(np.float64))
+    lons = np.sort(plan["longitude"].astype(np.float64))
+    return tiles.grid_def_from_coords(
+        lats, lons, step=float(resolution), tile_size=tile_size
+    )
+
+
+def ensure_grid_defs(engine: engine.Engine, grids: dict[int, tiles.GridDef]) -> None:
+    """Store the grid of each resolution group, or check the stored one.
+
+    All gridded variables must share one grid per resolution group.
+
+    Args:
+        engine (engine.Engine): SQLAlchemy engine object.
+        grids (dict[int, tiles.GridDef]): Grid per resolution group ID.
+    """
+    with engine.begin() as conn:
+        for resolution_id, grid in grids.items():
+            stored = conn.execute(
+                text(
+                    "SELECT lat0, lon0, step, n_lat, n_lon, tile_size "
+                    "FROM grid_def WHERE resolution_id = :r"
+                ),
+                {"r": int(resolution_id)},
+            ).first()
+            if stored is None:
+                conn.execute(
+                    text(
+                        "INSERT INTO grid_def "
+                        "(resolution_id, lat0, lon0, step, n_lat, n_lon, tile_size) "
+                        "VALUES (:r, :lat0, :lon0, :step, :n_lat, :n_lon, :ts)"
+                    ),
+                    {
+                        "r": int(resolution_id),
+                        "lat0": grid.lat0,
+                        "lon0": grid.lon0,
+                        "step": grid.step,
+                        "n_lat": grid.n_lat,
+                        "n_lon": grid.n_lon,
+                        "ts": grid.tile_size,
+                    },
+                )
+                continue
+            stored_grid = tiles.GridDef(*stored)
+            same = np.allclose(
+                [stored_grid.lat0, stored_grid.lon0, stored_grid.step],
+                [grid.lat0, grid.lon0, grid.step],
+                atol=tiles.COORD_ATOL,
+            ) and (stored_grid.n_lat, stored_grid.n_lon, stored_grid.tile_size) == (
+                grid.n_lat,
+                grid.n_lon,
+                grid.tile_size,
+            )
+            if not same:
+                raise ValueError(
+                    f"The grid of resolution group {resolution_id} differs from "
+                    f"the stored one: {grid} vs. {stored_grid}. All gridded "
+                    "variables must share one grid."
+                )
+
+
+def copy_var_tiles(
+    engine: engine.Engine,
+    var_id: int,
+    resolution_id: int,
+    time_ids: np.ndarray,
+    values: np.ndarray,
+    tile_size: int,
+) -> int:
+    """Cut (time, lat, lon) values into tiles and store them with a binary COPY.
+
+    Args:
+        engine (engine.Engine): SQLAlchemy engine object.
+        var_id (int): Variable type ID.
+        resolution_id (int): Resolution group ID.
+        time_ids (np.ndarray): Time point ID per entry of the first axis.
+        values (np.ndarray): Values on the full grid of the resolution group,
+            both axes ascending, NaN where there is no data.
+        tile_size (int): Cells per tile side.
+
+    Returns:
+        int: Number of tiles stored.
+    """
+    t_ids, rows, cols, blobs = [], [], [], []
+    for time_id, values_t in zip(time_ids, values):
+        for tile_row, tile_col, blob in tiles.array_to_tiles(values_t, tile_size):
+            t_ids.append(time_id)
+            rows.append(tile_row)
+            cols.append(tile_col)
+            blobs.append(blob)
+    n_tiles = len(blobs)
+    if n_tiles == 0:
+        return 0
+    # all tiles have the same size, so they fit a fixed-size numpy type
+    blob_dtype = f"V{tile_size * tile_size * tiles.TILE_DTYPE.itemsize}"
+    return copy_rows(
+        engine,
+        "var_tile",
+        ["var_id", "resolution_id", "time_id", "tile_row", "tile_col", "data"],
+        [
+            (">i2", np.full(n_tiles, var_id)),
+            (">i2", np.full(n_tiles, resolution_id)),
+            (">i4", np.array(t_ids)),
+            (">i2", np.array(rows)),
+            (">i2", np.array(cols)),
+            (blob_dtype, np.frombuffer(b"".join(blobs), dtype=blob_dtype)),
+        ],
+    )
+
+
+def insert_var_tiles(
+    engine: engine.Engine,
+    ds: xr.Dataset,
+    var_name: str,
+    time_id_map: dict,
+    var_id_map: dict,
+    resolution_id_map: dict[float, int],
+    aggregation: str = "subsample",
+    mask: xr.DataArray | None = None,
+    transform: str | None = None,
+    transform_floor: float = 1.0,
+    tile_size: int = tiles.DEFAULT_TILE_SIZE,
+) -> int:
+    """Insert a gridded variable as tiles, at every fitting resolution group.
+
+    For every resolution group that is an integer multiple of the data's grid
+    step, the values are computed on that group's grid and stored as tiles
+    (see `VarTile`): by taking every n-th grid point (aggregation
+    "subsample") or the area-weighted mean over each coarse cell (aggregation
+    "mean"). The grid of each group is stored in `grid_def` (or checked
+    against the stored one). No grid points are needed.
+
+    Args:
+        engine (engine.Engine): SQLAlchemy engine object.
+        ds (xr.Dataset): Dataset with `var_name` over (time, latitude, longitude),
+            in any dimension order.
+        var_name (str): Name of the variable to insert.
+        time_id_map (dict): Mapping of datetime64 to time point ID.
+        var_id_map (dict): Mapping of variable name to variable type ID.
+        resolution_id_map (dict[float, int]): Mapping of resolution to group ID.
+        aggregation (str): "subsample" or "mean". Defaults to "subsample".
+        mask (xr.DataArray | None): Boolean (time, latitude, longitude) array on
+            the same grid. Cells where it is False are set to NaN first, e.g.
+            to drop ocean cells. Defaults to None.
+        transform (str | None): Transform applied after aggregating, see
+            `apply_transform`. Means are always taken over the original values.
+        transform_floor (float): Floor for the transform. Defaults to 1.
+        tile_size (int): Cells per tile side.
+
+    Returns:
+        int: Total number of tiles inserted over all resolutions.
+    """
+    if aggregation not in ("subsample", "mean"):
+        raise ValueError(f"Unknown aggregation {aggregation} for {var_name}.")
+    # fail early, before any data is read
+    apply_transform(np.array([1.0]), transform, transform_floor)
+    var_id = var_id_map.get(var_name)
+    if var_id is None:
+        raise ValueError(f"Variable {var_name} not found in var_type table.")
+    data = _to_time_lat_lon(ds, var_name)[var_name]
+    lats = data.latitude.values
+    lons = data.longitude.values
+
+    plans = _resolution_plans(lats, lons, resolution_id_map, var_name)
+    mask = _align_mask(mask, lats, lons, var_name)
+    grids = {
+        resolution_id: _plan_grid(plan, resolution, tile_size)
+        for resolution, resolution_id, plan in plans
+    }
+    ensure_grid_defs(engine, grids)
+    strides = {
+        resolution_id: (
+            _coarse_indices(lats, resolution),
+            _coarse_indices(lons, resolution),
+        )
+        for resolution, resolution_id, plan in plans
+        if plan["factor"] > 1
+    }
+
+    total = 0
+    for t0, times, values in _masked_chunks(data, mask, var_name):
+        time_ids = time_id_array(times, time_id_map)
+        for resolution, resolution_id, plan in plans:
+            if plan["factor"] == 1:
+                coarse = values
+            elif aggregation == "mean":
+                coarse = block_mean(values, plan)
+            else:
+                lat_idx, lon_idx = strides[resolution_id]
+                coarse = values[:, lat_idx][:, :, lon_idx]
+            coarse = apply_transform(coarse, transform, transform_floor)
+            coarse, _, _ = _ascending(coarse, plan["latitude"], plan["longitude"])
+            total += copy_var_tiles(
+                engine, var_id, resolution_id, time_ids, coarse, tile_size
+            )
+            print(
+                f"{var_name}: inserted {resolution} degree tiles for time "
+                f"indices {t0}:{t0 + len(times)}."
+            )
+        del values
+        gc.collect()
+
+    print(f"Tiles of {var_name} inserted for all resolutions. Total: {total}")
+    return total
+
+
 def get_var_value(
     session: Session,
     var_name: str,
@@ -1754,6 +2093,7 @@ def get_var_value(
     month: int,
     day: int,
     resolution: float | None = None,
+    storage: str | None = None,
 ) -> float | int | str | None:
     """Get variable value from the database.
 
@@ -1768,11 +2108,16 @@ def get_var_value(
         resolution (float | None): Grid resolution in degrees, only used for
             variables stored per resolution. If None, the finest available
             resolution is returned. Defaults to None.
+        storage (str | None): "rows" or "tiles", see `resolve_storage`.
 
     Returns:
         float | int | str | None: Value of the variable at
             the specified grid point and time point.
     """
+    if resolve_storage(session, storage) == "tiles":
+        return get_var_value_tiles(
+            session, var_name, lat, lon, year, month, day, resolution
+        )
     if day != 1:
         print(
             "The current database only supports monthly data."
@@ -2076,6 +2421,7 @@ def get_var_values_cartesian(
     grid_resolution: float = 0.1,
     area: None | tuple[float, float, float, float] = None,
     var_name: None | str = None,
+    storage: str | None = None,
 ) -> dict:
     """Get variable values for a cartesian map.
 
@@ -2088,10 +2434,15 @@ def get_var_values_cartesian(
             If None, all grid points are used.
         var_name (None | str): Variable name for which values should be returned.
          If None, the default model values will be returned.
+        storage (str | None): "rows" or "tiles", see `resolve_storage`.
 
     Returns:
         dict: a dict with (latitude, longitude, var_value) for the requested date.
     """
+    if resolve_storage(session, storage) == "tiles":
+        return get_var_values_cartesian_tiles(
+            session, time_point, grid_resolution, area, var_name
+        )
     # get the time points and their ids
     date_object = (
         session.query(TimePoint)
@@ -2213,6 +2564,7 @@ def get_var_values_cartesian_for_download(
     area: None | tuple[float, float, float, float] = None,
     var_names: None | list[str] = None,
     netcdf_file: str = "cartesian_grid_data_heiplanet.nc",
+    storage: str | None = None,
 ) -> dict:
     """Get variable values for a cartesian map.
 
@@ -2227,11 +2579,16 @@ def get_var_values_cartesian_for_download(
         var_names (None | List[str]): List of variable names to filter by.
             If None, all variable types are used.
         netcdf_file (str): Name of the NetCDF file to save the dataset.
+        storage (str | None): "rows" or "tiles", see `resolve_storage`.
 
     Returns:
         dict: a dict with (time, latitude, longitude, var_value) keys.
             time or var_value is empty if no data is found.
     """
+    if resolve_storage(session, storage) == "tiles":
+        return get_var_values_cartesian_for_download_tiles(
+            session, start_time_point, end_time_point, area, var_names, netcdf_file
+        )
     # get the time points and their ids
     time_points = get_time_points(session, start_time_point, end_time_point)
 
@@ -2352,6 +2709,315 @@ def get_var_values_cartesian_for_download(
     ds.to_netcdf(netcdf_file)
     print(f"Dataset saved to {netcdf_file}")
 
+    return {"response": "Dataset created successfully.", "netcdf_file": netcdf_file}
+
+
+# --- tiled storage: read path ----------------------------------------------
+
+
+def resolve_storage(session: Session, storage: str | None = None) -> str:
+    """Decide whether gridded values are read from tiles or from rows.
+
+    Args:
+        session (Session): SQLAlchemy session object.
+        storage (str | None): "tiles" or "rows". If None, the environment
+            variable STORAGE is used; if that is not set either, "tiles" if
+            any grid definition is stored, else "rows".
+
+    Returns:
+        str: "tiles" or "rows".
+    """
+    storage = storage or os.environ.get("STORAGE") or None
+    if storage is None:
+        has_tiles = session.execute(text("SELECT 1 FROM grid_def LIMIT 1")).first()
+        storage = "tiles" if has_tiles else "rows"
+    if storage not in STORAGES:
+        raise ValueError(f"Unknown storage {storage}; use one of {sorted(STORAGES)}.")
+    return storage
+
+
+def get_grid_def(session: Session, resolution_id: int) -> tiles.GridDef | None:
+    """The stored grid of a resolution group, None if there is none."""
+    row = session.get(GridDefinition, resolution_id)
+    return None if row is None else row.to_grid()
+
+
+def _finest_tile_resolution_id(session: Session, var_id: int) -> int | None:
+    """Finest resolution group that has tiles of a variable."""
+    row = session.execute(
+        text(
+            """
+            SELECT g.resolution_id
+            FROM grid_def g
+            JOIN resolution_group r ON r.id = g.resolution_id
+            WHERE EXISTS (
+                SELECT 1 FROM var_tile t
+                WHERE t.var_id = :v AND t.resolution_id = g.resolution_id
+            )
+            ORDER BY r.resolution
+            LIMIT 1
+            """
+        ),
+        {"v": int(var_id)},
+    ).first()
+    return None if row is None else row[0]
+
+
+def read_tile_values(
+    session: Session,
+    var_id: int,
+    resolution_id: int,
+    time_ids: list[int],
+    grid: tiles.GridDef,
+    index_range: tuple[int, int, int, int],
+) -> np.ndarray:
+    """Values of a variable on a block of cells, from the tiles, in one query.
+
+    Args:
+        session (Session): SQLAlchemy session object.
+        var_id (int): Variable type ID.
+        resolution_id (int): Resolution group ID.
+        time_ids (list[int]): Time point IDs.
+        grid (tiles.GridDef): Grid of the resolution group.
+        index_range (tuple[int, int, int, int]): Cells
+            (i_start, i_stop, j_start, j_stop), see `tiles.area_to_index_range`.
+
+    Returns:
+        np.ndarray: float32 array (time, lat, lon), both axes ascending, NaN
+            where there is no data.
+    """
+    i0, i1, j0, j1 = index_range
+    r0, r1, c0, c1 = tiles.tile_range(grid, i0, i1, j0, j1)
+    rows = session.execute(
+        text(
+            """
+            SELECT time_id, tile_row, tile_col, data FROM var_tile
+            WHERE var_id = :v AND resolution_id = :r AND time_id = ANY(:t)
+                AND tile_row >= :r0 AND tile_row < :r1
+                AND tile_col >= :c0 AND tile_col < :c1
+            """
+        ),
+        {
+            "v": int(var_id),
+            "r": int(resolution_id),
+            "t": [int(t) for t in time_ids],
+            "r0": r0,
+            "r1": r1,
+            "c0": c0,
+            "c1": c1,
+        },
+    ).all()
+    by_time: dict[int, list] = {int(t): [] for t in time_ids}
+    for time_id, tile_row, tile_col, data in rows:
+        by_time[time_id].append((tile_row, tile_col, data))
+    return np.stack(
+        [
+            tiles.tiles_to_array(by_time[int(t)], grid.tile_size, i0, i1, j0, j1)
+            for t in time_ids
+        ]
+    )
+
+
+def get_var_value_tiles(
+    session: Session,
+    var_name: str,
+    lat: float,
+    lon: float,
+    year: int,
+    month: int,
+    day: int,
+    resolution: float | None = None,
+) -> float | None:
+    """`get_var_value` for tiled storage. Same arguments and results."""
+    if day != 1:
+        print(
+            "The current database only supports monthly data."
+            "Retieving data for the first day of the month..."
+        )
+        day = 1
+    var_type = session.query(VarType).filter(VarType.name == var_name).first()
+    if var_type is None:
+        return None
+    # "subsample" values are the same at every resolution that has the point;
+    # like the row storage, the native value is returned whatever is asked
+    if resolution is None or var_type.aggregation == "subsample":
+        resolution_id = _finest_tile_resolution_id(session, var_type.id)
+    else:
+        resolution_id = get_resolution_id(session, resolution)
+    if resolution_id is None:
+        return None
+    grid = get_grid_def(session, resolution_id)
+    time_point = (
+        session.query(TimePoint.id)
+        .filter(TimePoint.year == year, TimePoint.month == month, TimePoint.day == day)
+        .first()
+    )
+    if grid is None or time_point is None:
+        return None
+    cell = tiles.cell_index(grid, lat, lon)
+    if cell is None:
+        return None
+    i, j = cell
+    value = read_tile_values(
+        session, var_type.id, resolution_id, [time_point.id], grid, (i, i + 1, j, j + 1)
+    )[0, 0, 0]
+    return None if np.isnan(value) else float(value)
+
+
+def get_var_values_cartesian_tiles(
+    session: Session,
+    time_point: tuple[int, int],
+    grid_resolution: float = 0.1,
+    area: None | tuple[float, float, float, float] = None,
+    var_name: None | str = None,
+) -> dict:
+    """`get_var_values_cartesian` for tiled storage. Same arguments and results."""
+    date_object = (
+        session.query(TimePoint)
+        .filter((TimePoint.year == time_point[0]) & (TimePoint.month == time_point[1]))
+        .first()
+    )
+    if not date_object:
+        print("No time point found for the specified date.")
+        raise HTTPException(status_code=400, detail="Missing data for requested date.")
+
+    resolution_id = get_resolution_id(session=session, resolution=grid_resolution)
+    if not resolution_id:
+        print("No resolution id found for requested resolution.")
+        raise HTTPException(
+            status_code=400, detail="No id found for specified resolution."
+        )
+
+    grid = get_grid_def(session, resolution_id)
+    index_range = None if grid is None else tiles.area_to_index_range(grid, area)
+    if index_range is None:
+        print(
+            "No grid points found in the specified area or with the specified resolution."
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="No grid points found in specified area or with the specified resolution.",
+        )
+
+    if not var_name:
+        var_name = "t2m"  # default variable name
+    var_type = session.query(VarType).filter(VarType.name == var_name).first()
+    if not var_type:
+        print("No variable type found for the specified name.")
+        raise HTTPException(
+            status_code=400, detail="Missing variable type for requested time point."
+        )
+
+    values = read_tile_values(
+        session, var_type.id, resolution_id, [date_object.id], grid, index_range
+    )[0]
+    i0, i1, j0, j1 = index_range
+    lat_idx, lon_idx = np.nonzero(~np.isnan(values))
+    # ordered by latitude, then longitude, like the row storage
+    lats = np.round(grid.latitudes(i0, i1), ROUND_DIGITS)[lat_idx]
+    lons = np.round(grid.longitudes(j0, j1), ROUND_DIGITS)[lon_idx]
+    values_list = list(
+        zip(lats.tolist(), lons.tolist(), values[lat_idx, lon_idx].tolist())
+    )
+    return {"latitude, longitude, var_value": values_list}
+
+
+def get_var_values_cartesian_for_download_tiles(
+    session: Session,
+    start_time_point: tuple[int, int],
+    end_time_point: tuple[int, int] | None = None,
+    area: None | tuple[float, float, float, float] = None,
+    var_names: None | list[str] = None,
+    netcdf_file: str = "cartesian_grid_data_heiplanet.nc",
+) -> dict:
+    """`get_var_values_cartesian_for_download` for tiled storage.
+
+    Same arguments and results. Every variable is exported at its finest
+    resolution, on the grid of the finest stored resolution.
+    """
+    time_points = sorted(
+        get_time_points(session, start_time_point, end_time_point),
+        key=lambda tp: (tp.year, tp.month, tp.day),
+    )
+    if not time_points:
+        print("No time points found in the specified range.")
+        raise HTTPException(
+            status_code=400, detail="Missing data for requested time point."
+        )
+    time_values = np.asarray(
+        [
+            np.datetime64(pd.Timestamp(year=tp.year, month=tp.month, day=1), "ns")
+            for tp in time_points
+        ],
+        dtype="datetime64[ns]",
+    )
+    time_ids = [tp.id for tp in time_points]
+
+    # the finest stored grid gives the coordinates of the dataset
+    finest = (
+        session.query(GridDefinition)
+        .join(ResolutionGroup, ResolutionGroup.id == GridDefinition.resolution_id)
+        .order_by(ResolutionGroup.resolution.asc())
+        .first()
+    )
+    out_grid = None if finest is None else finest.to_grid()
+    out_range = None if out_grid is None else tiles.area_to_index_range(out_grid, area)
+    if out_range is None:
+        print("No grid points found in the specified area.")
+        raise HTTPException(
+            status_code=400, detail="No grid points found in specified area."
+        )
+    oi0, oi1, oj0, oj1 = out_range
+    latitudes = np.round(out_grid.latitudes(oi0, oi1), ROUND_DIGITS)
+    longitudes = np.round(out_grid.longitudes(oj0, oj1), ROUND_DIGITS)
+
+    var_types = get_var_types(session, var_names)
+    if not var_types:
+        print("No variable types found in the specified names.")
+        raise HTTPException(
+            status_code=400, detail="Missing variable type for requested time point."
+        )
+
+    ds = xr.Dataset(
+        coords={
+            "time": ("time", time_values),
+            "latitude": ("latitude", latitudes),
+            "longitude": ("longitude", longitudes),
+        }
+    )
+    for vt in var_types:
+        values_array = np.full(
+            (len(time_values), len(latitudes), len(longitudes)), np.nan
+        )
+        resolution_id = _finest_tile_resolution_id(session, vt.id)
+        grid = None if resolution_id is None else get_grid_def(session, resolution_id)
+        index_range = None if grid is None else tiles.area_to_index_range(grid, area)
+        if index_range is not None:
+            values = read_tile_values(
+                session, vt.id, resolution_id, time_ids, grid, index_range
+            )
+            i0, i1, j0, j1 = index_range
+            # positions of this variable's cells on the output grid
+            rows = np.round(
+                (grid.latitudes(i0, i1) - latitudes[0]) / out_grid.step
+            ).astype(int)
+            cols = np.round(
+                (grid.longitudes(j0, j1) - longitudes[0]) / out_grid.step
+            ).astype(int)
+            keep_r = (rows >= 0) & (rows < len(latitudes))
+            keep_c = (cols >= 0) & (cols < len(longitudes))
+            values_array[:, rows[keep_r][:, None], cols[keep_c][None, :]] = values[
+                :, keep_r
+            ][:, :, keep_c]
+        ds[vt.name] = (("time", "latitude", "longitude"), values_array)
+        ds[vt.name].attrs["unit"] = vt.unit
+        ds[vt.name].attrs["description"] = vt.description
+
+    ds.attrs["source"] = "OneHealth Database"
+    ds.attrs["created_at"] = pd.Timestamp.now().isoformat()
+    ds.attrs["description"] = "Variable values for a cartesian map from the database."
+    ds.to_netcdf(netcdf_file)
+    print(f"Dataset saved to {netcdf_file}")
     return {"response": "Dataset created successfully.", "netcdf_file": netcdf_file}
 
 

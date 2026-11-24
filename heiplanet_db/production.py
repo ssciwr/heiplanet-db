@@ -7,6 +7,7 @@ from pathlib import Path
 
 import dotenv
 import numpy as np
+import pandas as pd
 import pooch
 import xarray as xr
 import yaml
@@ -240,13 +241,21 @@ def _check_same_grid(datasets: dict[str, xr.Dataset]) -> xr.Dataset:
     return reference
 
 
-def insert_grid_var_values(engine: engine.Engine, grid_vars: list[GridVar]) -> int:
+def insert_grid_var_values(
+    engine: engine.Engine, grid_vars: list[GridVar], storage: str = "rows"
+) -> int:
     """Insert grid points, time points and values of all gridded variables.
 
     Args:
         engine (engine.Engine): SQLAlchemy engine object.
         grid_vars (list[GridVar]): Gridded variables to insert.
+        storage (str): "rows" (one row per value in `var_value`) or "tiles"
+            (compressed tiles in `var_tile`, no grid points). Defaults to "rows".
     """
+    if storage not in db.STORAGES:
+        raise ValueError(
+            f"Unknown storage {storage}; use one of {sorted(db.STORAGES)}."
+        )
     names = {gv.name for gv in grid_vars}
     for gv in grid_vars:
         if gv.aggregation not in AGGREGATIONS:
@@ -259,6 +268,9 @@ def insert_grid_var_values(engine: engine.Engine, grid_vars: list[GridVar]) -> i
             )
     datasets = {gv.name: open_grid_dataset(gv) for gv in grid_vars}
     reference = _check_same_grid(datasets)
+    if storage == "tiles":
+        _insert_grid_var_tiles(engine, grid_vars, datasets)
+        return 0
 
     # add grid points
     grid_point_session = db.create_session(engine)
@@ -270,13 +282,7 @@ def insert_grid_var_values(engine: engine.Engine, grid_vars: list[GridVar]) -> i
     grid_point_session.commit()
     grid_point_session.close()
     # add time points of all variables (monthly data)
-    time_point_session = db.create_session(engine)
-    db.insert_time_points(
-        time_point_session,
-        time_point_data=[(ds.time.to_numpy(), False) for ds in datasets.values()],
-    )
-    time_point_session.commit()
-    time_point_session.close()
+    _insert_time_points(engine, datasets)
     # get id maps for grid, time, variable types and resolutions
     print("Getting id maps for grid, time, and variable types.")
     id_map_session = db.create_session(engine)
@@ -317,6 +323,53 @@ def insert_grid_var_values(engine: engine.Engine, grid_vars: list[GridVar]) -> i
     resolution_session.close()
     print("Variable values inserted and resolution groups assigned.")
     return 0
+
+
+def _insert_time_points(engine: engine.Engine, datasets: dict[str, xr.Dataset]):
+    """Insert the (monthly) time points of all datasets that are not stored yet.
+
+    Skipping stored ones allows loading the same data as rows and as tiles
+    into one database, e.g. to compare the two.
+    """
+    session = db.create_session(engine)
+    stored = {(tp.year, tp.month, tp.day) for tp in session.query(db.TimePoint)}
+    times = np.unique(np.concatenate([ds.time.to_numpy() for ds in datasets.values()]))
+    new = [t for t in times if pd.Timestamp(t).timetuple()[:3] not in stored]
+    if new:
+        db.insert_time_points(
+            session, time_point_data=[(np.array(new, dtype=times.dtype), False)]
+        )
+    session.commit()
+    session.close()
+
+
+def _insert_grid_var_tiles(
+    engine: engine.Engine, grid_vars: list[GridVar], datasets: dict[str, xr.Dataset]
+) -> None:
+    """Insert time points and the values of all gridded variables as tiles."""
+    _insert_time_points(engine, datasets)
+    session = db.create_session(engine)
+    _, time_id_map, var_type_id_map = db.get_id_maps(session)
+    resolution_id_map = db.get_resolution_id_map(session)
+    session.close()
+    for gv in grid_vars:
+        print(f"Inserting tiles of {gv.name} ({gv.aggregation}) into the database.")
+        mask = None
+        if gv.mask_by is not None:
+            mask = datasets[gv.mask_by][gv.mask_by].notnull()
+        db.insert_var_tiles(
+            engine,
+            datasets[gv.name],
+            gv.name,
+            time_id_map,
+            var_type_id_map,
+            resolution_id_map,
+            aggregation=gv.aggregation,
+            mask=mask,
+            transform=gv.transform,
+            transform_floor=gv.transform_floor,
+        )
+    print("Variable tiles inserted.")
 
 
 def insert_nuts_var_values(engine: engine.Engine, nuts_vars: list[NutsVar]) -> int:
@@ -365,6 +418,8 @@ def reset_production_data(engine: engine.Engine) -> None:
             text(
                 """
                 TRUNCATE TABLE
+                    var_tile,
+                    grid_def,
                     grid_point_resolution,
                     var_value_nuts,
                     var_coverage,
@@ -589,6 +644,12 @@ def main(drop_tables: bool = False, config_path: str | None = None) -> None:
     """
     # set up production database and data lake using the provided config
     config = read_production_config(_resolve_config_path(config_path))
+    # "rows" or "tiles", see insert_grid_var_values; checked before any download
+    storage = config.get("storage", "rows")
+    if storage not in db.STORAGES:
+        raise ValueError(
+            f"Unknown storage {storage}; use one of {sorted(db.STORAGES)}."
+        )
     shapefile_folder_path = None
     grid_vars: list[GridVar] = []
     nuts_vars: list[NutsVar] = []
@@ -630,7 +691,12 @@ def main(drop_tables: bool = False, config_path: str | None = None) -> None:
     resolution_session.close()
 
     # load data with optimization
-    load_data_with_optimization(engine, grid_vars=grid_vars, nuts_vars=nuts_vars)
+    load_data_with_optimization(
+        engine,
+        grid_vars=grid_vars,
+        nuts_vars=nuts_vars,
+        storage=storage,
+    )
 
 
 def _restore_after_bulk_load(engine: engine.Engine, after_error: bool) -> None:
@@ -669,9 +735,12 @@ def load_data_with_optimization(
     engine: engine.Engine,
     grid_vars: list[GridVar] | None = None,
     nuts_vars: list[NutsVar] | None = None,
+    storage: str = "rows",
 ) -> None:
     """
     Load data into the database with autovacuum disabled for performance.
+    Gridded variables are stored as `storage` ("rows" or "tiles"), see
+    `insert_grid_var_values`.
     The unique and foreign key constraints of var_value and var_coverage are
     dropped during the load and created again afterwards, which is much faster
     and gives a smaller index. Ensures autovacuum and the constraints are
@@ -696,7 +765,7 @@ def load_data_with_optimization(
 
         # insert the data
         if grid_vars:
-            insert_grid_var_values(engine, grid_vars)
+            insert_grid_var_values(engine, grid_vars, storage=storage)
             print("DEBUG: insert_grid_var_values completed.")
         # insert the nuts variables data
         if nuts_vars:
