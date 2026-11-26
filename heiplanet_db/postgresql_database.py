@@ -46,16 +46,26 @@ ROUND_DIGITS = int(os.environ.get("ROUND_DIGITS", "4"))
 
 
 def _normalize_time_key(t_val: np.datetime64) -> np.datetime64:
-    """Normalize a datetime64 value to a date-only key for time_id_map lookup.
+    """Normalize a datetime64 value to the key of its time point.
+
+    The database is monthly: every time point is the first day of a month, and
+    all values within a month belong to that time point.
 
     Args:
-        t_val: datetime64 value (may include time components).
+        t_val: datetime64 value (may include a day and time of day).
 
     Returns:
-        datetime64[ns] normalized to midnight of the date.
+        datetime64[ns] of midnight on the first day of the month.
     """
-    ts = pd.Timestamp(t_val)
-    return np.datetime64(pd.to_datetime(f"{ts.year}-{ts.month}-{ts.day}"), "ns")
+    return np.datetime64(t_val, "M").astype("datetime64[ns]")
+
+
+def month_starts(times: np.ndarray) -> np.ndarray:
+    """Sorted unique first days of the months of `times`, as datetime64[ns]."""
+    times = np.asarray(times)
+    if times.size == 0:
+        return np.array([], dtype="datetime64[ns]")
+    return np.unique(times.astype("datetime64[M]")).astype("datetime64[ns]")
 
 
 # Base declarative class
@@ -590,8 +600,8 @@ def get_unique_time_points(
     time_points = []
     for tpd, yearly in time_point_data:
         if not yearly:
-            # assume it's monthly TODO
-            time_points.append(tpd)
+            # the database is monthly: one time point per month, on its first day
+            time_points.append(month_starts(tpd))
         else:
             # convert to monthly for the whole range
             if np.datetime64(tpd[0]) > np.datetime64(tpd[-1]):
@@ -611,9 +621,7 @@ def get_unique_time_points(
     if not time_points:
         return np.array([])
 
-    concatenated = np.concatenate(time_points)
-    unique_time_points = np.unique(concatenated)
-    return np.sort(unique_time_points)
+    return month_starts(np.concatenate(time_points))
 
 
 def insert_time_points(
@@ -668,15 +676,18 @@ def get_id_maps(session: Session) -> tuple[dict, dict]:
 
     Returns:
         tuple: A tuple containing two dictionaries:\n
-            - time_id_map: Mapping of datetime64 to time point ID.\n
+            - time_id_map: Mapping of the first day of a month (datetime64,
+              see `_normalize_time_key`) to time point ID.\n
             - var_id_map: Mapping of variable name to variable type ID.
     """
-    time_id_map = {
-        np.datetime64(pd.to_datetime(f"{year}-{month}-{day}"), "ns"): time_id
-        for time_id, year, month, day in session.query(
-            TimePoint.id, TimePoint.year, TimePoint.month, TimePoint.day
-        )
-    }
+    time_id_map = {}
+    # earliest day first, so a month with several (legacy) time points maps
+    # to the same one that the API selects
+    for time_id, year, month in session.query(
+        TimePoint.id, TimePoint.year, TimePoint.month
+    ).order_by(TimePoint.year, TimePoint.month, TimePoint.day, TimePoint.id):
+        key = np.datetime64(f"{year:04d}-{month:02d}", "M").astype("datetime64[ns]")
+        time_id_map.setdefault(key, time_id)
     var_id_map = {
         name: var_id for var_id, name in session.query(VarType.id, VarType.name)
     }
@@ -687,20 +698,35 @@ _PGCOPY_HEADER = b"PGCOPY\n\xff\r\n\x00" + struct.pack("!ii", 0, 0)
 _PGCOPY_TRAILER = struct.pack("!h", -1)
 
 
-def _pgcopy_binary(columns: list[tuple[str, np.ndarray | None]]) -> bytes:
-    """Encode rows in the binary format of PostgreSQL's COPY.
+CopyColumn = tuple[str, np.ndarray | list[np.ndarray] | None]
+
+
+def _column_length(values: np.ndarray | list[np.ndarray]) -> int:
+    if isinstance(values, list):
+        return sum(len(part) for part in values)
+    return len(values)
+
+
+def _pgcopy_rows(columns: list[CopyColumn]) -> np.ndarray:
+    """Encode rows in the binary row format of PostgreSQL's COPY.
+
+    The values are written straight into one structured array, so the data is
+    held only once more in memory.
 
     Args:
-        columns (list[tuple[str, np.ndarray | None]]): One (dtype, values) pair
-            per column, in table column order. `dtype` is a big-endian numpy
-            type matching the column exactly (">i4" for integer, ">i2" for
-            smallint, ">f4" for real). `values` is a 1D array with one entry
-            per row, or None for a column that is NULL in every row.
+        columns (list[CopyColumn]): One (dtype, values) pair per column, in
+            table column order. `dtype` is a big-endian numpy type matching the
+            column exactly (">i4" for integer, ">i2" for smallint, ">f4" for
+            real), or a void type ("V<n>") for a bytea of fixed length n.
+            `values` is a 1D array with one entry per row, a list of such
+            arrays that are concatenated, or None for a column that is NULL in
+            every row.
 
     Returns:
-        bytes: The COPY data, including header and trailer.
+        np.ndarray: Structured array whose bytes are the COPY rows, without
+            header and trailer.
     """
-    n_rows = next((len(v) for _, v in columns if v is not None), 0)
+    n_rows = next((_column_length(v) for _, v in columns if v is not None), 0)
     fields = [("n_fields", ">i2")]
     for k, (dtype, values) in enumerate(columns):
         fields.append((f"len{k}", ">i4"))
@@ -711,36 +737,78 @@ def _pgcopy_binary(columns: list[tuple[str, np.ndarray | None]]) -> bytes:
     for k, (dtype, values) in enumerate(columns):
         if values is None:
             rows[f"len{k}"] = -1
-        else:
-            if len(values) != n_rows:
-                raise ValueError("All COPY columns must have the same length.")
-            rows[f"len{k}"] = np.dtype(dtype).itemsize
+            continue
+        if _column_length(values) != n_rows:
+            raise ValueError("All COPY columns must have the same length.")
+        rows[f"len{k}"] = np.dtype(dtype).itemsize
+        if not isinstance(values, list):
             rows[f"val{k}"] = values
-    return _PGCOPY_HEADER + rows.tobytes() + _PGCOPY_TRAILER
+            continue
+        start = 0
+        for part in values:
+            rows[f"val{k}"][start : start + len(part)] = part
+            start += len(part)
+    return rows
+
+
+def _pgcopy_binary(columns: list[CopyColumn]) -> bytes:
+    """The complete COPY data of `columns`, see `_pgcopy_rows`.
+
+    Returns:
+        bytes: The COPY data, including header and trailer.
+    """
+    return _PGCOPY_HEADER + _pgcopy_rows(columns).tobytes() + _PGCOPY_TRAILER
+
+
+class _BufferReader(io.RawIOBase):
+    """Read-only file over several buffers, without joining them."""
+
+    def __init__(self, *buffers):
+        self._parts = [memoryview(b).cast("B") for b in buffers]
+        self._index = 0
+        self._offset = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, target) -> int:
+        target = memoryview(target).cast("B")
+        written = 0
+        while written < len(target) and self._index < len(self._parts):
+            part = self._parts[self._index]
+            n = min(len(target) - written, len(part) - self._offset)
+            target[written : written + n] = part[self._offset : self._offset + n]
+            written += n
+            self._offset += n
+            if self._offset == len(part):
+                self._index += 1
+                self._offset = 0
+        return written
 
 
 def copy_rows(
     engine: engine.Engine,
     table: str,
     column_names: list[str],
-    columns: list[tuple[str, np.ndarray | None]],
+    columns: list[CopyColumn],
 ) -> int:
     """Insert rows with a binary COPY, in one transaction.
 
     Much faster than INSERT statements, and no Python object is created per
-    row. See `_pgcopy_binary` for `columns`.
+    row. The encoded rows are streamed to the server, not copied into one
+    bytes object. See `_pgcopy_rows` for `columns`.
 
     Args:
         engine (engine.Engine): SQLAlchemy engine object.
         table (str): Table name.
         column_names (list[str]): Names of the columns in `columns`.
-        columns (list[tuple[str, np.ndarray | None]]): Column data.
+        columns (list[CopyColumn]): Column data.
 
     Returns:
         int: Number of rows inserted.
     """
-    data = _pgcopy_binary(columns)
-    n_rows = next((len(v) for _, v in columns if v is not None), 0)
+    rows = _pgcopy_rows(columns)
+    n_rows = len(rows)
     if n_rows == 0:
         return 0
     connection = engine.raw_connection()
@@ -749,7 +817,7 @@ def copy_rows(
             cursor.copy_expert(
                 f"COPY {table} ({', '.join(column_names)}) "
                 "FROM STDIN WITH (FORMAT BINARY)",
-                io.BytesIO(data),
+                _BufferReader(_PGCOPY_HEADER, rows, _PGCOPY_TRAILER),
             )
         connection.commit()
     except Exception:
@@ -860,8 +928,10 @@ def _coarse_indices(coords: np.ndarray, resolution: float) -> np.ndarray:
 
     These are the grid points of that resolution group (see `GridDefinition`).
     """
-    tenths = np.round(coords.astype(np.float64) * 10).astype(np.int64)
-    return np.flatnonzero(tenths % round(float(resolution) * 10) == 0)
+    resolution = float(resolution)
+    ratio = coords.astype(np.float64) / resolution
+    offset = np.abs(ratio - np.round(ratio)) * resolution
+    return np.flatnonzero(offset <= tiles.COORD_ATOL)
 
 
 def _window_matrix(
@@ -1056,14 +1126,20 @@ def _resolution_plans(
             points are not multiples of the step.
     """
     _check_grid_usable(lats, lons, resolution_id_map, var_name)
+    step = _grid_step(lats)
     plans = []
     for resolution, resolution_id in sorted(resolution_id_map.items()):
         plan = _block_mean_plan(lats, lons, resolution)
         if plan is None:
-            print(
-                f"Skipping {resolution} degree resolution for {var_name}: "
-                "not a multiple of the data grid step."
-            )
+            ratio = float(resolution) / step
+            if round(ratio) < 1 or not np.isclose(ratio, round(ratio)):
+                reason = f"not a whole multiple of the data grid step {step:g}°"
+            else:
+                reason = (
+                    "the data covers no grid point of this resolution "
+                    "(its area is smaller than one cell)"
+                )
+            print(f"Skipping {resolution} degree resolution for {var_name}: {reason}.")
             continue
         plans.append((resolution, resolution_id, plan))
     if not plans or plans[0][2]["factor"] != 1:
@@ -1130,7 +1206,9 @@ def _plan_grid(plan: dict, resolution: float, tile_size: int) -> tiles.GridDef:
 def ensure_grid_defs(engine: engine.Engine, grids: dict[int, tiles.GridDef]) -> None:
     """Store the grid of each resolution group, or check the stored one.
 
-    All gridded variables must share one grid per resolution group.
+    All gridded variables must share one grid per resolution group. A stored
+    grid that no tile uses yet (e.g. left over from a load that failed) is
+    replaced.
 
     Args:
         engine (engine.Engine): SQLAlchemy engine object.
@@ -1174,12 +1252,72 @@ def ensure_grid_defs(engine: engine.Engine, grids: dict[int, tiles.GridDef]) -> 
                 grid.n_lon,
                 grid.tile_size,
             )
-            if not same:
+            if same:
+                continue
+            in_use = conn.execute(
+                text("SELECT 1 FROM var_tile WHERE resolution_id = :r LIMIT 1"),
+                {"r": int(resolution_id)},
+            ).first()
+            if in_use is None:
+                print(
+                    f"Replacing the unused grid of resolution group "
+                    f"{resolution_id}: {stored_grid} -> {grid}."
+                )
+                conn.execute(
+                    text(
+                        "UPDATE grid_def SET lat0 = :lat0, lon0 = :lon0, "
+                        "step = :step, n_lat = :n_lat, n_lon = :n_lon, "
+                        "tile_size = :ts WHERE resolution_id = :r"
+                    ),
+                    {
+                        "r": int(resolution_id),
+                        "lat0": grid.lat0,
+                        "lon0": grid.lon0,
+                        "step": grid.step,
+                        "n_lat": grid.n_lat,
+                        "n_lon": grid.n_lon,
+                        "ts": grid.tile_size,
+                    },
+                )
+            else:
                 raise ValueError(
                     f"The grid of resolution group {resolution_id} differs from "
                     f"the stored one: {grid} vs. {stored_grid}. All gridded "
                     "variables must share one grid."
                 )
+
+
+def _check_not_loaded(
+    engine: engine.Engine, var_id: int, time_ids: np.ndarray, var_name: str
+) -> None:
+    """Raise if `var_id` already has tiles at any of `time_ids`."""
+    with engine.connect() as conn:
+        loaded = conn.execute(
+            text(
+                "SELECT DISTINCT tp.year, tp.month FROM var_tile v "
+                "JOIN time_point tp ON tp.id = v.time_id "
+                "WHERE v.var_id = :v AND v.time_id = ANY(:t) "
+                "ORDER BY tp.year, tp.month"
+            ),
+            {"v": int(var_id), "t": [int(t) for t in time_ids]},
+        ).all()
+    if loaded:
+        months = ", ".join(f"{y}-{m:02d}" for y, m in loaded[:5])
+        more = f" and {len(loaded) - 5} more" if len(loaded) > 5 else ""
+        raise ValueError(
+            f"{var_name} is already loaded for {months}{more}. Remove its tiles "
+            "first (or reset the production tables) to load it again, and make "
+            "sure no two files or config entries cover the same months."
+        )
+
+
+def _delete_var_tiles(engine: engine.Engine, var_id: int, time_ids: np.ndarray):
+    """Delete the tiles of `var_id` at `time_ids`, at all resolutions."""
+    with engine.begin() as conn:
+        conn.execute(
+            text("DELETE FROM var_tile WHERE var_id = :v AND time_id = ANY(:t)"),
+            {"v": int(var_id), "t": [int(t) for t in time_ids]},
+        )
 
 
 def copy_var_tiles(
@@ -1204,18 +1342,21 @@ def copy_var_tiles(
     Returns:
         int: Number of tiles stored.
     """
-    t_ids, rows, cols, blobs = [], [], [], []
+    # all tiles have the same size, so they fit a fixed-size numpy type
+    blob_dtype = np.dtype(f"V{tile_size * tile_size * tiles.TILE_DTYPE.itemsize}")
+    t_ids, rows, cols, blocks = [], [], [], []
     for time_id, values_t in zip(time_ids, values):
-        for tile_row, tile_col, blob in tiles.array_to_tiles(values_t, tile_size):
-            t_ids.append(time_id)
-            rows.append(tile_row)
-            cols.append(tile_col)
-            blobs.append(blob)
-    n_tiles = len(blobs)
+        tile_rows, tile_cols, blocks_t = tiles.array_to_tile_blocks(values_t, tile_size)
+        if len(tile_rows) == 0:
+            continue
+        t_ids.append(np.full(len(tile_rows), time_id))
+        rows.append(tile_rows)
+        cols.append(tile_cols)
+        # a view: each tile becomes one fixed-size bytea value
+        blocks.append(blocks_t.reshape(len(tile_rows), -1).view(blob_dtype)[:, 0])
+    n_tiles = sum(len(r) for r in rows)
     if n_tiles == 0:
         return 0
-    # all tiles have the same size, so they fit a fixed-size numpy type
-    blob_dtype = f"V{tile_size * tile_size * tiles.TILE_DTYPE.itemsize}"
     return copy_rows(
         engine,
         "var_tile",
@@ -1223,10 +1364,10 @@ def copy_var_tiles(
         [
             (">i2", np.full(n_tiles, var_id)),
             (">i2", np.full(n_tiles, resolution_id)),
-            (">i4", np.array(t_ids)),
-            (">i2", np.array(rows)),
-            (">i2", np.array(cols)),
-            (blob_dtype, np.frombuffer(b"".join(blobs), dtype=blob_dtype)),
+            (">i4", t_ids),
+            (">i2", rows),
+            (">i2", cols),
+            (blob_dtype.str, blocks),
         ],
     )
 
@@ -1286,6 +1427,14 @@ def insert_var_tiles(
 
     plans = _resolution_plans(lats, lons, resolution_id_map, var_name)
     mask = _align_mask(mask, data, var_name)
+    # check every time point before anything is stored
+    all_time_ids = time_id_array(data.time.values, time_id_map)
+    if len(np.unique(all_time_ids)) != len(all_time_ids):
+        raise ValueError(
+            f"{var_name} has several time steps in one month. The database "
+            "stores one value per month; aggregate the data to monthly first."
+        )
+    _check_not_loaded(engine, var_id, all_time_ids, var_name)
     grids = {
         resolution_id: _plan_grid(plan, resolution, tile_size)
         for resolution, resolution_id, plan in plans
@@ -1301,27 +1450,34 @@ def insert_var_tiles(
     }
 
     total = 0
-    for t0, times, values in _masked_chunks(data, mask):
-        time_ids = time_id_array(times, time_id_map)
-        for resolution, resolution_id, plan in plans:
-            if plan["factor"] == 1:
-                coarse = values
-            elif aggregation == "mean":
-                coarse = block_mean(values, plan)
-            else:
-                lat_idx, lon_idx = strides[resolution_id]
-                coarse = values[:, lat_idx][:, :, lon_idx]
-            coarse = apply_transform(coarse, transform, transform_floor)
-            coarse, _, _ = _ascending(coarse, plan["latitude"], plan["longitude"])
-            total += copy_var_tiles(
-                engine, var_id, resolution_id, time_ids, coarse, tile_size
-            )
-            print(
-                f"{var_name}: inserted {resolution} degree tiles for time "
-                f"indices {t0}:{t0 + len(times)}."
-            )
-        del values
-        gc.collect()
+    try:
+        for t0, times, values in _masked_chunks(data, mask):
+            time_ids = all_time_ids[t0 : t0 + len(times)]
+            for resolution, resolution_id, plan in plans:
+                if plan["factor"] == 1:
+                    coarse = values
+                elif aggregation == "mean":
+                    coarse = block_mean(values, plan)
+                else:
+                    lat_idx, lon_idx = strides[resolution_id]
+                    coarse = values[:, lat_idx][:, :, lon_idx]
+                coarse = apply_transform(coarse, transform, transform_floor)
+                coarse, _, _ = _ascending(coarse, plan["latitude"], plan["longitude"])
+                total += copy_var_tiles(
+                    engine, var_id, resolution_id, time_ids, coarse, tile_size
+                )
+                print(
+                    f"{var_name}: inserted {resolution} degree tiles for time "
+                    f"indices {t0}:{t0 + len(times)}."
+                )
+            del values
+            gc.collect()
+    except BaseException:
+        # the chunks are committed one by one: remove what this call stored, so
+        # that the variable is not left half-loaded and can be loaded again
+        _delete_var_tiles(engine, var_id, all_time_ids)
+        print(f"Loading {var_name} failed; its tiles stored so far were removed.")
+        raise
 
     print(f"Tiles of {var_name} inserted for all resolutions. Total: {total}")
     return total
@@ -1630,6 +1786,7 @@ def get_var_values_cartesian(
     date_object = (
         session.query(TimePoint)
         .filter((TimePoint.year == time_point[0]) & (TimePoint.month == time_point[1]))
+        .order_by(TimePoint.day, TimePoint.id)
         .first()
     )
     if not date_object:
@@ -1909,6 +2066,7 @@ def get_var_values_nuts(
     date_object = (
         session.query(TimePoint)
         .filter((TimePoint.year == time_point[0]) & (TimePoint.month == time_point[1]))
+        .order_by(TimePoint.day, TimePoint.id)
         .first()
     )
 
@@ -2011,6 +2169,12 @@ def insert_var_value_nuts(
     # Some inputs come as (NUTS_ID, time). Normalize to (time, NUTS_ID) so the
     # chunking/insertion logic always treats axis 0 as time.
     var_data = var_data.transpose("time", "NUTS_ID")
+    months = var_data["time"].values.astype("datetime64[M]")
+    if len(np.unique(months)) != len(months):
+        raise ValueError(
+            f"{var_name} has several time steps in one month. The database "
+            "stores one value per month; aggregate the data to monthly first."
+        )
 
     nuts_ids = var_data["NUTS_ID"].values
 

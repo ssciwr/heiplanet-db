@@ -10,6 +10,11 @@ implicit: cell (i, j) of a grid lies at
 NaN means "no data" (e.g. ocean), 0 means 0. Tiles that are entirely NaN are
 not stored. Edge tiles are padded with NaN.
 
+float32 keeps about 7 significant digits: integers above 2^24 (about 16.7
+million) are no longer exact, e.g. 123456789 is stored as 123456792. Gridded
+values are therefore only as precise as float32, while NUTS values (stored as
+float64) are not limited this way.
+
 This module is pure numpy and knows nothing about the database.
 """
 
@@ -258,6 +263,41 @@ def decode_tile(data: bytes | memoryview, tile_size: int) -> np.ndarray:
     return values.reshape(tile_size, tile_size)
 
 
+def array_to_tile_blocks(
+    values: np.ndarray, tile_size: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Cut a 2D (lat, lon) array into tiles, as one array.
+
+    Edge tiles are padded with NaN. Tiles that are entirely NaN are skipped.
+
+    Args:
+        values (np.ndarray): Values on the full grid, rows ascending in
+            latitude, columns ascending in longitude.
+        tile_size (int): Cells per tile side.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray, np.ndarray]: tile rows, tile columns and
+            a contiguous (n_tiles, tile_size, tile_size) `TILE_DTYPE` array,
+            whose entry k is tile k in the layout of `encode_tile`.
+    """
+    if values.ndim != 2:
+        raise ValueError(f"Expected a 2D array, got shape {values.shape}.")
+    n_lat, n_lon = values.shape
+    padded = np.full(
+        (-(-n_lat // tile_size) * tile_size, -(-n_lon // tile_size) * tile_size),
+        np.nan,
+        dtype=TILE_DTYPE,
+    )
+    padded[:n_lat, :n_lon] = values
+    n_rows = padded.shape[0] // tile_size
+    n_cols = padded.shape[1] // tile_size
+    # (tile_row, tile_col, cell row, cell col)
+    blocks = padded.reshape(n_rows, tile_size, n_cols, tile_size).swapaxes(1, 2)
+    tile_rows, tile_cols = np.nonzero(~np.isnan(blocks).all(axis=(2, 3)))
+    # fancy indexing copies, so the result is contiguous
+    return tile_rows, tile_cols, np.ascontiguousarray(blocks[tile_rows, tile_cols])
+
+
 def array_to_tiles(
     values: np.ndarray, tile_size: int
 ) -> Iterator[tuple[int, int, bytes]]:
@@ -273,22 +313,9 @@ def array_to_tiles(
     Yields:
         tuple[int, int, bytes]: (tile_row, tile_col, encoded tile).
     """
-    if values.ndim != 2:
-        raise ValueError(f"Expected a 2D array, got shape {values.shape}.")
-    n_lat, n_lon = values.shape
-    padded = np.full(
-        (-(-n_lat // tile_size) * tile_size, -(-n_lon // tile_size) * tile_size),
-        np.nan,
-        dtype=TILE_DTYPE,
-    )
-    padded[:n_lat, :n_lon] = values
-    n_rows = padded.shape[0] // tile_size
-    n_cols = padded.shape[1] // tile_size
-    # (tile_row, tile_col, cell row, cell col)
-    blocks = padded.reshape(n_rows, tile_size, n_cols, tile_size).swapaxes(1, 2)
-    has_data = ~np.isnan(blocks).all(axis=(2, 3))
-    for tile_row, tile_col in zip(*np.nonzero(has_data)):
-        yield int(tile_row), int(tile_col), encode_tile(blocks[tile_row, tile_col])
+    tile_rows, tile_cols, blocks = array_to_tile_blocks(values, tile_size)
+    for tile_row, tile_col, block in zip(tile_rows, tile_cols, blocks):
+        yield int(tile_row), int(tile_col), encode_tile(block)
 
 
 def tiles_to_array(

@@ -351,30 +351,31 @@ def _build_maps():
 
 
 def test__normalize_time_key():
-    """Test that _normalize_time_key normalizes datetime64 to date-only midnight."""
-    # Test with full datetime precision
-    dt1 = np.datetime64("2023-01-15T14:30:45.123456789", "ns")
-    normalized = postdb._normalize_time_key(dt1)
-    expected = np.datetime64("2023-01-15T00:00:00", "ns")
-    assert normalized == expected
+    """Any time within a month maps to midnight on the first day of the month."""
+    cases = {
+        "2023-01-15T14:30:45.123456789": "2023-01-01",
+        "2023-02-28": "2023-02-01",
+        "2023-12-31T23:59:59": "2023-12-01",
+        "2024-02-29T12:00:00": "2024-02-01",
+        "2024-03-01": "2024-03-01",
+    }
+    for value, expected in cases.items():
+        normalized = postdb._normalize_time_key(np.datetime64(value, "ns"))
+        assert normalized == np.datetime64(expected, "ns")
 
-    # Test with date-only input
-    dt2 = np.datetime64("2023-02-28", "ns")
-    normalized = postdb._normalize_time_key(dt2)
-    expected = np.datetime64("2023-02-28T00:00:00", "ns")
-    assert normalized == expected
 
-    # Test with different time components
-    dt3 = np.datetime64("2023-12-31T23:59:59", "ns")
-    normalized = postdb._normalize_time_key(dt3)
-    expected = np.datetime64("2023-12-31T00:00:00", "ns")
-    assert normalized == expected
-
-    # Test leap year date
-    dt4 = np.datetime64("2024-02-29T12:00:00", "ns")
-    normalized = postdb._normalize_time_key(dt4)
-    expected = np.datetime64("2024-02-29T00:00:00", "ns")
-    assert normalized == expected
+def test_month_starts():
+    times = np.array(
+        ["2023-02-15", "2023-01-01T12:00", "2023-01-01", "2023-02-01"],
+        dtype="datetime64[ns]",
+    )
+    result = postdb.month_starts(times)
+    assert result.dtype == np.dtype("datetime64[ns]")
+    assert (
+        result.tolist()
+        == np.array(["2023-01-01", "2023-02-01"], dtype="datetime64[ns]").tolist()
+    )
+    assert len(postdb.month_starts(np.array([], dtype="datetime64[ns]"))) == 0
 
 
 def test_get_var_value(insert_data, get_dataset):
@@ -1292,17 +1293,35 @@ def test_insert_var_tiles_mean(get_engine_with_tables, get_session):
 
     # a variable on another grid is rejected
     shifted = ds.assign_coords(longitude=ds.longitude + 1.0)
-    get_session.execute(text("UPDATE var_type SET name = 'other'"))
-    get_session.commit()
+    postdb.insert_var_types(
+        get_session, [{"name": "other", "unit": "-", "aggregation": "mean"}]
+    )
+    time_id_map, var_id_map = postdb.get_id_maps(get_session)
     with pytest.raises(ValueError, match="differs from the stored one"):
         postdb.insert_var_tiles(
             get_engine_with_tables,
             shifted.rename({"adults": "other"}),
             "other",
-            {},
-            {"other": 1},
+            time_id_map,
+            var_id_map,
             resolution_id_map,
         )
+
+    # loading the same variable again is rejected before anything is stored
+    n_before = get_session.execute(text("SELECT count(*) FROM var_tile")).scalar()
+    with pytest.raises(ValueError, match="already loaded for 2023-01"):
+        postdb.insert_var_tiles(
+            get_engine_with_tables,
+            ds,
+            "adults",
+            time_id_map,
+            var_id_map,
+            resolution_id_map,
+            aggregation="mean",
+            tile_size=2,
+        )
+    n_after = get_session.execute(text("SELECT count(*) FROM var_tile")).scalar()
+    assert n_after == n_before
 
 
 def test_insert_var_tiles_subsample(get_engine_with_tables, get_session):
@@ -1330,8 +1349,116 @@ def test_ensure_grid_defs_tolerance(get_engine_with_tables, get_session):
     postdb.ensure_grid_defs(get_engine_with_tables, {resolution_id: close})
     # outside COORD_ATOL, though within the default relative tolerance
     shifted = tiles.GridDef(-89.9, -179.9015, 0.1, 1799, 3599, 100)
+    # no tile uses the stored grid yet: it is replaced
+    postdb.ensure_grid_defs(get_engine_with_tables, {resolution_id: shifted})
+    stored = get_session.get(postdb.GridDefinition, resolution_id)
+    get_session.refresh(stored)
+    assert stored.to_grid() == shifted
+    # once tiles use it, another grid is rejected
+    postdb.insert_var_types(
+        get_session, [{"name": "v", "unit": "-", "aggregation": "mean"}]
+    )
+    postdb.insert_time_points(
+        get_session, [(np.array(["2023-01-01"], dtype="datetime64[ns]"), False)]
+    )
+    postdb.copy_var_tiles(
+        get_engine_with_tables, 1, resolution_id, np.array([1]), np.ones((1, 2, 2)), 100
+    )
     with pytest.raises(ValueError, match="differs from the stored one"):
-        postdb.ensure_grid_defs(get_engine_with_tables, {resolution_id: shifted})
+        postdb.ensure_grid_defs(get_engine_with_tables, {resolution_id: grid})
+
+
+def test_insert_var_tiles_failure_removes_tiles(
+    get_engine_with_tables, get_session, monkeypatch
+):
+    ds = _fine_grid_ds()
+    postdb.insert_var_types(
+        get_session, [{"name": "adults", "unit": "-", "aggregation": "mean"}]
+    )
+    postdb.insert_time_points(get_session, [(ds.time.values, False)])
+    postdb.insert_resolution_groups(get_session, resolutions=np.array([0.1, 0.2]))
+    time_id_map, var_id_map = postdb.get_id_maps(get_session)
+    resolution_id_map = postdb.get_resolution_id_map(get_session)
+    original = postdb.copy_var_tiles
+    calls = []
+
+    def failing_copy(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            raise RuntimeError("connection lost")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(postdb, "copy_var_tiles", failing_copy)
+    with pytest.raises(RuntimeError, match="connection lost"):
+        postdb.insert_var_tiles(
+            get_engine_with_tables,
+            ds,
+            "adults",
+            time_id_map,
+            var_id_map,
+            resolution_id_map,
+            aggregation="mean",
+            tile_size=2,
+        )
+    assert get_session.execute(text("SELECT count(*) FROM var_tile")).scalar() == 0
+    # it can be loaded again
+    monkeypatch.setattr(postdb, "copy_var_tiles", original)
+    total = postdb.insert_var_tiles(
+        get_engine_with_tables,
+        ds,
+        "adults",
+        time_id_map,
+        var_id_map,
+        resolution_id_map,
+        aggregation="mean",
+        tile_size=2,
+    )
+    assert total > 0
+
+
+def test_insert_var_tiles_rejects_several_steps_per_month(get_engine_with_tables):
+    ds = _fine_grid_ds()
+    ds = ds.assign_coords(
+        time=np.array(["2023-01-01", "2023-01-15"], dtype="datetime64[ns]")[
+            : ds.sizes["time"]
+        ]
+    )
+    time_id_map = {np.datetime64("2023-01-01", "ns"): 1}
+    with pytest.raises(ValueError, match="several time steps in one month"):
+        postdb.insert_var_tiles(
+            get_engine_with_tables, ds, "adults", time_id_map, {"adults": 1}, {0.1: 1}
+        )
+
+
+def test_coarse_indices_quarter_degree():
+    coords = np.round(np.arange(-1.0, 1.01, 0.05), 2)
+    idx = postdb._coarse_indices(coords, 0.25)
+    np.testing.assert_allclose(
+        coords[idx], [-1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0]
+    )
+    idx = postdb._coarse_indices(coords, 0.2)
+    np.testing.assert_allclose(coords[idx], np.round(np.arange(-1.0, 1.01, 0.2), 1))
+
+
+def test_buffer_reader_streams_parts():
+    rows = np.arange(5, dtype=">i4")
+    reader = postdb._BufferReader(b"ab", rows, b"z")
+    out = b""
+    while chunk := reader.read(3):
+        out += chunk
+    assert out == b"ab" + rows.tobytes() + b"z"
+
+
+def test_pgcopy_rows_list_columns():
+    blob = np.dtype("V4")
+    parts = [np.array([1.0, 2.0], "<f4").view(blob), np.array([3.0], "<f4").view(blob)]
+    rows = postdb._pgcopy_rows(
+        [(">i4", [np.array([1, 2]), np.array([3])]), (blob.str, parts)]
+    )
+    assert rows["val0"].tolist() == [1, 2, 3]
+    np.testing.assert_array_equal(
+        np.frombuffer(rows["val1"].tobytes(), "<f4"), [1.0, 2.0, 3.0]
+    )
 
 
 def test_insert_var_tiles_errors(get_engine_with_tables):

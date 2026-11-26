@@ -1028,3 +1028,33 @@ def test_insert_nuts_var_values_without_grid_vars(get_engine_with_tables, tmp_pa
             )
         ).all()
     assert [tuple(r) for r in rows] == [(2031, 1, 1.5), (2031, 2, 2.5)]
+
+
+def test_insert_time_points_one_per_month(get_engine_with_tables):
+    import numpy as np
+    import xarray as xr
+
+    def ds(times):
+        return xr.Dataset(coords={"time": np.array(times, dtype="datetime64[ns]")})
+
+    with get_engine_with_tables.begin() as conn:
+        conn.execute(text("TRUNCATE TABLE time_point RESTART IDENTITY CASCADE"))
+    # same day at different times, and mid-month dates: one point per month
+    prod._insert_time_points(
+        get_engine_with_tables,
+        {
+            "a": ds(["2020-01-01T00:00", "2020-02-01"]),
+            "b": ds(["2020-01-01T12:00", "2020-02-15"]),
+        },
+    )
+    # a later file dated mid-month adds no second point for a stored month
+    prod._insert_time_points(
+        get_engine_with_tables, {"c": ds(["2020-01-15", "2020-03-31"])}
+    )
+    with get_engine_with_tables.connect() as conn:
+        rows = conn.execute(
+            text("SELECT year, month, day FROM time_point ORDER BY year, month")
+        ).all()
+        conn.execute(text("TRUNCATE TABLE time_point RESTART IDENTITY CASCADE"))
+        conn.commit()
+    assert [tuple(r) for r in rows] == [(2020, 1, 1), (2020, 2, 1), (2020, 3, 1)]

@@ -510,13 +510,25 @@ Optional keys for `grid` and `nuts` variables:
 
 All `grid` variables must be on the same grid. The grid points of a coarser resolution are the points whose latitude and longitude are multiples of that resolution (e.g. every second 0.1° point for 0.2°). A resolution is only stored if it is a whole multiple of the grid step of the data.
 
-The frontend only requests the resolutions of the resolution groups (0.1, 0.2, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0 and 5.0°), on grid points that are multiples of the resolution. Data on any other grid could not be shown, so the loader stops with an error before it stores anything if a `grid` variable:
+The frontend only requests the resolutions of the resolution groups (0.1, 0.2, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0 and 5.0°), on grid points that are multiples of the resolution. Data on any other grid could not be shown, so the loader stops with an error before it stores any values of that variable if a `grid` variable:
 
 - is not on a regular grid with the same step on both axes and at least two points per axis,
 - has a grid step that is not one of the resolution groups (e.g. 0.25° ERA5 data), or
 - has coordinates that are not multiples of its grid step, such as a grid that is offset by half a step (cell centres at 0.05, 0.15, … for 0.1°, or at 0.25, 0.75, … for 0.5°).
 
 The current J-Model and P-Model data are on a 0.1° grid with coordinates on whole tenths of a degree (90.0, 89.9, …, -179.9) and load as they are. Regrid or shift other data to such a grid first.
+
+Rows that do not depend on the data, such as NUTS definitions, variable types, resolution groups and time points, may already be stored at that point.
+
+#### Time points and reloading
+
+The database is monthly. Every time point is the first day of a month, and a value dated on any other day (e.g. a NUTS file stamped on the 15th) is stored under the first day of its month. A `grid` variable with more than one time step in a month is rejected; aggregate it to monthly values first.
+
+A `grid` variable that already has values for one of its months is rejected before anything is stored, e.g. when the load is run again without resetting the tables, or when two files or configuration entries cover the same months. If a load fails partway through, the values of that variable stored so far are removed again, and a stored grid that no values use yet is replaced by the grid of the next variable.
+
+#### Precision
+
+Gridded values are stored as float32, which keeps about 7 significant digits. Integers above 2^24 (about 16.7 million) are no longer exact: 123456789 is returned as 123456792. NUTS values are stored as float64 and are not limited this way, so the gridded and NUTS values of the same quantity can differ in the 8th digit.
 
 #### Storage of gridded values
 

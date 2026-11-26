@@ -290,17 +290,30 @@ def insert_grid_var_values(engine: engine.Engine, grid_vars: list[GridVar]) -> i
 
 
 def _insert_time_points(engine: engine.Engine, datasets: dict[str, xr.Dataset]):
-    """Insert the (monthly) time points of all datasets that are not stored yet."""
+    """Insert the months of all datasets that have no time point yet.
+
+    The database is monthly: a time point is the first day of a month, and a
+    value dated on any day of that month belongs to it. A month that already
+    has a time point (whatever its day) gets no second one.
+    """
     session = db.create_session(engine)
-    stored = {(tp.year, tp.month, tp.day) for tp in session.query(db.TimePoint)}
-    times = np.unique(np.concatenate([ds.time.to_numpy() for ds in datasets.values()]))
-    new = [t for t in times if pd.Timestamp(t).timetuple()[:3] not in stored]
-    if new:
-        db.insert_time_points(
-            session, time_point_data=[(np.array(new, dtype=times.dtype), False)]
+    try:
+        stored = {
+            (year, month)
+            for year, month in session.query(db.TimePoint.year, db.TimePoint.month)
+        }
+        months = db.month_starts(
+            np.concatenate([ds.time.to_numpy() for ds in datasets.values()])
         )
-    session.commit()
-    session.close()
+        new = [t for t in months if pd.Timestamp(t).timetuple()[:2] not in stored]
+        if new:
+            db.insert_time_points(
+                session,
+                time_point_data=[(np.array(new, dtype="datetime64[ns]"), False)],
+            )
+        session.commit()
+    finally:
+        session.close()
 
 
 def insert_nuts_var_values(engine: engine.Engine, nuts_vars: list[NutsVar]) -> int:
