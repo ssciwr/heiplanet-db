@@ -1,8 +1,16 @@
 # Plan: store gridded values as compressed tiles instead of one row per value
 
-Status: proposal, 2026-11-23. Follows the storage quick wins on branch
-`include-pmodel` (narrower column types, no PostGIS point, constraints rebuilt
-after the bulk load, binary COPY loader).
+Status: implemented, 2026-11-26. All steps are done; tiles are the only
+storage, and the row tables are dropped by `upgrade_schema`. Measured results
+are in `docs/deployment.md` (section "Measured resources of the gridded
+variables"): 0.5 GB instead of 9.8 GB, loading in 1.5 min instead of 8 min,
+a global 0.1° request in 0.2 s instead of 10 s. Steps 5 and 6 were merged:
+the comparison was run on the 2014–2018 data, and the row storage was removed
+right after instead of being kept for one release.
+
+Originally a proposal from 2026-11-23, following the storage quick wins on
+branch `include-pmodel` (narrower column types, no PostGIS point, constraints
+rebuilt after the bulk load, binary COPY loader).
 
 ## Why
 

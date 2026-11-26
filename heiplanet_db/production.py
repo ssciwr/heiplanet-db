@@ -241,21 +241,15 @@ def _check_same_grid(datasets: dict[str, xr.Dataset]) -> xr.Dataset:
     return reference
 
 
-def insert_grid_var_values(
-    engine: engine.Engine, grid_vars: list[GridVar], storage: str = "rows"
-) -> int:
-    """Insert grid points, time points and values of all gridded variables.
+def insert_grid_var_values(engine: engine.Engine, grid_vars: list[GridVar]) -> int:
+    """Insert time points and the values of all gridded variables as tiles.
+
+    See `db.insert_var_tiles`. All variables must share one grid.
 
     Args:
         engine (engine.Engine): SQLAlchemy engine object.
         grid_vars (list[GridVar]): Gridded variables to insert.
-        storage (str): "rows" (one row per value in `var_value`) or "tiles"
-            (compressed tiles in `var_tile`, no grid points). Defaults to "rows".
     """
-    if storage not in db.STORAGES:
-        raise ValueError(
-            f"Unknown storage {storage}; use one of {sorted(db.STORAGES)}."
-        )
     names = {gv.name for gv in grid_vars}
     for gv in grid_vars:
         if gv.aggregation not in AGGREGATIONS:
@@ -267,89 +261,11 @@ def insert_grid_var_values(
                 "variable in the configuration."
             )
     datasets = {gv.name: open_grid_dataset(gv) for gv in grid_vars}
-    reference = _check_same_grid(datasets)
-    if storage == "tiles":
-        _insert_grid_var_tiles(engine, grid_vars, datasets)
-        return 0
+    _check_same_grid(datasets)
 
-    # add grid points
-    grid_point_session = db.create_session(engine)
-    db.insert_grid_points(
-        grid_point_session,
-        latitudes=reference.latitude.to_numpy(),
-        longitudes=reference.longitude.to_numpy(),
-    )
-    grid_point_session.commit()
-    grid_point_session.close()
-    # add time points of all variables (monthly data)
-    _insert_time_points(engine, datasets)
-    # get id maps for grid, time, variable types and resolutions
-    print("Getting id maps for grid, time, and variable types.")
-    id_map_session = db.create_session(engine)
-    grid_id_map, time_id_map, var_type_id_map = db.get_id_maps(id_map_session)
-    resolution_id_map = db.get_resolution_id_map(id_map_session)
-    id_map_session.close()
-
-    for gv in grid_vars:
-        print(f"Inserting values of {gv.name} ({gv.aggregation}) into the database.")
-        ds = datasets[gv.name]
-        if gv.aggregation == "subsample":
-            # rechunk the dataset
-            ds = ds.chunk({"time": 1, "latitude": 180, "longitude": 360})
-            ds = db.apply_transform(ds, gv.transform, gv.transform_floor)
-            db.insert_var_values(
-                engine, ds, gv.name, grid_id_map, time_id_map, var_type_id_map
-            )
-        else:
-            mask = None
-            if gv.mask_by is not None:
-                mask = datasets[gv.mask_by][gv.mask_by].notnull()
-            db.insert_var_values_by_resolution(
-                engine,
-                ds,
-                gv.name,
-                grid_id_map,
-                time_id_map,
-                var_type_id_map,
-                resolution_id_map,
-                mask=mask,
-                transform=gv.transform,
-                transform_floor=gv.transform_floor,
-            )
-    # assign resolution groups to grid points
-    print("Assigning resolution groups to grid points.")
-    resolution_session = db.create_session(engine)
-    db.assign_grid_resolution_group_to_grid_point(resolution_session)
-    resolution_session.close()
-    print("Variable values inserted and resolution groups assigned.")
-    return 0
-
-
-def _insert_time_points(engine: engine.Engine, datasets: dict[str, xr.Dataset]):
-    """Insert the (monthly) time points of all datasets that are not stored yet.
-
-    Skipping stored ones allows loading the same data as rows and as tiles
-    into one database, e.g. to compare the two.
-    """
-    session = db.create_session(engine)
-    stored = {(tp.year, tp.month, tp.day) for tp in session.query(db.TimePoint)}
-    times = np.unique(np.concatenate([ds.time.to_numpy() for ds in datasets.values()]))
-    new = [t for t in times if pd.Timestamp(t).timetuple()[:3] not in stored]
-    if new:
-        db.insert_time_points(
-            session, time_point_data=[(np.array(new, dtype=times.dtype), False)]
-        )
-    session.commit()
-    session.close()
-
-
-def _insert_grid_var_tiles(
-    engine: engine.Engine, grid_vars: list[GridVar], datasets: dict[str, xr.Dataset]
-) -> None:
-    """Insert time points and the values of all gridded variables as tiles."""
     _insert_time_points(engine, datasets)
     session = db.create_session(engine)
-    _, time_id_map, var_type_id_map = db.get_id_maps(session)
+    time_id_map, var_type_id_map = db.get_id_maps(session)
     resolution_id_map = db.get_resolution_id_map(session)
     session.close()
     for gv in grid_vars:
@@ -370,6 +286,21 @@ def _insert_grid_var_tiles(
             transform_floor=gv.transform_floor,
         )
     print("Variable tiles inserted.")
+    return 0
+
+
+def _insert_time_points(engine: engine.Engine, datasets: dict[str, xr.Dataset]):
+    """Insert the (monthly) time points of all datasets that are not stored yet."""
+    session = db.create_session(engine)
+    stored = {(tp.year, tp.month, tp.day) for tp in session.query(db.TimePoint)}
+    times = np.unique(np.concatenate([ds.time.to_numpy() for ds in datasets.values()]))
+    new = [t for t in times if pd.Timestamp(t).timetuple()[:3] not in stored]
+    if new:
+        db.insert_time_points(
+            session, time_point_data=[(np.array(new, dtype=times.dtype), False)]
+        )
+    session.commit()
+    session.close()
 
 
 def insert_nuts_var_values(engine: engine.Engine, nuts_vars: list[NutsVar]) -> int:
@@ -381,7 +312,7 @@ def insert_nuts_var_values(engine: engine.Engine, nuts_vars: list[NutsVar]) -> i
     """
     check_paths([nv.path for nv in nuts_vars])
     id_map_session = db.create_session(engine)
-    _, time_id_map, var_type_id_map = db.get_id_maps(id_map_session)
+    time_id_map, var_type_id_map = db.get_id_maps(id_map_session)
     id_map_session.close()
     datasets: dict[Path, xr.Dataset] = {}
     for nv in nuts_vars:
@@ -420,11 +351,7 @@ def reset_production_data(engine: engine.Engine) -> None:
                 TRUNCATE TABLE
                     var_tile,
                     grid_def,
-                    grid_point_resolution,
                     var_value_nuts,
-                    var_coverage,
-                    var_value,
-                    grid_point,
                     time_point,
                     var_type,
                     resolution_group,
@@ -644,12 +571,6 @@ def main(drop_tables: bool = False, config_path: str | None = None) -> None:
     """
     # set up production database and data lake using the provided config
     config = read_production_config(_resolve_config_path(config_path))
-    # "rows" or "tiles", see insert_grid_var_values; checked before any download
-    storage = config.get("storage", "rows")
-    if storage not in db.STORAGES:
-        raise ValueError(
-            f"Unknown storage {storage}; use one of {sorted(db.STORAGES)}."
-        )
     shapefile_folder_path = None
     grid_vars: list[GridVar] = []
     nuts_vars: list[NutsVar] = []
@@ -691,92 +612,44 @@ def main(drop_tables: bool = False, config_path: str | None = None) -> None:
     resolution_session.close()
 
     # load data with optimization
-    load_data_with_optimization(
-        engine,
-        grid_vars=grid_vars,
-        nuts_vars=nuts_vars,
-        storage=storage,
-    )
+    load_data_with_optimization(engine, grid_vars=grid_vars, nuts_vars=nuts_vars)
 
 
-def _restore_after_bulk_load(engine: engine.Engine, after_error: bool) -> None:
-    """Re-enable autovacuum and restore the constraints after a bulk load.
+# tables that receive most of the rows of a load
+BULK_LOAD_TABLES = ("time_point", "var_tile", "var_value_nuts")
 
-    Autovacuum is re-enabled first, so it is back on even if the constraints
-    cannot be restored. Restoring them fails if the loaded data has duplicate
-    rows or unknown IDs. After a successful load that error is raised. After a
-    failed load it is only reported, so that it does not hide the error that
-    stopped the load; the constraints then stay missing until the data is
-    fixed and `db.add_bulk_load_constraints` is run.
 
-    Args:
-        engine (engine.Engine): SQLAlchemy engine object.
-        after_error (bool): Whether the load itself failed.
-    """
-    print("DEBUG: Re-enabling autovacuum on all tables...")
+def _set_autovacuum(engine: engine.Engine, enabled: bool) -> None:
+    """Switch autovacuum on or off for `BULK_LOAD_TABLES`."""
     with engine.begin() as conn:
-        for table in ("grid_point", "time_point", "var_value", "var_value_nuts"):
-            conn.execute(text(f"ALTER TABLE {table} SET (autovacuum_enabled = true);"))
-    print("DEBUG: Autovacuum re-enabled on all tables.")
-
-    print("Restoring the constraints of var_value and var_coverage...")
-    try:
-        db.add_bulk_load_constraints(engine)
-    except Exception as e:
-        if not after_error:
-            raise
-        print(
-            "Warning: could not restore the constraints of var_value and "
-            f"var_coverage after the failed load: {e}"
-        )
+        for table in BULK_LOAD_TABLES:
+            conn.execute(
+                text(f"ALTER TABLE {table} SET (autovacuum_enabled = {enabled});")
+            )
 
 
 def load_data_with_optimization(
     engine: engine.Engine,
     grid_vars: list[GridVar] | None = None,
     nuts_vars: list[NutsVar] | None = None,
-    storage: str = "rows",
 ) -> None:
     """
     Load data into the database with autovacuum disabled for performance.
-    Gridded variables are stored as `storage` ("rows" or "tiles"), see
-    `insert_grid_var_values`.
-    The unique and foreign key constraints of var_value and var_coverage are
-    dropped during the load and created again afterwards, which is much faster
-    and gives a smaller index. Ensures autovacuum and the constraints are
-    restored even if an error occurs.
+    Autovacuum is enabled again afterwards, also if an error occurs, and the
+    database is vacuumed and analyzed.
     """
+    _set_autovacuum(engine, enabled=False)
     try:
-        db.drop_bulk_load_constraints(engine)
-        # Disable autovacuum globally for all tables during bulk load
-        with engine.begin() as conn:
-            conn.execute(
-                text("ALTER TABLE grid_point SET (autovacuum_enabled = false);")
-            )
-            conn.execute(
-                text("ALTER TABLE time_point SET (autovacuum_enabled = false);")
-            )
-            conn.execute(
-                text("ALTER TABLE var_value SET (autovacuum_enabled = false);")
-            )
-            conn.execute(
-                text("ALTER TABLE var_value_nuts SET (autovacuum_enabled = false);")
-            )
-
-        # insert the data
         if grid_vars:
-            insert_grid_var_values(engine, grid_vars, storage=storage)
+            insert_grid_var_values(engine, grid_vars)
             print("DEBUG: insert_grid_var_values completed.")
-        # insert the nuts variables data
         if nuts_vars:
             insert_nuts_var_values(engine, nuts_vars)
             print("DEBUG: insert_nuts_var_values completed.")
         print("DEBUG: All variable value inserts done.")
-    except BaseException:
-        # restore what we can, but let the original error propagate
-        _restore_after_bulk_load(engine, after_error=True)
-        raise
-    _restore_after_bulk_load(engine, after_error=False)
+    finally:
+        _set_autovacuum(engine, enabled=True)
+        print("DEBUG: Autovacuum re-enabled on all tables.")
 
     # Run VACUUM in autocommit mode (outside transaction)
     print("DEBUG: Running VACUUM ANALYZE...")

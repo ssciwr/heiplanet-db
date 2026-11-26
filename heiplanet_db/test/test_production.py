@@ -4,7 +4,6 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from fastapi import HTTPException
 from sqlalchemy import text
 
 from heiplanet_db import production as prod
@@ -279,10 +278,9 @@ def test_reset_production_data_executes_truncate_statement():
     # The SQLAlchemy text object should contain our TRUNCATE statement and key tables.
     sql_str = str(sql_arg)
     assert "TRUNCATE TABLE" in sql_str
-    assert "grid_point_resolution" in sql_str
+    assert "var_tile" in sql_str
+    assert "grid_def" in sql_str
     assert "var_value_nuts" in sql_str
-    assert "var_value" in sql_str
-    assert "grid_point" in sql_str
     assert "time_point" in sql_str
     assert "var_type" in sql_str
     assert "resolution_group" in sql_str
@@ -452,6 +450,16 @@ def test_main():
         pytest.fail(f"Main function raised an exception: {e}")
 
 
+def _assert_autovacuum_enabled(engine):
+    """The load sets autovacuum_enabled explicitly, so it must be 'true'."""
+    with engine.connect() as conn:
+        for table in prod.BULK_LOAD_TABLES:
+            reloptions = conn.execute(
+                text("SELECT reloptions FROM pg_class WHERE relname = :t"), {"t": table}
+            ).scalar_one()
+            assert "autovacuum_enabled=true" in (reloptions or []), (table, reloptions)
+
+
 def test_autovacuum_restoration_on_failure(get_engine_with_tables, monkeypatch):
     engine = get_engine_with_tables
 
@@ -465,97 +473,7 @@ def test_autovacuum_restoration_on_failure(get_engine_with_tables, monkeypatch):
     with pytest.raises(RuntimeError, match="Insertion failed"):
         prod.load_data_with_optimization(engine, grid_vars=grid_vars)
 
-    # Verify autovacuum is enabled for all tables
-    with engine.connect() as conn:
-        for table in ["grid_point", "time_point", "var_value", "var_value_nuts"]:
-            result = conn.execute(
-                text(f"SELECT reloptions FROM pg_class WHERE relname = '{table}'")
-            )
-            row = result.fetchone()
-            # If autovacuum was disabled and NOT re-enabled, it would likely show up in reloptions.
-            # Postgres doesn't always clear the option when set to true, it might show 'autovacuum_enabled=true'.
-            # Or if it was reset, it might be None.
-            # IMPORTANT: The code explicitly sets it to true.
-            reloptions = row[0] if row else []
-            if reloptions:
-                opts = {k: v for k, v in (x.split("=") for x in reloptions)}
-                assert opts.get("autovacuum_enabled") == "true", (
-                    f"Autovacuum not enabled for {table}: {reloptions}"
-                )
-
-
-def test_failed_load_with_bad_data_keeps_original_error(
-    get_engine_with_tables, monkeypatch
-):
-    """If the constraints cannot be restored after a failed load, the load's
-    own error is raised and autovacuum is still re-enabled."""
-    engine = get_engine_with_tables
-
-    def insert_bad_row_and_fail(*_args, **_kwargs):
-        # a row with unknown IDs: restoring the foreign keys fails
-        with engine.begin() as conn:
-            conn.execute(
-                text(
-                    "INSERT INTO var_value (grid_id, time_id, var_id, value) "
-                    "VALUES (999, 999, 99, 1.0)"
-                )
-            )
-        raise RuntimeError("Insertion failed")
-
-    grid_vars = [prod.GridVar("R0", [Path("dummy.nc")])]
-    try:
-        monkeypatch.setattr(prod, "insert_grid_var_values", insert_bad_row_and_fail)
-        with pytest.raises(RuntimeError, match="Insertion failed"):
-            prod.load_data_with_optimization(engine, grid_vars=grid_vars)
-
-        with engine.connect() as conn:
-            for table in ["grid_point", "time_point", "var_value", "var_value_nuts"]:
-                reloptions = conn.execute(
-                    text("SELECT reloptions FROM pg_class WHERE relname = :t"),
-                    {"t": table},
-                ).scalar()
-                assert "autovacuum_enabled=true" in (reloptions or []), table
-            # the constraints could not be restored
-            assert (
-                conn.execute(
-                    text("SELECT 1 FROM pg_constraint WHERE conname = 'fk_grid_id'")
-                ).first()
-                is None
-            )
-    finally:
-        with engine.begin() as conn:
-            conn.execute(text("DELETE FROM var_value"))
-        prod.db.add_bulk_load_constraints(engine)
-
-
-def test_constraint_error_after_successful_load_is_raised(
-    get_engine_with_tables, monkeypatch
-):
-    engine = get_engine_with_tables
-
-    def insert_bad_row(*_args, **_kwargs):
-        with engine.begin() as conn:
-            conn.execute(
-                text(
-                    "INSERT INTO var_value (grid_id, time_id, var_id, value) "
-                    "VALUES (999, 999, 99, 1.0)"
-                )
-            )
-
-    grid_vars = [prod.GridVar("R0", [Path("dummy.nc")])]
-    try:
-        monkeypatch.setattr(prod, "insert_grid_var_values", insert_bad_row)
-        with pytest.raises(Exception, match="fk_"):
-            prod.load_data_with_optimization(engine, grid_vars=grid_vars)
-        with engine.connect() as conn:
-            reloptions = conn.execute(
-                text("SELECT reloptions FROM pg_class WHERE relname = 'var_value'")
-            ).scalar()
-        assert "autovacuum_enabled=true" in (reloptions or [])
-    finally:
-        with engine.begin() as conn:
-            conn.execute(text("DELETE FROM var_value"))
-        prod.db.add_bulk_load_constraints(engine)
+    _assert_autovacuum_enabled(engine)
 
 
 def test_autovacuum_restoration_on_success(get_engine_with_tables):
@@ -568,8 +486,9 @@ def test_autovacuum_restoration_on_success(get_engine_with_tables):
         patch("heiplanet_db.production.insert_nuts_var_values") as insert_nuts,
     ):
         prod.load_data_with_optimization(engine, grid_vars=grid_vars)
-    insert_grid.assert_called_once_with(engine, grid_vars, storage="rows")
+    insert_grid.assert_called_once_with(engine, grid_vars)
     insert_nuts.assert_not_called()
+    _assert_autovacuum_enabled(engine)
 
 
 def test_load_data_with_optimization_nuts_only(get_engine_with_tables):
@@ -583,19 +502,7 @@ def test_load_data_with_optimization_nuts_only(get_engine_with_tables):
     insert_grid.assert_not_called()
     insert_nuts.assert_called_once_with(engine, nuts_vars)
 
-    # Verify autovacuum is enabled
-    with engine.connect() as conn:
-        for table in ["grid_point", "time_point", "var_value", "var_value_nuts"]:
-            result = conn.execute(
-                text(f"SELECT reloptions FROM pg_class WHERE relname = '{table}'")
-            )
-            row = result.fetchone()
-            reloptions = row[0] if row else []
-            if reloptions:
-                opts = {k: v for k, v in (x.split("=") for x in reloptions)}
-                assert opts.get("autovacuum_enabled") == "true", (
-                    f"Autovacuum not enabled for {table}: {reloptions}"
-                )
+    _assert_autovacuum_enabled(engine)
 
 
 # --- config handling for several variables and files ---
@@ -891,16 +798,18 @@ def test_insert_grid_var_values_end_to_end(get_engine_with_tables, tmp_path):
     with engine.connect() as conn:
         rows = conn.execute(
             text(
-                "SELECT vt.name, rg.resolution, COUNT(*), MIN(vv.value), "
-                "MAX(vv.value) FROM var_value vv "
-                "JOIN var_type vt ON vt.id = vv.var_id "
-                "LEFT JOIN resolution_group rg ON rg.id = vv.resolution_id "
+                "SELECT vt.name, rg.resolution, COUNT(*), MIN(v.value), "
+                "MAX(v.value) FROM var_value_v v "
+                "JOIN var_type vt ON vt.id = v.var_id "
+                "JOIN resolution_group rg ON rg.id = v.resolution_id "
                 "GROUP BY vt.name, rg.resolution ORDER BY vt.name, rg.resolution"
             )
         ).all()
-    summary = {(name, None if res is None else float(res)): r for name, res, *r in rows}
-    # R0: 4 months x 20 land cells, one row each (no resolution)
-    assert summary[("R0", None)] == [80, 1.0, 1.0]
+    summary = {(name, float(res)): r for name, res, *r in rows}
+    # R0: 4 months x 20 land cells (the first column is ocean, NaN)
+    assert summary[("R0", 0.1)] == [80, 1.0, 1.0]
+    # R0 at 0.2: every second point, 3 x 2 land points
+    assert summary[("R0", 0.2)] == [24, 1.0, 1.0]
     # adults at 0.1: ocean column masked out, so the zeros are gone
     assert summary[("adults", 0.1)] == [80, 2.0, 2.0]
     # adults at 0.2: 3x3 coarse cells; the column at lon 0.0 still has land
@@ -1040,10 +949,10 @@ def test_insert_grid_and_nuts_values_with_transform(get_engine_with_tables, tmp_
     with engine.connect() as conn:
         rows = conn.execute(
             text(
-                "SELECT vt.name, rg.resolution, COUNT(*), MIN(vv.value), "
-                "MAX(vv.value) FROM var_value vv "
-                "JOIN var_type vt ON vt.id = vv.var_id "
-                "LEFT JOIN resolution_group rg ON rg.id = vv.resolution_id "
+                "SELECT vt.name, rg.resolution, COUNT(*), MIN(v.value), "
+                "MAX(v.value) FROM var_value_v v "
+                "JOIN var_type vt ON vt.id = v.var_id "
+                "JOIN resolution_group rg ON rg.id = v.resolution_id "
                 "GROUP BY vt.name, rg.resolution ORDER BY vt.name, rg.resolution"
             )
         ).all()
@@ -1055,22 +964,11 @@ def test_insert_grid_and_nuts_values_with_transform(get_engine_with_tables, tmp_
                 )
             ).all()
         )
-    summary = {(n, None if r is None else float(r)): rest for n, r, *rest in rows}
+    summary = {(n, float(r)): rest for n, r, *rest in rows}
     log2 = float(np.log10(2.0))
-    # R0 = 1 everywhere -> log10 = 0 at every covered grid point: no rows,
-    # only the coverage
-    assert ("R0_log10", None) not in summary
-    with engine.connect() as conn:
-        coverage = dict(
-            conn.execute(
-                text(
-                    "SELECT vt.name, COUNT(*) FROM var_coverage c "
-                    "JOIN var_type vt ON vt.id = c.var_id GROUP BY vt.name"
-                )
-            ).all()
-        )
-    # 5 x 5 grid, first column is ocean
-    assert coverage["R0_log10"] == 20
+    # R0 = 1 everywhere -> log10 = 0 at the 20 land cells (5 x 5 grid, the
+    # first column is ocean), 4 months
+    assert summary[("R0_log10", 0.1)] == [80, 0.0, 0.0]
     session = db.create_session(engine)
     assert db.get_var_value(session, "R0_log10", 0.0, 0.1, 2023, 1, 1) == 0.0
     assert db.get_var_value(session, "R0_log10", 0.0, 0.0, 2023, 1, 1) is None
@@ -1080,182 +978,3 @@ def test_insert_grid_and_nuts_values_with_transform(get_engine_with_tables, tmp_
     np.testing.assert_allclose(summary[("adults_log10", 0.2)][1:], [log2, log2])
     # 100 -> 2, 0.5 is below the floor -> 0
     assert nuts == {1: 2.0, 2: 0.0}
-
-
-def _write_varied_grid_files(tmp_path: Path):
-    """R0 (with an ocean column) and adults (with zeros) on a 7x8 0.1 degree
-    grid, latitudes descending, three months."""
-    import numpy as np
-    import xarray as xr
-
-    rng = np.random.default_rng(42)
-    lats = np.round(np.arange(0.6, -0.05, -0.1), 1)
-    lons = np.round(np.arange(10.0, 10.75, 0.1), 1)
-    times = np.array(["2023-01-01", "2023-02-01", "2023-03-01"], "datetime64[ns]")
-    shape = (len(times), len(lats), len(lons))
-    r0 = rng.random(shape) * 3
-    r0[:, :, 0] = np.nan  # ocean
-    r0[0, 3, 3] = 0.0
-    adults = rng.random(shape) * 1000
-    adults[adults < 300] = 0.0
-    adults[:, 1:3, 4:6] = 0.0  # zero everywhere: covered zeros
-    coords = {"time": times, "latitude": lats, "longitude": lons}
-    dims = ("time", "latitude", "longitude")
-    r0_path, adults_path = tmp_path / "r0.nc", tmp_path / "adults.nc"
-    xr.Dataset({"R0": (dims, r0)}, coords=coords).to_netcdf(r0_path)
-    xr.Dataset({"adults": (dims, adults)}, coords=coords).to_netcdf(adults_path)
-    return r0_path, adults_path, lats, lons
-
-
-def test_rows_and_tiles_give_the_same_results(get_engine_with_tables, tmp_path):
-    import numpy as np
-
-    from heiplanet_db import postgresql_database as db
-
-    engine = get_engine_with_tables
-    r0_path, adults_path, lats, lons = _write_varied_grid_files(tmp_path)
-    grid_vars = [
-        prod.GridVar("R0", [r0_path]),
-        prod.GridVar(
-            "adults_log10",
-            [adults_path],
-            aggregation="mean",
-            mask_by="R0",
-            source_name="adults",
-            transform="log10",
-        ),
-    ]
-    session = db.create_session(engine)
-    db.insert_var_types(
-        session,
-        [
-            {"name": "R0", "unit": "1", "description": "r0"},
-            {
-                "name": "adults_log10",
-                "unit": "-",
-                "description": "adults",
-                "aggregation": "mean",
-            },
-        ],
-    )
-    db.insert_resolution_groups(session, resolutions=np.array([0.1, 0.2, 0.3]))
-    session.close()
-    prod.insert_grid_var_values(engine, grid_vars, storage="rows")
-    prod.insert_grid_var_values(engine, grid_vars, storage="tiles")
-
-    session = db.create_session(engine)
-    # both are stored; without STORAGE set, tiles are used
-    assert db.resolve_storage(session) == "tiles"
-    with pytest.raises(ValueError, match="Unknown storage"):
-        db.resolve_storage(session, "columns")
-
-    def both(func, *args, **kwargs):
-        results = []
-        for storage in ("rows", "tiles"):
-            try:
-                results.append(func(session, *args, storage=storage, **kwargs))
-            except HTTPException as e:
-                results.append(("error", e.status_code, e.detail))
-        return results
-
-    try:
-        _compare_rows_and_tiles(session, both, lats, lons, tmp_path)
-    finally:
-        session.close()
-
-
-def _compare_rows_and_tiles(session, both, lats, lons, tmp_path):
-    import numpy as np
-    import xarray as xr
-
-    from heiplanet_db import postgresql_database as db
-
-    areas = [
-        None,
-        (0.4, 10.2, 0.1, 10.5),
-        (0.45, 10.15, 0.05, 10.55),  # borders between grid points
-        (0.6, 10.0, 0.6, 10.0),  # a single point
-        (90, -180, -90, 180),
-    ]
-    for var_name in ("R0", "adults_log10"):
-        for resolution in (0.1, 0.2, 0.3):
-            for area in areas:
-                for month in (1, 2, 3):
-                    rows, tiled = both(
-                        db.get_var_values_cartesian,
-                        time_point=(2023, month),
-                        grid_resolution=resolution,
-                        area=area,
-                        var_name=var_name,
-                    )
-                    if isinstance(rows, tuple):  # an error
-                        assert tiled == rows
-                        continue
-                    rows = rows["latitude, longitude, var_value"]
-                    tiled = tiled["latitude, longitude, var_value"]
-                    assert len(rows) == len(tiled), (var_name, resolution, area)
-                    if rows:
-                        np.testing.assert_allclose(
-                            np.array(tiled, dtype=float),
-                            np.array(rows, dtype=float),
-                            rtol=1e-6,
-                            atol=1e-7,
-                        )
-
-    # the same errors
-    for kwargs in (
-        {"time_point": (2020, 1)},
-        {"time_point": (2023, 1), "grid_resolution": 0.5},
-        {"time_point": (2023, 1), "area": (50, 50, 40, 60)},
-        {"time_point": (2023, 1), "var_name": "eggs"},
-    ):
-        rows, tiled = both(db.get_var_values_cartesian, **kwargs)
-        assert rows[0] == "error" and tiled == rows
-
-    # single values, including off-grid points and missing time points
-    points = [(lat, lon) for lat in lats for lon in lons] + [(0.25, 10.2), (5, 5)]
-    for var_name in ("R0", "adults_log10", "eggs"):
-        for resolution in (None, 0.2, 0.3):
-            for lat, lon in points:
-                for month in (1, 3, 4):
-                    rows, tiled = both(
-                        db.get_var_value,
-                        var_name,
-                        float(lat),
-                        float(lon),
-                        2023,
-                        month,
-                        1,
-                        resolution=resolution,
-                    )
-                    key = (var_name, resolution, lat, lon, month)
-                    if rows is None:
-                        assert tiled is None, key
-                    else:
-                        np.testing.assert_allclose(tiled, rows, rtol=1e-6, err_msg=key)
-
-    # downloads
-    for area in (None, (0.4, 10.2, 0.1, 10.5)):
-        files = [tmp_path / f"{s}.nc" for s in ("rows", "tiles")]
-        for storage, path in zip(("rows", "tiles"), files):
-            db.get_var_values_cartesian_for_download(
-                session,
-                start_time_point=(2023, 1),
-                end_time_point=(2023, 3),
-                area=area,
-                netcdf_file=str(path),
-                storage=storage,
-            )
-        with xr.open_dataset(files[0]) as rows, xr.open_dataset(files[1]) as tiled:
-            np.testing.assert_allclose(tiled.latitude, rows.latitude)
-            np.testing.assert_allclose(tiled.longitude, rows.longitude)
-            np.testing.assert_array_equal(tiled.time, rows.time)
-            for name in ("R0", "adults_log10"):
-                np.testing.assert_allclose(
-                    tiled[name].values, rows[name].values, rtol=1e-6, atol=1e-7
-                )
-
-
-def test_insert_grid_var_values_unknown_storage():
-    with pytest.raises(ValueError, match="Unknown storage"):
-        prod.insert_grid_var_values(engine=None, grid_vars=[], storage="columns")
