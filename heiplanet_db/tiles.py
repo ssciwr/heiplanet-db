@@ -164,9 +164,14 @@ def area_to_index_range(
         tuple[int, int, int, int] | None: Half-open ranges
             (i_start, i_stop, j_start, j_stop), or None if no cell is in the
             area.
+
+    Raises:
+        ValueError: If a bound of `area` is NaN or infinite.
     """
     if area is None:
         return 0, grid.n_lat, 0, grid.n_lon
+    if not np.all(np.isfinite(area)):
+        raise ValueError(f"Area bounds must be finite numbers, got {tuple(area)}.")
     north, west, south, east = area
     i0, i1 = _axis_range(grid.lat0, grid.n_lat, grid.step, south, north)
     j0, j1 = _axis_range(grid.lon0, grid.n_lon, grid.step, west, east)
@@ -186,6 +191,51 @@ def tile_range(
     """
     ts = grid.tile_size
     return i0 // ts, (i1 - 1) // ts + 1, j0 // ts, (j1 - 1) // ts + 1
+
+
+def shortest_float64(values: np.ndarray) -> np.ndarray:
+    """Float32 values as the float64 of their shortest decimal form.
+
+    Widening float32 to float64 directly exposes the float32 rounding error
+    (0.3 becomes 0.30000001192092896). This instead returns, for each value,
+    the float64 nearest to the shortest decimal (at most 9 significant digits)
+    that rounds back to the same float32, i.e. what `str(np.float32(x))`
+    shows. NaN and infinite values are passed through.
+
+    Args:
+        values (np.ndarray): Float32 values, any shape.
+
+    Returns:
+        np.ndarray: Float64 array of the same shape.
+    """
+    shape = np.shape(values)
+    f32 = np.asarray(values, dtype=np.float32).reshape(-1)
+    x = f32.astype(np.float64)
+    result = x.copy()
+    todo = np.isfinite(x) & (x != 0)
+    if not todo.any():
+        return result.reshape(shape)
+    exponent = np.zeros(x.shape, dtype=np.int64)
+    exponent[todo] = np.floor(np.log10(np.abs(x[todo]))).astype(np.int64)
+    # any float32 has a round-tripping decimal with 9 significant digits,
+    # and one with <= 6 digits is found by rounding to 6 digits
+    with np.errstate(over="ignore", invalid="ignore"):
+        for digits in range(6, 10):
+            idx = np.nonzero(todo)
+            if idx[0].size == 0:
+                break
+            d = digits - 1 - exponent[idx]
+            # powers of ten are exact up to 1e22, so dividing an integer
+            # mantissa by one is correctly rounded
+            pos = d >= 0
+            scale = 10.0 ** np.abs(d)
+            mantissa = np.where(pos, np.round(x[idx] * scale), np.round(x[idx] / scale))
+            candidate = np.where(pos, mantissa / scale, mantissa * scale)
+            ok = candidate.astype(np.float32) == f32[idx]
+            ok_idx = tuple(a[ok] for a in idx)
+            result[ok_idx] = candidate[ok]
+            todo[ok_idx] = False
+    return result.reshape(shape)
 
 
 def encode_tile(values: np.ndarray) -> bytes:

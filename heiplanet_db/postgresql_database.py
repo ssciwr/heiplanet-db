@@ -1107,6 +1107,7 @@ def ensure_grid_defs(engine: engine.Engine, grids: dict[int, tiles.GridDef]) -> 
             same = np.allclose(
                 [stored_grid.lat0, stored_grid.lon0, stored_grid.step],
                 [grid.lat0, grid.lon0, grid.step],
+                rtol=0,
                 atol=tiles.COORD_ATOL,
             ) and (stored_grid.n_lat, stored_grid.n_lon, stored_grid.tile_size) == (
                 grid.n_lat,
@@ -1529,7 +1530,17 @@ def get_var_value(
     value = read_tile_values(
         session, var_type.id, resolution_id, [time_point.id], grid, (i, i + 1, j, j + 1)
     )[0, 0, 0]
-    return None if np.isnan(value) else float(value)
+    return None if np.isnan(value) else float(tiles.shortest_float64(value))
+
+
+def _area_to_index_range(
+    grid: tiles.GridDef, area: tuple[float, float, float, float] | None
+) -> tuple[int, int, int, int] | None:
+    """`tiles.area_to_index_range`, rejecting invalid areas with HTTP 400."""
+    try:
+        return tiles.area_to_index_range(grid, area)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 def get_var_values_cartesian(
@@ -1573,7 +1584,7 @@ def get_var_values_cartesian(
         )
 
     grid = get_grid_def(session, resolution_id)
-    index_range = None if grid is None else tiles.area_to_index_range(grid, area)
+    index_range = None if grid is None else _area_to_index_range(grid, area)
     if index_range is None:
         print(
             "No grid points found in the specified area or with the specified resolution."
@@ -1601,7 +1612,11 @@ def get_var_values_cartesian(
     lats = np.round(grid.latitudes(i0, i1), ROUND_DIGITS)[lat_idx]
     lons = np.round(grid.longitudes(j0, j1), ROUND_DIGITS)[lon_idx]
     values_list = list(
-        zip(lats.tolist(), lons.tolist(), values[lat_idx, lon_idx].tolist())
+        zip(
+            lats.tolist(),
+            lons.tolist(),
+            tiles.shortest_float64(values[lat_idx, lon_idx]).tolist(),
+        )
     )
     return {"latitude, longitude, var_value": values_list}
 
@@ -1660,7 +1675,7 @@ def get_var_values_cartesian_for_download(
         .first()
     )
     out_grid = None if finest is None else finest.to_grid()
-    out_range = None if out_grid is None else tiles.area_to_index_range(out_grid, area)
+    out_range = None if out_grid is None else _area_to_index_range(out_grid, area)
     if out_range is None:
         print("No grid points found in the specified area.")
         raise HTTPException(
@@ -1690,7 +1705,7 @@ def get_var_values_cartesian_for_download(
         )
         resolution_id = _finest_resolution_id(session, vt.id)
         grid = None if resolution_id is None else get_grid_def(session, resolution_id)
-        index_range = None if grid is None else tiles.area_to_index_range(grid, area)
+        index_range = None if grid is None else _area_to_index_range(grid, area)
         if index_range is not None:
             values = read_tile_values(
                 session, vt.id, resolution_id, time_ids, grid, index_range
@@ -1705,9 +1720,9 @@ def get_var_values_cartesian_for_download(
             ).astype(int)
             keep_r = (rows >= 0) & (rows < len(latitudes))
             keep_c = (cols >= 0) & (cols < len(longitudes))
-            values_array[:, rows[keep_r][:, None], cols[keep_c][None, :]] = values[
-                :, keep_r
-            ][:, :, keep_c]
+            values_array[:, rows[keep_r][:, None], cols[keep_c][None, :]] = (
+                tiles.shortest_float64(values[:, keep_r][:, :, keep_c])
+            )
         ds[vt.name] = (("time", "latitude", "longitude"), values_array)
         # NetCDF attributes cannot be None
         for attr in ("unit", "description"):

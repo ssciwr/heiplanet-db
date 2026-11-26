@@ -572,6 +572,23 @@ def test_get_var_values_cartesian(insert_data):
             time_point=(2023, 1),
             var_name="non_existing_var",
         )
+    # test for non-finite area bounds
+    for bad in (math.inf, math.nan):
+        with pytest.raises(HTTPException) as e:
+            postdb.get_var_values_cartesian(
+                insert_data,
+                time_point=(2023, 1),
+                area=(bad, 10.0, 10.0, 10.2),
+                var_name="t2m",
+            )
+        assert e.value.status_code == 400
+
+    # values come back in their shortest form, without float32 noise
+    ds_result = postdb.get_var_values_cartesian(
+        insert_data, time_point=(2023, 1), var_name="t2m"
+    )
+    for _, _, value in ds_result["latitude, longitude, var_value"]:
+        assert value == float(str(np.float32(value)))
 
 
 def test_get_var_values_cartesian_download(get_dataset, insert_data, tmp_path):
@@ -1301,6 +1318,20 @@ def test_insert_var_tiles_subsample(get_engine_with_tables, get_session):
     # every second point, ascending: latitudes 0.0, 0.2, 0.4
     _, coarse = _read_tiles(get_session, resolution_id_map[0.2])
     np.testing.assert_array_equal(coarse, values[0, ::-2][:, ::2])
+
+
+def test_ensure_grid_defs_tolerance(get_engine_with_tables, get_session):
+    postdb.insert_resolution_groups(get_session, np.array([0.1]))
+    resolution_id = postdb.get_resolution_id_map(get_session)[0.1]
+    grid = tiles.GridDef(-89.9, -179.9, 0.1, 1799, 3599, 100)
+    postdb.ensure_grid_defs(get_engine_with_tables, {resolution_id: grid})
+    # within COORD_ATOL: same grid
+    close = tiles.GridDef(-89.9, -179.9 + 0.4e-4, 0.1, 1799, 3599, 100)
+    postdb.ensure_grid_defs(get_engine_with_tables, {resolution_id: close})
+    # outside COORD_ATOL, though within the default relative tolerance
+    shifted = tiles.GridDef(-89.9, -179.9015, 0.1, 1799, 3599, 100)
+    with pytest.raises(ValueError, match="differs from the stored one"):
+        postdb.ensure_grid_defs(get_engine_with_tables, {resolution_id: shifted})
 
 
 def test_insert_var_tiles_errors(get_engine_with_tables):

@@ -88,6 +88,31 @@ def test_area_to_index_range(grid):
     assert tiles.area_to_index_range(grid, (10, 20, 5, 30)) is None
     # a single cell
     assert tiles.area_to_index_range(grid, (0, 12.5, 0, 12.5)) == (3, 4, 5, 6)
+    # non-finite bounds
+    for bad in (np.inf, -np.inf, np.nan):
+        with pytest.raises(ValueError, match="finite"):
+            tiles.area_to_index_range(grid, (bad, 11.0, -0.5, 12.0))
+
+
+def test_shortest_float64():
+    values = np.array(
+        [[0.3, 293.15, 0.0, -1.25e-5], [np.nan, np.inf, 3.4e38, 1e-30]],
+        dtype=np.float32,
+    )
+    result = tiles.shortest_float64(values)
+    assert result.dtype == np.float64 and result.shape == values.shape
+    assert result[0].tolist() == [0.3, 293.15, 0.0, -1.25e-5]
+    assert np.isnan(result[1, 0]) and result[1, 1] == np.inf
+    # always the same float32, and the shortest decimal for random values
+    rng = np.random.default_rng(0)
+    random = (rng.standard_normal(10_000) * 10.0 ** rng.integers(-8, 8, 10_000)).astype(
+        np.float32
+    )
+    shortest = tiles.shortest_float64(random)
+    np.testing.assert_array_equal(shortest.astype(np.float32), random)
+    np.testing.assert_array_equal(shortest, random.astype(str).astype(np.float64))
+    # scalars
+    assert float(tiles.shortest_float64(np.float32(0.3))) == 0.3
 
 
 def test_tile_range(grid):
