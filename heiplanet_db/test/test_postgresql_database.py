@@ -1,18 +1,17 @@
 import math
 
-import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pytest
 import xarray as xr
 from conftest import cleanup
 from fastapi import HTTPException
-from shapely.geometry import Polygon
 from sqlalchemy import inspect, text
 from sqlalchemy.orm.session import Session
 from testcontainers.postgres import PostgresContainer
 
 from heiplanet_db import postgresql_database as postdb
+from heiplanet_db import tiles
 
 # for local docker desktop,
 # environ["DOCKER_HOST"] is "unix:///home/[user]/.docker/desktop/docker.sock"
@@ -40,13 +39,12 @@ def get_missing_tables(engine):
     inspector = inspect(engine)
     expected_tables = {
         "nuts_def",
-        "grid_point",
         "time_point",
         "var_type",
-        "var_value",
         "var_value_nuts",
         "resolution_group",
-        "grid_point_resolution",
+        "grid_def",
+        "var_tile",
     }
     existing_tables = set(inspector.get_table_names(schema="public"))
     missing_tables = expected_tables - existing_tables
@@ -234,23 +232,6 @@ def test_add_data_list_bulk_invalid(get_session, capsys):
     # TODO check it again
 
 
-def test_insert_grid_points(get_session):
-    latitudes = np.array([0.0, 1.0])
-    longitudes = np.array([0.0, 1.0])
-    postdb.insert_grid_points(get_session, latitudes, longitudes)
-
-    result = get_session.query(postdb.GridPoint).all()
-    assert len(result) == 4
-    assert math.isclose(result[0].latitude, 0.0, abs_tol=1e-5)
-    assert math.isclose(result[0].longitude, 0.0, abs_tol=1e-5)
-    assert math.isclose(result[1].latitude, 0.0, abs_tol=1e-5)
-    assert math.isclose(result[1].longitude, 1.0, abs_tol=1e-5)
-
-    # clean up
-    get_session.execute(text("TRUNCATE TABLE grid_point RESTART IDENTITY CASCADE"))
-    get_session.commit()
-
-
 def test_insert_resolution_groups(get_session):
     # first default case
     postdb.insert_resolution_groups(get_session)
@@ -258,135 +239,6 @@ def test_insert_resolution_groups(get_session):
     assert len(result) == 9
     assert math.isclose(result[0].resolution, 0.1, abs_tol=1e-5)
     assert result[0].description == "0.1 degree resolution"
-
-
-def test_assign_grid_resolution_group_to_grid_point(get_session):
-    # insert resolution groups first
-    postdb.insert_resolution_groups(get_session)
-    # insert grid points - mix of 0.1 and 0.2 degree resolution
-    latitudes = np.array([0.0, 0.1, 0.2, 0.3, 0.4])
-    longitudes = np.array([0.0, 0.1, 0.2, 0.3, 0.4])
-    postdb.insert_grid_points(get_session, latitudes, longitudes)
-    # assign resolution groups
-    postdb.assign_grid_resolution_group_to_grid_point(get_session)
-    # check results
-    # 0.1 degree resolution: all points
-    # 0.2 degree resolution: points where round(lat*10) % 2 == 0 AND round(lon*10) % 2 == 0
-    # 0.5 degree resolution: points where round(lat*10) % 5 == 0 AND round(lon*10) % 5 == 0
-    result = get_session.query(postdb.GridPointResolution).all()
-    # All 25 grid points (5x5) should be in 0.1 degree resolution
-    # 9 grid points should be in 0.2 degree resolution
-    # 1 grid point should be each in 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 5.0 degree resolution
-    assert len(result) == 41, f"Expected 40 entries, got {len(result)}"
-    # Check that all grid points have 0.1 degree resolution
-    grid_points = get_session.query(postdb.GridPoint).all()
-    assert len(grid_points) == 25
-    resolution_0_1 = (
-        get_session.query(postdb.ResolutionGroup)
-        .filter(postdb.ResolutionGroup.resolution == 0.1)
-        .first()
-    )
-    assert math.isclose(resolution_0_1.resolution, 0.1, abs_tol=1e-5)
-    # get all the grid points with resolution_0_1.id
-    gp_0_1 = (
-        get_session.query(postdb.GridPoint)
-        .join(
-            postdb.GridPointResolution,
-            postdb.GridPoint.id == postdb.GridPointResolution.grid_id,
-        )
-        .filter(postdb.GridPointResolution.resolution_id == resolution_0_1.id)
-        .all()
-    )
-    assert gp_0_1 is not None
-    assert len(gp_0_1) == 25, (
-        f"All 25 grid points should have 0.1 degree resolution, got {len(gp_0_1)}"
-    )
-    assert math.isclose(gp_0_1[0].latitude, 0.0, abs_tol=1e-5)
-    assert math.isclose(gp_0_1[0].longitude, 0.0, abs_tol=1e-5)
-    assert math.isclose(gp_0_1[1].latitude, 0.0, abs_tol=1e-5)
-    assert math.isclose(gp_0_1[1].longitude, 0.1, abs_tol=1e-5)
-    # Check that 0.2 degree resolution points are correct
-    resolution_0_2 = (
-        get_session.query(postdb.ResolutionGroup)
-        .filter(postdb.ResolutionGroup.resolution == 0.2)
-        .first()
-    )
-    gp_0_2 = (
-        get_session.query(postdb.GridPoint)
-        .join(
-            postdb.GridPointResolution,
-            postdb.GridPoint.id == postdb.GridPointResolution.grid_id,
-        )
-        .filter(postdb.GridPointResolution.resolution_id == resolution_0_2.id)
-        .all()
-    )
-    assert len(gp_0_2) == 9, (
-        f"Should have 9 grid points at 0.2 degree resolution, got {len(gp_0_2)}"
-    )
-    assert math.isclose(gp_0_2[0].latitude, 0.0, abs_tol=1e-5)
-    assert math.isclose(gp_0_2[0].longitude, 0.0, abs_tol=1e-5)
-    assert math.isclose(gp_0_2[1].latitude, 0.0, abs_tol=1e-5)
-    assert math.isclose(gp_0_2[1].longitude, 0.2, abs_tol=1e-5)
-    # check that 0.5 degree resolution points are correct
-    resolution_0_5 = (
-        get_session.query(postdb.ResolutionGroup)
-        .filter(postdb.ResolutionGroup.resolution == 0.5)
-        .first()
-    )
-    # here we should have 1 grid point: (0.0,0.0)
-    gp_0_5 = (
-        get_session.query(postdb.GridPoint)
-        .join(
-            postdb.GridPointResolution,
-            postdb.GridPoint.id == postdb.GridPointResolution.grid_id,
-        )
-        .filter(postdb.GridPointResolution.resolution_id == resolution_0_5.id)
-        .all()
-    )
-    assert math.isclose(gp_0_5[0].latitude, 0.0, abs_tol=1e-5)
-    assert math.isclose(gp_0_5[0].longitude, 0.0, abs_tol=1e-5)
-    # clean up
-    get_session.execute(
-        text("TRUNCATE TABLE grid_point_resolution RESTART IDENTITY CASCADE")
-    )
-    get_session.execute(
-        text("TRUNCATE TABLE resolution_group RESTART IDENTITY CASCADE")
-    )
-    get_session.execute(text("TRUNCATE TABLE grid_point RESTART IDENTITY CASCADE"))
-    get_session.commit()
-
-
-def test_assign_grid_resolution_group_to_grid_point_no_resolution_group(get_session):
-    # insert grid points - mix of 0.1 and 0.2 degree resolution
-    latitudes = np.array([0.0, 0.1, 0.2, 0.3, 0.4])
-    longitudes = np.array([0.0, 0.1, 0.2, 0.3, 0.4])
-    postdb.insert_grid_points(get_session, latitudes, longitudes)
-    # assign resolution groups without inserting resolution groups
-    with pytest.raises(ValueError):
-        postdb.assign_grid_resolution_group_to_grid_point(get_session)
-    # clean up
-    get_session.execute(text("TRUNCATE TABLE grid_point RESTART IDENTITY CASCADE"))
-    get_session.commit()
-
-
-def test_assign_grid_resolution_group_to_grid_point_idempotent(get_session):
-    # Arrange: insert resolution groups and grid points
-    postdb.insert_resolution_groups(get_session)
-    latitudes = np.array([0.0, 0.1, 0.2])
-    longitudes = np.array([0.0, 0.1, 0.2])
-    postdb.insert_grid_points(get_session, latitudes, longitudes)
-
-    # Act: first assignment
-    postdb.assign_grid_resolution_group_to_grid_point(get_session)
-    first_count = get_session.query(postdb.GridPointResolution).count()
-    assert first_count > 0
-
-    # Act again: second assignment must not raise and must not create duplicates
-    postdb.assign_grid_resolution_group_to_grid_point(get_session)
-    second_count = get_session.query(postdb.GridPointResolution).count()
-
-    # Assert: idempotent behaviour (same number of relationships)
-    assert second_count == first_count
 
 
 def test_extract_time_point():
@@ -443,112 +295,17 @@ def test_insert_var_types(get_session, get_var_type_list):
 
 
 def test_get_id_maps(get_session, insert_data):
-    grid_id_map, time_id_map, var_id_map = postdb.get_id_maps(get_session)
+    time_id_map, var_id_map = postdb.get_id_maps(get_session)
 
-    assert len(grid_id_map) == 6
-    assert grid_id_map[(10.1, 10.1)] == 1
     assert len(time_id_map) == 2
     assert time_id_map[np.datetime64("2023-01-01", "ns")] == 1
     assert len(var_id_map) == 1
     assert var_id_map["t2m"] == 1
 
     # clean up
-    get_session.execute(text("TRUNCATE TABLE grid_point RESTART IDENTITY CASCADE"))
     get_session.execute(text("TRUNCATE TABLE time_point RESTART IDENTITY CASCADE"))
     get_session.execute(text("TRUNCATE TABLE var_type RESTART IDENTITY CASCADE"))
     get_session.commit()
-
-
-def test_convert_monthly_to_yearly(get_dataset):
-    assert get_dataset.sizes == {"time": 2, "latitude": 2, "longitude": 3}
-    monthly_dataset = postdb.convert_yearly_to_monthly(get_dataset)
-    assert monthly_dataset.sizes == {"time": 24, "latitude": 2, "longitude": 3}
-    assert monthly_dataset.t2m.shape == (24, 2, 3)
-    assert monthly_dataset.t2m[0, 0, 0] == get_dataset.t2m[0, 0, 0]
-    assert monthly_dataset.t2m[1, 0, 0] == get_dataset.t2m[0, 0, 0]
-    assert monthly_dataset.t2m[2, 0, 0] == get_dataset.t2m[0, 0, 0]
-    assert monthly_dataset.t2m[11, 0, 0] == get_dataset.t2m[0, 0, 0]
-    assert monthly_dataset.t2m[12, 0, 0] == get_dataset.t2m[1, 0, 0]
-
-
-def test_insert_var_values_no_to_monthly(
-    get_session, get_engine_with_tables, get_dataset, seed_base_data
-):
-    # get the id maps
-    grid_id_map, time_id_map, var_id_map = postdb.get_id_maps(get_session)
-
-    # insert var values
-    postdb.insert_var_values(
-        get_engine_with_tables,
-        get_dataset,
-        "t2m",
-        grid_id_map,
-        time_id_map,
-        var_id_map,
-        to_monthly=False,
-    )
-
-    # check if the data is inserted correctly
-    session2 = postdb.create_session(get_engine_with_tables)
-    result = session2.query(postdb.VarValue).all()
-    assert len(result) == 12
-    assert result[0].grid_id == 1
-    assert result[0].time_id == 1
-    assert result[0].var_id == 1
-    session2.close()
-
-
-def test_insert_var_values_no_to_monthly_no_var(
-    get_engine_with_tables, get_dataset, get_session, seed_base_data
-):
-    # get the id maps
-    grid_id_map, time_id_map, var_id_map = postdb.get_id_maps(get_session)
-
-    # error due to no test_var var type
-    with pytest.raises(ValueError):
-        postdb.insert_var_values(
-            get_engine_with_tables,
-            get_dataset,
-            "test_var",
-            grid_id_map,
-            time_id_map,
-            var_id_map,
-            to_monthly=False,
-        )
-
-
-def test_insert_var_values_to_monthly(get_engine_with_tables, get_dataset, get_session):
-    postdb.insert_var_types(
-        get_session, [{"name": "t2m", "unit": "K", "description": "2m temperature"}]
-    )
-    postdb.insert_grid_points(
-        get_session, get_dataset.latitude.values, get_dataset.longitude.values
-    )
-    postdb.insert_time_points(get_session, [(get_dataset.time.values, True)])
-    # get the id maps
-    grid_id_map, time_id_map, var_id_map = postdb.get_id_maps(get_session)
-    # insert var values
-    postdb.insert_var_values(
-        get_engine_with_tables,
-        get_dataset,
-        "t2m",
-        grid_id_map,
-        time_id_map,
-        var_id_map,
-        to_monthly=True,
-    )
-
-    # check if the data is inserted correctly
-    result = (
-        get_session.query(postdb.VarValue)
-        .order_by(postdb.VarValue.grid_id, postdb.VarValue.time_id)
-        .all()
-    )
-    assert len(result) == 144
-    assert result[0].grid_id == 1
-    assert result[0].time_id == 1
-    assert result[0].var_id == 1
-    assert result[0].value == result[6].value  # same year, different month
 
 
 def _build_cartesian_ds(var_name: str = "t2m", fill_nan: bool = False) -> xr.Dataset:
@@ -593,93 +350,60 @@ def _build_maps():
     return grid_id_map, time_id_map
 
 
-def test__q_respects_round_digits(monkeypatch):
-    """Test that _q rounds floats according to ROUND_DIGITS setting."""
-    # Test with ROUND_DIGITS=2
-    monkeypatch.setattr(postdb, "ROUND_DIGITS", 2)
-    assert postdb._q(10.12345) == 10.12
-    assert postdb._q(10.126) == 10.13
-    assert postdb._q(-5.6789) == -5.68
-    assert postdb._q(0.001) == 0.0
-
-    # Test with ROUND_DIGITS=4 (default)
-    monkeypatch.setattr(postdb, "ROUND_DIGITS", 4)
-    assert postdb._q(10.12345) == 10.1235
-    assert postdb._q(10.123456789) == 10.1235
-    assert postdb._q(-5.67891234) == -5.6789
-
-    # Test type conversion for NumPy scalars
-    assert postdb._q(np.float64(10.12345)) == 10.1235
-    assert isinstance(postdb._q(np.float64(10.12345)), float)
-
-
 def test__normalize_time_key():
-    """Test that _normalize_time_key normalizes datetime64 to date-only midnight."""
-    # Test with full datetime precision
-    dt1 = np.datetime64("2023-01-15T14:30:45.123456789", "ns")
-    normalized = postdb._normalize_time_key(dt1)
-    expected = np.datetime64("2023-01-15T00:00:00", "ns")
-    assert normalized == expected
-
-    # Test with date-only input
-    dt2 = np.datetime64("2023-02-28", "ns")
-    normalized = postdb._normalize_time_key(dt2)
-    expected = np.datetime64("2023-02-28T00:00:00", "ns")
-    assert normalized == expected
-
-    # Test with different time components
-    dt3 = np.datetime64("2023-12-31T23:59:59", "ns")
-    normalized = postdb._normalize_time_key(dt3)
-    expected = np.datetime64("2023-12-31T00:00:00", "ns")
-    assert normalized == expected
-
-    # Test leap year date
-    dt4 = np.datetime64("2024-02-29T12:00:00", "ns")
-    normalized = postdb._normalize_time_key(dt4)
-    expected = np.datetime64("2024-02-29T00:00:00", "ns")
-    assert normalized == expected
+    """Any time within a month maps to midnight on the first day of the month."""
+    cases = {
+        "2023-01-15T14:30:45.123456789": "2023-01-01",
+        "2023-02-28": "2023-02-01",
+        "2023-12-31T23:59:59": "2023-12-01",
+        "2024-02-29T12:00:00": "2024-02-01",
+        "2024-03-01": "2024-03-01",
+    }
+    for value, expected in cases.items():
+        normalized = postdb._normalize_time_key(np.datetime64(value, "ns"))
+        assert normalized == np.datetime64(expected, "ns")
 
 
-def test_get_var_value(get_session):
-    # sample data
-    grid_point = postdb.GridPoint(latitude=10.0, longitude=20.0)
-    time_point = postdb.TimePoint(year=2023, month=1, day=1)
-    var_type = postdb.VarType(name="t2m", unit="K", description="2m temperature")
-    var_value = postdb.VarValue(
-        grid_id=1,
-        time_id=1,
-        var_id=1,
-        value=300.0,
+def test_month_starts():
+    times = np.array(
+        ["2023-02-15", "2023-01-01T12:00", "2023-01-01", "2023-02-01"],
+        dtype="datetime64[ns]",
     )
-    get_session.add(grid_point)
-    get_session.add(time_point)
-    get_session.add(var_type)
-    get_session.add(var_value)
-    get_session.commit()
-
-    # test the function
-    result = postdb.get_var_value(
-        get_session,
-        str(var_type.name),
-        grid_point.latitude,
-        grid_point.longitude,
-        time_point.year,
-        time_point.month,
-        time_point.day,
+    result = postdb.month_starts(times)
+    assert result.dtype == np.dtype("datetime64[ns]")
+    assert (
+        result.tolist()
+        == np.array(["2023-01-01", "2023-02-01"], dtype="datetime64[ns]").tolist()
     )
-    assert result == var_value.value
+    assert len(postdb.month_starts(np.array([], dtype="datetime64[ns]"))) == 0
 
-    # None case
-    result = postdb.get_var_value(
-        get_session,
-        "non_existing_var",
-        grid_point.latitude,
-        grid_point.longitude,
-        time_point.year,
-        time_point.month,
-        time_point.day,
+
+def test_get_var_value(insert_data, get_dataset):
+    session = insert_data
+    values = get_dataset["t2m"].values
+    result = postdb.get_var_value(session, "t2m", 10.2, 10.3, 2024, 1, 1)
+    np.testing.assert_allclose(result, values[1, 1, 2], rtol=1e-6)
+    assert isinstance(result, float)
+    # only monthly data: any day gives the first of the month
+    assert postdb.get_var_value(session, "t2m", 10.1, 10.1, 2023, 1, 15) == (
+        postdb.get_var_value(session, "t2m", 10.1, 10.1, 2023, 1, 1)
     )
-    assert result is None
+    # "subsample" values are the same at every resolution
+    assert postdb.get_var_value(
+        session, "t2m", 10.2, 10.3, 2024, 1, 1, resolution=0.2
+    ) == pytest.approx(result)
+
+    # None cases
+    assert postdb.get_var_value(session, "non_existing", 10.2, 10.3, 2024, 1, 1) is None
+    assert postdb.get_var_value(session, "t2m", 10.2, 10.3, 2020, 1, 1) is None
+    # off the grid and between grid points
+    assert postdb.get_var_value(session, "t2m", 50.0, 10.3, 2024, 1, 1) is None
+    assert postdb.get_var_value(session, "t2m", 10.15, 10.3, 2024, 1, 1) is None
+
+
+def test_get_var_value_no_tiles(get_session):
+    postdb.insert_var_types(get_session, [{"name": "t2m", "unit": "K"}])
+    assert postdb.get_var_value(get_session, "t2m", 10.2, 10.3, 2024, 1, 1) is None
 
 
 def test_get_var_value_nuts(
@@ -763,30 +487,6 @@ def test_get_time_points(get_session, get_dataset):
     get_session.commit()
 
 
-def test_get_grid_points(get_session, get_dataset):
-    # insert grid points
-    postdb.insert_grid_points(
-        get_session, get_dataset.latitude.values, get_dataset.longitude.values
-    )
-
-    # test the function
-    result = postdb.get_grid_points(get_session, area=None)
-    assert len(result) == 6  # 2 latitudes * 3 longitudes
-    assert math.isclose(result[0].latitude, 10.1, abs_tol=1e-5)
-    assert math.isclose(result[0].longitude, 10.1, abs_tol=1e-5)
-
-    result = postdb.get_grid_points(
-        get_session, area=(11.0, 10.0, 10.0, 12.0)
-    )  # [N, W, S, E]
-    assert len(result) == 6
-    assert math.isclose(result[0].latitude, 10.1, abs_tol=1e-5)
-    assert math.isclose(result[0].longitude, 10.1, abs_tol=1e-5)
-
-    # no grid points case
-    result = postdb.get_grid_points(get_session, area=(20.0, 20.0, 20.0, 20.0))
-    assert len(result) == 0
-
-
 def test_get_var_types(get_session):
     # insert var types
     var_type_data = [
@@ -812,23 +512,6 @@ def test_get_var_types(get_session):
     # test with no var types
     result = postdb.get_var_types(get_session, var_names=["non_existing_var"])
     assert len(result) == 0
-
-
-def test_sort_grid_points_get_ids(get_session, get_dataset, insert_data):
-    grid_points = get_session.query(postdb.GridPoint).all()
-    grid_ids, latitudes, longitudes = postdb.sort_grid_points_get_ids(grid_points)
-    assert len(grid_ids) == 6  # 2 latitudes * 3 longitudes
-    assert all(
-        math.isclose(lat, ref, abs_tol=1e-5)
-        for lat, ref in zip(latitudes, [10.1000, 10.2000])
-    )
-    assert all(
-        math.isclose(lon, ref, abs_tol=1e-5)
-        for lon, ref in zip(longitudes, [10.1000, 10.2000, 10.3000])
-    )
-    # check if the ids are correct
-    assert grid_ids[1] == (0, 0)
-    assert grid_ids[4] == (1, 0)
 
 
 def test_get_var_values_cartesian(insert_data):
@@ -890,6 +573,23 @@ def test_get_var_values_cartesian(insert_data):
             time_point=(2023, 1),
             var_name="non_existing_var",
         )
+    # test for non-finite area bounds
+    for bad in (math.inf, math.nan):
+        with pytest.raises(HTTPException) as e:
+            postdb.get_var_values_cartesian(
+                insert_data,
+                time_point=(2023, 1),
+                area=(bad, 10.0, 10.0, 10.2),
+                var_name="t2m",
+            )
+        assert e.value.status_code == 400
+
+    # values come back in their shortest form, without float32 noise
+    ds_result = postdb.get_var_values_cartesian(
+        insert_data, time_point=(2023, 1), var_name="t2m"
+    )
+    for _, _, value in ds_result["latitude, longitude, var_value"]:
+        assert value == float(str(np.float32(value)))
 
 
 def test_get_var_values_cartesian_download(get_dataset, insert_data, tmp_path):
@@ -1065,35 +765,6 @@ def test_get_nuts_regions_geojson(
         postdb.get_nuts_regions_geojson(get_engine_with_tables)
 
 
-def test_get_grid_ids_in_nuts(get_engine_with_tables, get_session):
-    nuts_regions = gpd.GeoDataFrame(
-        {
-            "nuts_id": ["DE11", "DE22"],
-            "geometry": [
-                Polygon([(0, 0), (1, 0), (1, 1), (0, 1)]),
-                Polygon([(1, 0), (2, 0), (2, 1), (1, 1)]),
-            ],
-        },
-        crs="EPSG:4326",
-    )
-    latitudes = np.array([0.5, 1.0, 1.5])
-    longitudes = np.array([0.5, 1.0, 1.5])
-    postdb.insert_grid_points(get_session, latitudes, longitudes)
-
-    # test the function
-    # normal case
-    grid_ids = postdb.get_grid_ids_in_nuts(get_engine_with_tables, nuts_regions)
-    assert len(grid_ids) == 6
-    assert grid_ids[0] == 1
-    assert grid_ids[1] == 2
-
-    # none cases
-    grid_ids = postdb.get_grid_ids_in_nuts(
-        get_engine_with_tables, nuts_regions=gpd.GeoDataFrame(geometry=[])
-    )
-    assert len(grid_ids) == 0
-
-
 def test_filter_nuts_ids_for_resolution():
     nuts_ids = ["DE", "DE11", "DE1", "TR2", "TR22"]
     filtered_nuts_ids = postdb.filter_nuts_ids_for_resolution(nuts_ids, "NUTS0")
@@ -1129,7 +800,7 @@ def test_get_var_values_nuts(
     postdb.insert_nuts_def(get_engine_with_tables, nuts_path)
 
     # get the id maps
-    _, time_id_map, var_id_map = postdb.get_id_maps(get_session)
+    time_id_map, var_id_map = postdb.get_id_maps(get_session)
 
     # insert var value
     postdb.insert_var_value_nuts(
@@ -1202,7 +873,7 @@ def test_insert_var_value_nuts_no_var(
     postdb.insert_time_points(get_session, [(get_varnuts_dataset.time.values, False)])
 
     # get the id maps
-    _, time_id_map, var_id_map = postdb.get_id_maps(get_session)
+    time_id_map, var_id_map = postdb.get_id_maps(get_session)
 
     # error due to no t2m var type
     with pytest.raises(ValueError):
@@ -1232,7 +903,7 @@ def test_insert_var_value_nuts(
     postdb.insert_nuts_def(get_engine_with_tables, nuts_path)
 
     # get the id maps
-    _, time_id_map, var_id_map = postdb.get_id_maps(get_session)
+    time_id_map, var_id_map = postdb.get_id_maps(get_session)
 
     # insert var value
     postdb.insert_var_value_nuts(
@@ -1266,7 +937,7 @@ def test_insert_var_value_nuts_rejects_extra_dims(
     postdb.insert_nuts_def(get_engine_with_tables, nuts_path)
 
     # get the id maps
-    _, time_id_map, var_id_map = postdb.get_id_maps(get_session)
+    time_id_map, var_id_map = postdb.get_id_maps(get_session)
 
     ds_extra = get_varnuts_dataset.expand_dims(lat=[0, 1])
     with pytest.raises(ValueError, match="must be 2D over \\('time', 'NUTS_ID'\\)"):
@@ -1371,29 +1042,6 @@ def test__to_time_lat_lon():
         postdb._to_time_lat_lon(ds_no_time, "adults")
 
 
-def test_insert_var_values_transposes_lon_lat_time(monkeypatch):
-    ds = _fine_grid_ds(var_name="t2m", lon_lat_time=True)
-    captured = {}
-
-    def _fake_copy(engine, values, grid_ids, time_ids, var_id, resolution_id=None):
-        captured["shape"] = values.shape
-        captured["grid"] = grid_ids.shape
-        return 0
-
-    monkeypatch.setattr(postdb, "copy_var_values", _fake_copy)
-    monkeypatch.setattr(postdb, "_check_no_coverage", lambda *a: None)
-    monkeypatch.setattr(postdb, "insert_var_coverage", lambda *a, **k: 0)
-    monkeypatch.setattr(postdb, "time_id_array", lambda times, m: np.arange(len(times)))
-    postdb.insert_var_values(object(), ds, "t2m", {}, {}, {"t2m": 1})
-    n_time = ds.sizes["time"]
-    assert captured["shape"] == (
-        min(n_time, postdb.VAR_TIME_CHUNK),
-        ds.sizes["latitude"],
-        ds.sizes["longitude"],
-    )
-    assert captured["grid"] == (ds.sizes["latitude"], ds.sizes["longitude"])
-
-
 def test_pgcopy_binary_layout():
     data = postdb._pgcopy_binary(
         [(">i4", np.array([7, 8])), (">i2", None), (">f4", np.array([1.5, -2.0]))]
@@ -1423,15 +1071,6 @@ def test_pgcopy_binary_layout():
         postdb._pgcopy_binary([(">i4", np.array([1])), (">i4", np.array([1, 2]))])
 
 
-def test_grid_id_array(capsys):
-    grid_id_map = {(10.1, 20.1): 1, (10.1, 20.2): 2, (10.2, 20.1): 3}
-    ids = postdb.grid_id_array(
-        np.array([10.1, 10.2]), np.array([20.1, 20.2000001]), grid_id_map
-    )
-    assert ids.tolist() == [[1, 2], [3, -1]]
-    assert "1 grid points are not in the database" in capsys.readouterr().out
-
-
 def test_time_id_array():
     time_id_map = {postdb._normalize_time_key(np.datetime64("2023-01-01")): 5}
     ids = postdb.time_id_array(
@@ -1442,374 +1081,59 @@ def test_time_id_array():
         postdb.time_id_array(np.array(["2023-02-01"], dtype="datetime64[ns]"), {})
 
 
-def test_copy_var_values(get_session, get_engine_with_tables):
-    engine = get_engine_with_tables
-    postdb.insert_var_types(get_session, [{"name": "t2m", "unit": "K"}])
-    postdb.insert_grid_points(
-        get_session, np.array([10.1, 10.2]), np.array([20.1, 20.2])
-    )
-    postdb.insert_time_points(
-        get_session,
-        [(np.array(["2023-01-01", "2023-02-01"], dtype="datetime64[ns]"), False)],
-    )
-    postdb.insert_resolution_groups(get_session, resolutions=np.array([0.1]))
-    grid_id_map, time_id_map, var_id_map = postdb.get_id_maps(get_session)
-    grid_ids = postdb.grid_id_array(
-        np.array([10.1, 10.2]), np.array([20.1, 20.2]), grid_id_map
-    )
-    grid_ids[1, 1] = -1  # unknown grid point: skipped
-    values = np.arange(8, dtype=float).reshape(2, 2, 2) + 0.25
-    values[0, 0, 1] = np.nan  # no value: skipped
-    time_ids = postdb.time_id_array(
-        np.array(["2023-01-01", "2023-02-01"], dtype="datetime64[ns]"), time_id_map
-    )
-    n = postdb.copy_var_values(engine, values, grid_ids, time_ids, var_id_map["t2m"])
-    assert n == 5
-    # the same values with a resolution group are a different row
-    n_res = postdb.copy_var_values(
-        engine, values, grid_ids, time_ids, var_id_map["t2m"], resolution_id=1
-    )
-    assert n_res == 5
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text(
-                "SELECT grid_id, time_id, resolution_id, value FROM var_value "
-                "ORDER BY resolution_id NULLS FIRST, time_id, grid_id"
-            )
-        ).all()
-    assert len(rows) == 10
-    assert rows[0] == (grid_ids[0, 0], time_ids[0], None, 0.25)
-    assert rows[5][2] == 1
-    assert {r[3] for r in rows[:5]} == {0.25, 2.25, 4.25, 5.25, 6.25}
-    with pytest.raises(ValueError, match="do not match the grid"):
-        postdb.copy_var_values(engine, values[:, :1], grid_ids, time_ids, 1)
-    with pytest.raises(ValueError, match="One time point ID"):
-        postdb.copy_var_values(engine, values, grid_ids, time_ids[:1], 1)
-    get_session.execute(text("TRUNCATE TABLE var_value"))
-    get_session.commit()
-
-
-def test_initialize_database_without_upgrade_keeps_bulk_load_state(
-    get_engine_with_tables,
-):
-    """The API initializes the database with upgrade=False, which must not
-    re-create the constraints that a running bulk load has dropped."""
-    engine = get_engine_with_tables
-    db_url = engine.url.render_as_string(hide_password=False)
-
-    def has_unique_constraint():
-        with engine.connect() as conn:
-            return (
-                conn.execute(
-                    text(
-                        "SELECT 1 FROM pg_constraint "
-                        "WHERE conname = 'uq_time_grid_var_res'"
-                    )
-                ).first()
-                is not None
-            )
-
-    postdb.drop_bulk_load_constraints(engine)
-    try:
-        postdb.initialize_database(db_url, replace=False, upgrade=False)
-        assert not has_unique_constraint()
-        # the production runner upgrades, and so re-creates it
-        postdb.initialize_database(db_url, replace=False)
-        assert has_unique_constraint()
-    finally:
-        postdb.add_bulk_load_constraints(engine)
-
-
-def test_bulk_load_constraints_drop_and_add(get_session, get_engine_with_tables):
-    engine = get_engine_with_tables
-
-    def constraints():
-        with engine.connect() as conn:
-            return {
-                row[0]
-                for row in conn.execute(
-                    text(
-                        "SELECT conname FROM pg_constraint WHERE conrelid IN "
-                        "('var_value'::regclass, 'var_coverage'::regclass)"
-                    )
-                )
-            }
-
-    expected = {
-        "uq_time_grid_var_res",
-        "fk_grid_id",
-        "fk_time_id",
-        "fk_var_id",
-        "fk_resolution_id",
-        "uq_coverage_var_res_grid",
-        "fk_coverage_var_id",
-        "fk_coverage_resolution_id",
-        "fk_coverage_grid_id",
-    }
-    assert expected <= constraints()
-    get_session.close()  # dropping needs exclusive locks on the referenced tables
-    postdb.drop_bulk_load_constraints(engine)
-    postdb.drop_bulk_load_constraints(engine)  # idempotent
-    assert not (expected & constraints())
-    # rows with unknown IDs are accepted without the constraints ...
+def _create_legacy_tables(engine):
+    """The tables of the old row-per-value storage, with their foreign keys."""
     with engine.begin() as conn:
         conn.execute(
             text(
-                "INSERT INTO var_value (grid_id, time_id, var_id, value) "
-                "VALUES (999, 999, 99, 1.0)"
+                """
+                CREATE TABLE grid_point (
+                    id serial PRIMARY KEY, latitude numeric, longitude numeric);
+                CREATE TABLE grid_point_resolution (
+                    grid_id integer REFERENCES grid_point (id),
+                    resolution_id integer REFERENCES resolution_group (id));
+                CREATE TABLE var_value (
+                    grid_id integer REFERENCES grid_point (id),
+                    time_id integer REFERENCES time_point (id),
+                    var_id smallint REFERENCES var_type (id),
+                    resolution_id smallint, value real);
+                CREATE TABLE var_coverage (
+                    var_id smallint REFERENCES var_type (id),
+                    resolution_id smallint,
+                    grid_id integer REFERENCES grid_point (id));
+                """
             )
         )
-    # ... and rejected when they are restored
-    with pytest.raises(Exception, match="fk_"):
-        postdb.add_bulk_load_constraints(engine)
-    with engine.begin() as conn:
-        conn.execute(text("DELETE FROM var_value"))
-    postdb.add_bulk_load_constraints(engine)
-    postdb.add_bulk_load_constraints(engine)  # idempotent
-    assert expected <= constraints()
-    with engine.connect() as conn:
-        definition = conn.execute(
-            text(
-                "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
-                "WHERE conname = 'uq_time_grid_var_res'"
-            )
-        ).scalar()
-    assert "NULLS NOT DISTINCT" in definition
 
 
-def _seed_mean_var(session, engine, ds, mask=None):
-    """Insert grid/time points, resolution groups and `adults` per resolution."""
-    postdb.insert_var_types(
-        session,
-        [
-            {
-                "name": "adults",
-                "unit": "mosquitoes per 625 km²",
-                "description": "adult mosquitoes",
-                "aggregation": "mean",
-            }
-        ],
-    )
-    postdb.insert_grid_points(session, ds.latitude.values, ds.longitude.values)
-    postdb.insert_time_points(session, [(ds.time.values, False)])
-    postdb.insert_resolution_groups(session, resolutions=np.array([0.1, 0.2, 0.25]))
-    grid_id_map, time_id_map, var_id_map = postdb.get_id_maps(session)
-    resolution_id_map = postdb.get_resolution_id_map(session)
-    total = postdb.insert_var_values_by_resolution(
-        engine,
-        ds,
-        "adults",
-        grid_id_map,
-        time_id_map,
-        var_id_map,
-        resolution_id_map,
-        mask=mask,
-    )
-    postdb.assign_grid_resolution_group_to_grid_point(session)
-    return total, resolution_id_map
-
-
-def test_insert_var_values_by_resolution_and_queries(
-    get_engine_with_tables, get_session, tmp_path
-):
-    ds = _fine_grid_ds(lon_lat_time=True)
-    mask = xr.ones_like(ds["adults"], dtype=bool)
-    mask[{"longitude": 4, "latitude": 0}] = False  # (lat 0.4, lon 0.4)
-    total, resolution_id_map = _seed_mean_var(
-        get_session, get_engine_with_tables, ds, mask=mask
-    )
-    # 0.1: 25 - 1 masked per time step, 0.2: 3x3, 0.25 skipped
-    assert total == 2 * (24 + 9)
-    counts = dict(
-        get_session.execute(
-            text("SELECT resolution_id, COUNT(*) FROM var_value GROUP BY resolution_id")
-        ).all()
-    )
-    assert counts == {resolution_id_map[0.1]: 48, resolution_id_map[0.2]: 18}
-
-    values = ds["adults"].transpose("time", "latitude", "longitude").values
-    values = np.where(
-        mask.transpose("time", "latitude", "longitude").values, values, np.nan
-    )
-    plan = postdb._block_mean_plan(ds.latitude.values, ds.longitude.values, 0.2)
-    expected = postdb.block_mean(values, plan)
-
-    # cartesian query at 0.2 returns the coarse means
-    result = postdb.get_var_values_cartesian(
-        get_session, time_point=(2023, 1), grid_resolution=0.2, var_name="adults"
-    )["latitude, longitude, var_value"]
-    assert len(result) == 9
-    lookup = {(round(float(la), 1), round(float(lo), 1)): v for la, lo, v in result}
-    np.testing.assert_allclose(lookup[(0.2, 0.2)], expected[0, 1, 1])
-    np.testing.assert_allclose(lookup[(0.4, 0.4)], expected[0, 0, 2])
-    # at 0.1 it returns the native values, without the masked cell
-    result = postdb.get_var_values_cartesian(
-        get_session, time_point=(2023, 1), grid_resolution=0.1, var_name="adults"
-    )["latitude, longitude, var_value"]
-    assert len(result) == 24
-    lookup = {(round(float(la), 1), round(float(lo), 1)): v for la, lo, v in result}
-    np.testing.assert_allclose(lookup[(0.2, 0.2)], values[0, 2, 2])
-
-    # single values: native by default, coarse on request
-    native = postdb.get_var_value(get_session, "adults", 0.2, 0.2, 2023, 2, 1)
-    np.testing.assert_allclose(native, values[1, 2, 2])
-    coarse = postdb.get_var_value(
-        get_session, "adults", 0.2, 0.2, 2023, 2, 1, resolution=0.2
-    )
-    np.testing.assert_allclose(coarse, expected[1, 1, 1])
-
-    # download exports the native resolution only
-    out_file = tmp_path / "download.nc"
-    postdb.get_var_values_cartesian_for_download(
-        get_session,
-        start_time_point=(2023, 1),
-        end_time_point=(2023, 2),
-        var_names=["adults"],
-        netcdf_file=str(out_file),
-    )
-    with xr.open_dataset(out_file) as downloaded:
-        got = downloaded["adults"].sortby("latitude", ascending=False).values
-    np.testing.assert_allclose(got, values)
-
-
-def test_insert_var_values_by_resolution_errors(get_engine_with_tables, get_session):
-    ds = _fine_grid_ds()
-    with pytest.raises(ValueError, match="not found in var_type"):
-        postdb.insert_var_values_by_resolution(
-            get_engine_with_tables, ds, "adults", {}, {}, {}, {0.1: 1}
-        )
-    # no resolution group at the data's grid step
-    with pytest.raises(ValueError, match="No resolution group matches"):
-        postdb.insert_var_values_by_resolution(
-            get_engine_with_tables, ds, "adults", {}, {}, {"adults": 1}, {0.2: 1}
-        )
-    # mask on another grid
-    mask = xr.ones_like(ds["adults"], dtype=bool).isel(latitude=slice(0, 4))
-    with pytest.raises(ValueError, match="different grid"):
-        postdb.insert_var_values_by_resolution(
-            get_engine_with_tables,
-            ds,
-            "adults",
-            {},
-            {},
-            {"adults": 1},
-            {0.1: 1},
-            mask=mask,
-        )
-    # mask without the data's time points
-    mask = xr.ones_like(ds["adults"], dtype=bool).assign_coords(
-        time=[np.datetime64("2020-01-01", "ns"), np.datetime64("2020-02-01", "ns")]
-    )
-    with pytest.raises(ValueError, match="does not cover"):
-        postdb.insert_var_values_by_resolution(
-            get_engine_with_tables,
-            ds,
-            "adults",
-            {},
-            {},
-            {"adults": 1},
-            {0.1: 1},
-            mask=mask,
-        )
-
-
-def test_var_value_unique_with_null_resolution(get_session):
-    postdb.insert_var_types(get_session, [{"name": "t2m", "unit": "K"}])
-    postdb.insert_grid_points(get_session, np.array([0.0]), np.array([0.0]))
-    postdb.insert_time_points(
-        get_session, [(np.array([np.datetime64("2023-01-01", "ns")]), False)]
-    )
-    row = {"grid_id": 1, "time_id": 1, "var_id": 1, "value": 1.0}
-    postdb.add_data_list_bulk(get_session, [row], postdb.VarValue)
-    # NULLS NOT DISTINCT: a second row without resolution is a duplicate
-    with pytest.raises(RuntimeError, match="uq_time_grid_var_res"):
-        postdb.add_data_list_bulk(get_session, [row], postdb.VarValue)
-    assert (
-        get_session.query(postdb.VarType).first().aggregation == "subsample"
-    )  # server default
+def _table_names(engine):
+    return set(inspect(engine).get_table_names(schema="public"))
 
 
 def test_upgrade_schema_from_old_tables(get_engine_with_tables):
     engine = get_engine_with_tables
-    # turn the tables back into the old schema
+    _create_legacy_tables(engine)
     with engine.begin() as conn:
-        conn.execute(text("ALTER TABLE var_value DROP CONSTRAINT uq_time_grid_var_res"))
-        conn.execute(text("ALTER TABLE var_value DROP CONSTRAINT fk_resolution_id"))
-        conn.execute(text("ALTER TABLE var_value DROP COLUMN resolution_id"))
         conn.execute(text("ALTER TABLE var_type DROP COLUMN aggregation"))
-        # surrogate key and duplicate foreign keys of older versions
-        conn.execute(text("ALTER TABLE var_value ADD COLUMN id BIGSERIAL PRIMARY KEY"))
-        conn.execute(
-            text(
-                "ALTER TABLE var_value ADD CONSTRAINT var_value_grid_id_fkey "
-                "FOREIGN KEY (grid_id) REFERENCES grid_point (id)"
-            )
-        )
-        conn.execute(
-            text(
-                "ALTER TABLE var_value ADD CONSTRAINT uq_time_grid_var "
-                "UNIQUE (time_id, grid_id, var_id)"
-            )
-        )
-        # wide types and the PostGIS point of older versions
-        conn.execute(
-            text(
-                "ALTER TABLE var_value ALTER COLUMN var_id TYPE integer, "
-                "ALTER COLUMN value TYPE double precision"
-            )
-        )
-        conn.execute(text("ALTER TABLE var_coverage ALTER COLUMN var_id TYPE integer"))
-        conn.execute(
-            text("ALTER TABLE grid_point ADD COLUMN point geometry(POINT, 4326)")
-        )
-        conn.execute(
-            text("CREATE INDEX idx_grid_point_point ON grid_point USING gist (point)")
-        )
+    assert set(postdb.LEGACY_TABLES) <= _table_names(engine)
+
     postdb.upgrade_schema(engine)
     postdb.upgrade_schema(engine)  # idempotent
-    with engine.connect() as conn:
-        columns = {
-            (t, c)
-            for t, c in conn.execute(
-                text(
-                    "SELECT table_name, column_name FROM information_schema.columns "
-                    "WHERE table_name IN ('var_value', 'var_type', 'grid_point')"
-                )
-            )
-        }
-        types = dict(
-            conn.execute(
-                text(
-                    "SELECT table_name || '.' || column_name, data_type "
-                    "FROM information_schema.columns "
-                    "WHERE table_name IN ('var_value', 'var_coverage')"
-                )
-            ).all()
-        )
-        constraints = {
-            row[0]
-            for row in conn.execute(
-                text(
-                    "SELECT conname FROM pg_constraint "
-                    "WHERE conrelid = 'var_value'::regclass"
-                )
-            )
-        }
-    assert ("var_value", "resolution_id") in columns
-    assert ("var_type", "aggregation") in columns
-    assert "uq_time_grid_var_res" in constraints
-    assert "fk_resolution_id" in constraints
-    assert "uq_time_grid_var" not in constraints
-    assert ("var_value", "id") not in columns
-    assert "var_value_pkey" not in constraints
-    assert "var_value_grid_id_fkey" not in constraints
-    assert "fk_grid_id" in constraints
-    assert ("grid_point", "point") not in columns
-    assert types["var_value.value"] == "real"
-    assert types["var_value.var_id"] == "smallint"
-    assert types["var_value.resolution_id"] == "smallint"
-    assert types["var_coverage.var_id"] == "smallint"
-    assert types["var_coverage.resolution_id"] == "smallint"
+
+    assert not set(postdb.LEGACY_TABLES) & _table_names(engine)
+    columns = {c["name"] for c in inspect(engine).get_columns("var_type")}
+    assert "aggregation" in columns
+
+
+def test_create_or_replace_tables_with_legacy_tables(get_engine_without_tables):
+    engine = get_engine_without_tables
+    postdb.create_tables(engine)
+    _create_legacy_tables(engine)
+    # the legacy tables reference time_point and var_type
+    postdb.create_or_replace_tables(engine)
+    tables = _table_names(engine)
+    assert not set(postdb.LEGACY_TABLES) & tables
+    assert {"var_tile", "grid_def", "time_point"} <= tables
 
 
 def test_normalize_db_url():
@@ -1844,158 +1168,6 @@ def test_apply_transform():
         postdb.apply_transform(values, "log10", floor=0)
 
 
-def test_insert_var_values_by_resolution_transform_after_mean(
-    get_engine_with_tables, get_session
-):
-    ds = _fine_grid_ds(n_time=1)
-    # spread over orders of magnitude, with values below the floor
-    values = 10.0 ** (np.arange(25).reshape(1, 5, 5) / 3.0 - 2.0)
-    ds["adults"].values[:] = values
-    postdb.insert_var_types(
-        get_session,
-        [{"name": "adults", "unit": "log10", "aggregation": "mean"}],
-    )
-    postdb.insert_grid_points(get_session, ds.latitude.values, ds.longitude.values)
-    postdb.insert_time_points(get_session, [(ds.time.values, False)])
-    postdb.insert_resolution_groups(get_session, resolutions=np.array([0.1, 0.2]))
-    grid_id_map, time_id_map, var_id_map = postdb.get_id_maps(get_session)
-    resolution_id_map = postdb.get_resolution_id_map(get_session)
-    with pytest.raises(ValueError, match="Unknown transform"):
-        postdb.insert_var_values_by_resolution(
-            get_engine_with_tables,
-            ds,
-            "adults",
-            grid_id_map,
-            time_id_map,
-            var_id_map,
-            resolution_id_map,
-            transform="sqrt",
-        )
-    postdb.insert_var_values_by_resolution(
-        get_engine_with_tables,
-        ds,
-        "adults",
-        grid_id_map,
-        time_id_map,
-        var_id_map,
-        resolution_id_map,
-        transform="log10",
-        transform_floor=1.0,
-    )
-    postdb.assign_grid_resolution_group_to_grid_point(get_session)
-    plan = postdb._block_mean_plan(ds.latitude.values, ds.longitude.values, 0.2)
-    expected_coarse = np.log10(np.maximum(postdb.block_mean(values, plan), 1.0))
-    # the log is taken of the mean, not the mean of the logs
-    coarse = postdb.get_var_value(
-        get_session, "adults", 0.2, 0.2, 2023, 1, 1, resolution=0.2
-    )
-    np.testing.assert_allclose(coarse, expected_coarse[0, 1, 1])
-    assert not np.isclose(coarse, np.log10(np.maximum(values[0, 1:4, 1:4], 1)).mean())
-    native = postdb.get_var_value(get_session, "adults", 0.4, 0.0, 2023, 1, 1)
-    assert native == 0.0  # 10**-2 is below the floor
-    native = postdb.get_var_value(get_session, "adults", 0.0, 0.4, 2023, 1, 1)
-    np.testing.assert_allclose(native, np.log10(values[0, 4, 4]))
-
-
-def test_get_var_value_mean_var_does_not_fall_back_to_coarser_resolution(
-    get_engine_with_tables, get_session
-):
-    ds = _fine_grid_ds()
-    # a covered zero at (0.2, 0.2): not stored at 0.1, but the 0.2 mean around
-    # it is positive and stored
-    ds["adults"].values[:, 2, 2] = 0.0
-    # (0.4, 0.4) has no data at 0.1, but its 0.2 cell has a value
-    mask = xr.ones_like(ds["adults"], dtype=bool)
-    mask[{"latitude": 0, "longitude": 4}] = False
-    _seed_mean_var(get_session, get_engine_with_tables, ds, mask=mask)
-
-    coarse = postdb.get_var_value(
-        get_session, "adults", 0.2, 0.2, 2023, 1, 1, resolution=0.2
-    )
-    assert coarse > 0
-    # without a resolution: the native value (0), not the coarse mean
-    assert postdb.get_var_value(get_session, "adults", 0.2, 0.2, 2023, 1, 1) == 0.0
-    assert (
-        postdb.get_var_value(
-            get_session, "adults", 0.2, 0.2, 2023, 1, 1, resolution=0.1
-        )
-        == 0.0
-    )
-    # no native data: None, not the value of the coarse cell
-    assert (
-        postdb.get_var_value(
-            get_session, "adults", 0.4, 0.4, 2023, 1, 1, resolution=0.2
-        )
-        is not None
-    )
-    assert postdb.get_var_value(get_session, "adults", 0.4, 0.4, 2023, 1, 1) is None
-    # a resolution the variable is not stored at
-    assert (
-        postdb.get_var_value(
-            get_session, "adults", 0.2, 0.2, 2023, 1, 1, resolution=0.25
-        )
-        is None
-    )
-    # unknown variable
-    assert postdb.get_var_value(get_session, "nope", 0.2, 0.2, 2023, 1, 1) is None
-
-
-def test_download_mean_var_does_not_fall_back_to_coarser_resolution(
-    get_engine_with_tables, get_session, tmp_path
-):
-    ds = _fine_grid_ds()
-    # (0.4, 0.4) has no data at 0.1, but its 0.2 cell has a value
-    mask = xr.ones_like(ds["adults"], dtype=bool)
-    mask[{"latitude": 0, "longitude": 4}] = False
-    _seed_mean_var(get_session, get_engine_with_tables, ds, mask=mask)
-    assert (
-        postdb.get_var_value(
-            get_session, "adults", 0.4, 0.4, 2023, 1, 1, resolution=0.2
-        )
-        is not None
-    )
-
-    # an area that holds only that grid point
-    out_file = tmp_path / "download.nc"
-    postdb.get_var_values_cartesian_for_download(
-        get_session,
-        start_time_point=(2023, 1),
-        end_time_point=(2023, 2),
-        area=(0.4, 0.4, 0.4, 0.4),
-        var_names=["adults"],
-        netcdf_file=str(out_file),
-    )
-    with xr.open_dataset(out_file) as downloaded:
-        got = downloaded["adults"].values
-    assert got.shape == (2, 1, 1)
-    # like get_var_value: no native data, not the coarse mean
-    assert np.isnan(got).all()
-
-
-def test_block_valid_and_drop_covered_zeros():
-    lats = np.round(np.arange(0.4, -0.05, -0.1), 1)
-    lons = np.round(np.arange(0.0, 0.45, 0.1), 1)
-    plan = postdb._block_mean_plan(lats, lons, 0.2)
-    valid = np.zeros((5, 5), dtype=bool)
-    valid[0, 0] = True  # only in the window of the coarse cell (0.4, 0.0)
-    coarse = postdb.block_valid(valid, plan)
-    values = np.full((1, 5, 5), np.nan)
-    values[0, 0, 0] = 1.0
-    np.testing.assert_array_equal(
-        coarse, np.isfinite(postdb.block_mean(values, plan)[0])
-    )
-    native = postdb._block_mean_plan(lats, lons, 0.1)
-    np.testing.assert_array_equal(postdb.block_valid(valid, native), valid)
-
-    covered = np.array([[True, False]])
-    out = postdb.drop_covered_zeros(np.array([[[0.0, 0.0]], [[1.0, 0.0]]]), covered)
-    np.testing.assert_array_equal(np.isnan(out), [[[True, False]], [[False, False]]])
-    da = xr.DataArray(np.array([[[0.0, 0.0]]]), dims=("time", "lat", "lon"))
-    out = postdb.drop_covered_zeros(da, xr.DataArray(covered, dims=("lat", "lon")))
-    assert np.isnan(out.values[0, 0, 0])
-    assert out.values[0, 0, 1] == 0.0
-
-
 def _zeros_ds(var_name):
     """5x5 grid, 2 time points: zeros and positive values on land, an ocean
     column, and one cell that is NaN only at the second time point."""
@@ -2008,93 +1180,414 @@ def _zeros_ds(var_name):
     return ds
 
 
-def _cartesian_values(session, var_name, month, resolution):
-    result = postdb.get_var_values_cartesian(
-        session, (2023, month), grid_resolution=resolution, var_name=var_name
-    )["latitude, longitude, var_value"]
-    return {(round(float(a), 1), round(float(o), 1)): v for a, o, v in result}
+# --- tiled storage ---------------------------------------------------------
 
 
-def test_insert_var_values_skips_covered_zeros(get_engine_with_tables, get_session):
-    ds = _zeros_ds("t2m")
-    postdb.insert_var_types(get_session, [{"name": "t2m", "unit": "K"}])
-    postdb.insert_grid_points(get_session, ds.latitude.values, ds.longitude.values)
+def _seed_tiles(session, engine, ds, aggregation, tile_size=2, **kwargs):
+    """Insert var type, time points, resolution groups and `adults` as tiles."""
+    postdb.insert_var_types(
+        session,
+        [{"name": "adults", "unit": "-", "aggregation": aggregation}],
+    )
+    postdb.insert_time_points(session, [(ds.time.values, False)])
+    postdb.insert_resolution_groups(session, resolutions=np.array([0.1, 0.2, 0.25]))
+    time_id_map, var_id_map = postdb.get_id_maps(session)
+    resolution_id_map = postdb.get_resolution_id_map(session)
+    total = postdb.insert_var_tiles(
+        engine,
+        ds,
+        "adults",
+        time_id_map,
+        var_id_map,
+        resolution_id_map,
+        aggregation=aggregation,
+        tile_size=tile_size,
+        **kwargs,
+    )
+    return total, resolution_id_map
+
+
+def _read_tiles(session, resolution_id, time_id=1):
+    grid = session.get(postdb.GridDefinition, resolution_id).to_grid()
+    rows = session.execute(
+        text(
+            "SELECT tile_row, tile_col, data FROM var_tile "
+            "WHERE resolution_id = :r AND time_id = :t"
+        ),
+        {"r": resolution_id, "t": time_id},
+    ).all()
+    return grid, tiles.tiles_to_array(
+        rows, grid.tile_size, 0, grid.n_lat, 0, grid.n_lon
+    )
+
+
+def test_var_tile_schema(get_engine_with_tables, get_session):
+    compression = get_session.execute(
+        text(
+            "SELECT attcompression FROM pg_attribute "
+            "WHERE attrelid = 'var_tile'::regclass AND attname = 'data'"
+        )
+    ).scalar()
+    assert compression == "l"  # lz4
+    # values decoded in SQL match numpy's float32
+    expected = np.array([1.0, -2.0, 0.15625, 1e-40, np.inf, 3.4e38], dtype="<f4")
+    got = get_session.execute(
+        text("SELECT tile_value(:d, k) FROM generate_series(0, 5) AS k ORDER BY k"),
+        {"d": expected.tobytes()},
+    ).scalars()
+    np.testing.assert_array_equal(np.array(list(got), dtype="<f4"), expected)
+    nan = get_session.execute(
+        text("SELECT tile_value(:d, 0) = 'NaN'::real"),
+        {"d": np.array([np.nan], dtype="<f4").tobytes()},
+    ).scalar()
+    assert nan
+
+
+def test_insert_var_tiles_mean(get_engine_with_tables, get_session):
+    ds = _fine_grid_ds(lon_lat_time=True)
+    mask = xr.ones_like(ds["adults"], dtype=bool)
+    mask[{"longitude": 4, "latitude": 0}] = False  # (lat 0.4, lon 0.4)
+    total, resolution_id_map = _seed_tiles(
+        get_session,
+        get_engine_with_tables,
+        ds,
+        "mean",
+        mask=mask,
+        transform="log10",
+    )
+    # 0.1: 5x5 cells in 3x3 tiles of 2, but the corner tile holds only the
+    # masked cell and is skipped; 0.2: 3x3 cells in 2x2 tiles; per time step
+    assert total == 2 * (8 + 4)
+
+    values = ds["adults"].transpose("time", "latitude", "longitude").values
+    values = np.where(
+        mask.transpose("time", "latitude", "longitude").values, values, np.nan
+    )
+    plan = postdb._block_mean_plan(ds.latitude.values, ds.longitude.values, 0.2)
+    expected = np.log10(postdb.block_mean(values, plan))
+
+    grid, native = _read_tiles(get_session, resolution_id_map[0.1])
+    assert (grid.n_lat, grid.n_lon, grid.tile_size) == (5, 5, 2)
+    np.testing.assert_allclose([grid.lat0, grid.lon0, grid.step], [0.0, 0.0, 0.1])
+    # stored with ascending latitude
+    np.testing.assert_allclose(native, np.log10(values[0, ::-1]), rtol=1e-6)
+    assert np.isnan(native[4, 4])
+
+    grid, coarse = _read_tiles(get_session, resolution_id_map[0.2], time_id=2)
+    assert (grid.n_lat, grid.n_lon, grid.step) == (3, 3, 0.2)
+    np.testing.assert_allclose(coarse, expected[1, ::-1], rtol=1e-6)
+    # 0.25 is not a multiple of 0.1: no grid, no tiles
+    assert get_session.get(postdb.GridDefinition, resolution_id_map[0.25]) is None
+
+    # the debug view returns one row per value
+    rows = get_session.execute(
+        text(
+            "SELECT latitude, longitude, value FROM var_value_v "
+            "WHERE resolution_id = :r AND time_id = 1"
+        ),
+        {"r": resolution_id_map[0.1]},
+    ).all()
+    assert len(rows) == 24
+    lookup = {(float(la), float(lo)): v for la, lo, v in rows}
+    np.testing.assert_allclose(lookup[(0.2, 0.3)], np.log10(values[0, 2, 3]), rtol=1e-6)
+
+    # a variable on another grid is rejected
+    shifted = ds.assign_coords(longitude=ds.longitude + 1.0)
+    postdb.insert_var_types(
+        get_session, [{"name": "other", "unit": "-", "aggregation": "mean"}]
+    )
+    time_id_map, var_id_map = postdb.get_id_maps(get_session)
+    with pytest.raises(ValueError, match="differs from the stored one"):
+        postdb.insert_var_tiles(
+            get_engine_with_tables,
+            shifted.rename({"adults": "other"}),
+            "other",
+            time_id_map,
+            var_id_map,
+            resolution_id_map,
+        )
+
+    # loading the same variable again is rejected before anything is stored
+    n_before = get_session.execute(text("SELECT count(*) FROM var_tile")).scalar()
+    with pytest.raises(ValueError, match="already loaded for 2023-01"):
+        postdb.insert_var_tiles(
+            get_engine_with_tables,
+            ds,
+            "adults",
+            time_id_map,
+            var_id_map,
+            resolution_id_map,
+            aggregation="mean",
+            tile_size=2,
+        )
+    n_after = get_session.execute(text("SELECT count(*) FROM var_tile")).scalar()
+    assert n_after == n_before
+
+
+def test_insert_var_tiles_subsample(get_engine_with_tables, get_session):
+    ds = _fine_grid_ds()
+    total, resolution_id_map = _seed_tiles(
+        get_session, get_engine_with_tables, ds, "subsample", tile_size=100
+    )
+    # one tile per resolution and time step
+    assert total == 2 * 2
+    values = ds["adults"].values
+    _, native = _read_tiles(get_session, resolution_id_map[0.1], time_id=2)
+    np.testing.assert_array_equal(native, values[1, ::-1])
+    # every second point, ascending: latitudes 0.0, 0.2, 0.4
+    _, coarse = _read_tiles(get_session, resolution_id_map[0.2])
+    np.testing.assert_array_equal(coarse, values[0, ::-2][:, ::2])
+
+
+def test_ensure_grid_defs_tolerance(get_engine_with_tables, get_session):
+    postdb.insert_resolution_groups(get_session, np.array([0.1]))
+    resolution_id = postdb.get_resolution_id_map(get_session)[0.1]
+    grid = tiles.GridDef(-89.9, -179.9, 0.1, 1799, 3599, 100)
+    postdb.ensure_grid_defs(get_engine_with_tables, {resolution_id: grid})
+    # within COORD_ATOL: same grid
+    close = tiles.GridDef(-89.9, -179.9 + 0.4e-4, 0.1, 1799, 3599, 100)
+    postdb.ensure_grid_defs(get_engine_with_tables, {resolution_id: close})
+    # outside COORD_ATOL, though within the default relative tolerance
+    shifted = tiles.GridDef(-89.9, -179.9015, 0.1, 1799, 3599, 100)
+    # no tile uses the stored grid yet: it is replaced
+    postdb.ensure_grid_defs(get_engine_with_tables, {resolution_id: shifted})
+    stored = get_session.get(postdb.GridDefinition, resolution_id)
+    get_session.refresh(stored)
+    assert stored.to_grid() == shifted
+    # once tiles use it, another grid is rejected
+    postdb.insert_var_types(
+        get_session, [{"name": "v", "unit": "-", "aggregation": "mean"}]
+    )
+    postdb.insert_time_points(
+        get_session, [(np.array(["2023-01-01"], dtype="datetime64[ns]"), False)]
+    )
+    postdb.copy_var_tiles(
+        get_engine_with_tables, 1, resolution_id, np.array([1]), np.ones((1, 2, 2)), 100
+    )
+    with pytest.raises(ValueError, match="differs from the stored one"):
+        postdb.ensure_grid_defs(get_engine_with_tables, {resolution_id: grid})
+
+
+def test_insert_var_tiles_failure_removes_tiles(
+    get_engine_with_tables, get_session, monkeypatch
+):
+    ds = _fine_grid_ds()
+    postdb.insert_var_types(
+        get_session, [{"name": "adults", "unit": "-", "aggregation": "mean"}]
+    )
     postdb.insert_time_points(get_session, [(ds.time.values, False)])
     postdb.insert_resolution_groups(get_session, resolutions=np.array([0.1, 0.2]))
-    postdb.assign_grid_resolution_group_to_grid_point(get_session)
-    grid_id_map, time_id_map, var_id_map = postdb.get_id_maps(get_session)
-    postdb.insert_var_values(
-        get_engine_with_tables, ds, "t2m", grid_id_map, time_id_map, var_id_map
+    time_id_map, var_id_map = postdb.get_id_maps(get_session)
+    resolution_id_map = postdb.get_resolution_id_map(get_session)
+    original = postdb.copy_var_tiles
+    calls = []
+
+    def failing_copy(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            raise RuntimeError("connection lost")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(postdb, "copy_var_tiles", failing_copy)
+    with pytest.raises(RuntimeError, match="connection lost"):
+        postdb.insert_var_tiles(
+            get_engine_with_tables,
+            ds,
+            "adults",
+            time_id_map,
+            var_id_map,
+            resolution_id_map,
+            aggregation="mean",
+            tile_size=2,
+        )
+    assert get_session.execute(text("SELECT count(*) FROM var_tile")).scalar() == 0
+    # it can be loaded again
+    monkeypatch.setattr(postdb, "copy_var_tiles", original)
+    total = postdb.insert_var_tiles(
+        get_engine_with_tables,
+        ds,
+        "adults",
+        time_id_map,
+        var_id_map,
+        resolution_id_map,
+        aggregation="mean",
+        tile_size=2,
     )
-    with get_engine_with_tables.connect() as conn:
-        n_rows = conn.execute(text("SELECT COUNT(*) FROM var_value")).scalar()
-        n_coverage = conn.execute(text("SELECT COUNT(*) FROM var_coverage")).scalar()
-    # 4 land columns, minus the cell that is NaN once
-    assert n_coverage == 19
-    # stored: positive values (2 columns x 5 rows x 2 times, minus the cell
-    # that is 0 once and NaN once) and the 0 of that uncovered cell
-    assert n_rows == 20 - 2 + 1
-    for month in (1, 2):
-        got = _cartesian_values(get_session, "t2m", month, 0.1)
-        expected = {
-            (round(float(a), 1), round(float(o), 1)): float(v)
-            for (a, o), v in ds["t2m"].isel(time=month - 1).to_series().items()
-            if np.isfinite(v)
-        }
-        assert got == expected
-    assert postdb.get_var_value(get_session, "t2m", 0.4, 0.0, 2023, 1, 1) == 0.0
-    assert postdb.get_var_value(get_session, "t2m", 0.2, 0.3, 2023, 1, 1) == 0.0
-    assert postdb.get_var_value(get_session, "t2m", 0.2, 0.3, 2023, 2, 1) is None
-    assert postdb.get_var_value(get_session, "t2m", 0.4, 0.4, 2023, 1, 1) is None
-    assert postdb.get_var_value(get_session, "t2m", 0.4, 0.0, 2024, 1, 1) is None
-    # a variable is inserted in one go
-    with pytest.raises(ValueError, match="already in the database"):
-        postdb.insert_var_values(
-            get_engine_with_tables, ds, "t2m", grid_id_map, time_id_map, var_id_map
+    assert total > 0
+
+
+def test_insert_var_tiles_rejects_several_steps_per_month(get_engine_with_tables):
+    ds = _fine_grid_ds()
+    ds = ds.assign_coords(
+        time=np.array(["2023-01-01", "2023-01-15"], dtype="datetime64[ns]")[
+            : ds.sizes["time"]
+        ]
+    )
+    time_id_map = {np.datetime64("2023-01-01", "ns"): 1}
+    with pytest.raises(ValueError, match="several time steps in one month"):
+        postdb.insert_var_tiles(
+            get_engine_with_tables, ds, "adults", time_id_map, {"adults": 1}, {0.1: 1}
         )
 
 
-def test_insert_var_values_by_resolution_skips_covered_zeros(
-    get_engine_with_tables, get_session
-):
-    ds = _zeros_ds("adults")
-    _seed_mean_var(get_session, get_engine_with_tables, ds)
-    for resolution in (0.1, 0.2):
-        plan = postdb._block_mean_plan(ds.latitude.values, ds.longitude.values, 0.2)
-        for month in (1, 2):
-            values = ds["adults"].values[month - 1 : month]
-            got = _cartesian_values(get_session, "adults", month, resolution)
-            if resolution == 0.1:
-                expected_grid, lats, lons = values[0], ds.latitude, ds.longitude
-            else:
-                expected_grid = postdb.block_mean(values, plan)[0]
-                lats, lons = plan["latitude"], plan["longitude"]
-            expected = {
-                (round(float(a), 1), round(float(o), 1)): float(expected_grid[i, j])
-                for i, a in enumerate(np.asarray(lats))
-                for j, o in enumerate(np.asarray(lons))
-                if np.isfinite(expected_grid[i, j])
-            }
-            assert got.keys() == expected.keys()
-            np.testing.assert_allclose(
-                [got[k] for k in expected], list(expected.values())
-            )
-    with get_engine_with_tables.connect() as conn:
-        zeros = conn.execute(
-            text("SELECT COUNT(*) FROM var_value WHERE value = 0")
-        ).scalar()
-    # only the uncovered cell keeps its 0 (at 0.1 degree; at 0.2 degree its
-    # coarse cell always has other valid cells)
-    assert zeros == 1
-
-
-def test_download_fills_covered_zeros(get_engine_with_tables, get_session, tmp_path):
-    ds = _zeros_ds("adults")
-    _seed_mean_var(get_session, get_engine_with_tables, ds)
-    out = tmp_path / "out.nc"
-    postdb.get_var_values_cartesian_for_download(
-        get_session, (2023, 1), (2023, 2), var_names=["adults"], netcdf_file=str(out)
+def test_coarse_indices_quarter_degree():
+    coords = np.round(np.arange(-1.0, 1.01, 0.05), 2)
+    idx = postdb._coarse_indices(coords, 0.25)
+    np.testing.assert_allclose(
+        coords[idx], [-1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0]
     )
-    with xr.open_dataset(out) as result:
-        got = result["adults"].sel(latitude=ds.latitude, longitude=ds.longitude)
-        np.testing.assert_array_equal(got.values, ds["adults"].values)
+    idx = postdb._coarse_indices(coords, 0.2)
+    np.testing.assert_allclose(coords[idx], np.round(np.arange(-1.0, 1.01, 0.2), 1))
+
+
+def test_buffer_reader_streams_parts():
+    rows = np.arange(5, dtype=">i4")
+    reader = postdb._BufferReader(b"ab", rows, b"z")
+    out = b""
+    while chunk := reader.read(3):
+        out += chunk
+    assert out == b"ab" + rows.tobytes() + b"z"
+
+
+def test_pgcopy_rows_list_columns():
+    blob = np.dtype("V4")
+    parts = [np.array([1.0, 2.0], "<f4").view(blob), np.array([3.0], "<f4").view(blob)]
+    rows = postdb._pgcopy_rows(
+        [(">i4", [np.array([1, 2]), np.array([3])]), (blob.str, parts)]
+    )
+    assert rows["val0"].tolist() == [1, 2, 3]
+    np.testing.assert_array_equal(
+        np.frombuffer(rows["val1"].tobytes(), "<f4"), [1.0, 2.0, 3.0]
+    )
+
+
+def test_insert_var_tiles_errors(get_engine_with_tables):
+    ds = _fine_grid_ds()
+    with pytest.raises(ValueError, match="Unknown aggregation"):
+        postdb.insert_var_tiles(
+            get_engine_with_tables, ds, "adults", {}, {}, {}, aggregation="sum"
+        )
+    with pytest.raises(ValueError, match="not found in var_type"):
+        postdb.insert_var_tiles(get_engine_with_tables, ds, "adults", {}, {}, {})
+    with pytest.raises(ValueError, match="not one of the resolution groups"):
+        postdb.insert_var_tiles(
+            get_engine_with_tables, ds, "adults", {}, {"adults": 1}, {0.2: 1}
+        )
+
+
+def test_check_grid_usable():
+    groups = {0.1: 1, 0.2: 2, 0.5: 3, 1.0: 4}
+    lats = np.round(np.arange(0.0, 1.05, 0.1), 1)
+    # 0.1 degree grid on whole tenths: fine
+    postdb._check_grid_usable(lats, lats, groups, "x")
+    # step that is not a resolution group (e.g. 0.25 degree ERA5)
+    quarter = np.arange(0.0, 2.1, 0.25)
+    with pytest.raises(ValueError, match=r"grid step of x \(0.25°\) is not one"):
+        postdb._check_grid_usable(quarter, quarter, groups, "x")
+    # offset by half a step
+    offset = np.arange(0.25, 5.0, 0.5)
+    with pytest.raises(ValueError, match="not multiples of its step 0.5°"):
+        postdb._check_grid_usable(offset, offset, groups, "x")
+    with pytest.raises(ValueError, match="latitude 0.05"):
+        postdb._check_grid_usable(lats + 0.05, lats, groups, "x")
+    # different steps per axis
+    with pytest.raises(ValueError, match="steps differ|step .* differ"):
+        postdb._check_grid_usable(lats, np.arange(0.0, 2.1, 0.2), groups, "x")
+    # irregular or too short
+    with pytest.raises(ValueError, match="not regularly spaced"):
+        postdb._check_grid_usable(np.array([0.0, 0.1, 0.3]), lats, groups, "x")
+    with pytest.raises(ValueError, match="at least two"):
+        postdb._check_grid_usable(np.array([0.0]), lats, groups, "x")
+
+
+def test_insert_var_tiles_mask_errors(get_engine_with_tables):
+    ds = _fine_grid_ds()
+    # mask on another grid
+    mask = xr.ones_like(ds["adults"], dtype=bool).isel(latitude=slice(0, 4))
+    with pytest.raises(ValueError, match="different grid"):
+        postdb.insert_var_tiles(
+            get_engine_with_tables, ds, "adults", {}, {"adults": 1}, {0.1: 1}, mask=mask
+        )
+    # mask without the data's time points
+    mask = xr.ones_like(ds["adults"], dtype=bool).assign_coords(
+        time=[np.datetime64("2020-01-01", "ns"), np.datetime64("2020-02-01", "ns")]
+    )
+    with pytest.raises(ValueError, match="does not cover"):
+        postdb.insert_var_tiles(
+            get_engine_with_tables, ds, "adults", {}, {"adults": 1}, {0.1: 1}, mask=mask
+        )
+
+
+def test_queries_on_mean_var(get_engine_with_tables, get_session, tmp_path):
+    ds = _fine_grid_ds()
+    ds["adults"][{"latitude": slice(3, 5), "longitude": slice(0, 2)}] = 0.0
+    mask = xr.ones_like(ds["adults"], dtype=bool)
+    mask[{"longitude": 4, "latitude": 0}] = False  # (lat 0.4, lon 0.4)
+    _, _ = _seed_tiles(get_session, get_engine_with_tables, ds, "mean", mask=mask)
+    values = np.where(mask.values, ds["adults"].values, np.nan)  # lat descending
+    plan = postdb._block_mean_plan(ds.latitude.values, ds.longitude.values, 0.2)
+    coarse = postdb.block_mean(values, plan)  # lat descending: 0.4, 0.2, 0.0
+
+    def cartesian(resolution, month=1, area=None):
+        result = postdb.get_var_values_cartesian(
+            get_session,
+            time_point=(2023, month),
+            grid_resolution=resolution,
+            area=area,
+            var_name="adults",
+        )["latitude, longitude, var_value"]
+        return {(la, lo): v for la, lo, v in result}
+
+    # native: the masked cell is left out, zeros are returned as 0
+    native = cartesian(0.1)
+    assert len(native) == 24
+    assert (0.4, 0.4) not in native
+    assert native[(0.0, 0.0)] == 0.0
+    np.testing.assert_allclose(native[(0.2, 0.3)], values[0, 2, 3])
+    # ordered by latitude, then longitude
+    assert list(native) == sorted(native)
+    # coarse: area-weighted means
+    means = cartesian(0.2, month=2)
+    assert len(means) == 9
+    np.testing.assert_allclose(means[(0.2, 0.2)], coarse[1, 1, 1], rtol=1e-6)
+    np.testing.assert_allclose(means[(0.4, 0.4)], coarse[1, 0, 2], rtol=1e-6)
+    assert means[(0.0, 0.0)] == 0.0
+    # an area, boundaries included
+    assert set(cartesian(0.1, area=(0.3, 0.1, 0.1, 0.2))) == {
+        (la, lo) for la in (0.1, 0.2, 0.3) for lo in (0.1, 0.2)
+    }
+    # 0.25 is not a multiple of the grid step: no grid
+    with pytest.raises(HTTPException, match="No grid points"):
+        cartesian(0.25)
+
+    # single values: native by default, coarse on request, no fallback to
+    # another resolution
+    get = postdb.get_var_value
+    np.testing.assert_allclose(
+        get(get_session, "adults", 0.2, 0.2, 2023, 2, 1), values[1, 2, 2]
+    )
+    np.testing.assert_allclose(
+        get(get_session, "adults", 0.2, 0.2, 2023, 2, 1, resolution=0.2),
+        coarse[1, 1, 1],
+        rtol=1e-6,
+    )
+    assert get(get_session, "adults", 0.1, 0.1, 2023, 2, 1, resolution=0.2) is None
+    assert get(get_session, "adults", 0.2, 0.2, 2023, 2, 1, resolution=0.25) is None
+    assert get(get_session, "adults", 0.4, 0.4, 2023, 1, 1) is None  # masked
+    assert get(get_session, "adults", 0.0, 0.0, 2023, 1, 1) == 0.0
+
+    # the download has the native resolution, ascending coordinates
+    out_file = tmp_path / "download.nc"
+    postdb.get_var_values_cartesian_for_download(
+        get_session,
+        start_time_point=(2023, 1),
+        end_time_point=(2023, 2),
+        var_names=["adults"],
+        netcdf_file=str(out_file),
+    )
+    with xr.open_dataset(out_file) as downloaded:
+        np.testing.assert_allclose(downloaded.latitude, [0.0, 0.1, 0.2, 0.3, 0.4])
+        np.testing.assert_allclose(
+            downloaded["adults"].values, values[:, ::-1], rtol=1e-6
+        )
+        assert downloaded["adults"].attrs["unit"] == "-"

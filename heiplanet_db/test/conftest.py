@@ -48,25 +48,25 @@ def get_session(get_engine_with_tables):
     connection.close()
 
 
+TRUNCATE_ALL = text(
+    """
+    TRUNCATE TABLE
+        var_value_nuts,
+        var_tile,
+        grid_def,
+        resolution_group,
+        time_point,
+        var_type,
+        nuts_def
+    RESTART IDENTITY CASCADE
+    """
+)
+
+
 @pytest.fixture(scope="function", autouse=True)
 def clean_db(get_session):
     yield
-    get_session.execute(
-        text(
-            """
-            TRUNCATE TABLE
-                var_value_nuts,
-                var_value,
-                grid_point_resolution,
-                resolution_group,
-                time_point,
-                grid_point,
-                var_type,
-                nuts_def
-            RESTART IDENTITY CASCADE
-            """
-        )
-    )
+    get_session.execute(TRUNCATE_ALL)
     get_session.commit()
 
 
@@ -75,65 +75,30 @@ def seed_base_data(get_session, get_dataset, get_engine_with_tables):
     postdb.insert_var_types(
         get_session, [{"name": "t2m", "unit": "K", "description": "2m temperature"}]
     )
-    postdb.insert_grid_points(
-        get_session, get_dataset.latitude.values, get_dataset.longitude.values
-    )
     postdb.insert_time_points(get_session, [(get_dataset.time.values, False)])
 
 
 @pytest.fixture(scope="function")
 def insert_data(get_session, get_dataset, get_engine_with_tables):
-    var_type_data = [
-        {
-            "name": "t2m",
-            "unit": "K",
-            "description": "2m temperature",
-        }
-    ]
-    postdb.insert_var_types(get_session, var_type_data)
-    # insert grid points
-    postdb.insert_grid_points(
-        get_session, get_dataset.latitude.values, get_dataset.longitude.values
+    """t2m of `get_dataset` as tiles, at 0.1 and 0.2 degree."""
+    postdb.insert_var_types(
+        get_session,
+        [{"name": "t2m", "unit": "K", "description": "2m temperature"}],
     )
-    # insert time points
     postdb.insert_time_points(get_session, [(get_dataset.time.values, False)])
-
-    # get the id maps
-    grid_id_map, time_id_map, var_id_map = postdb.get_id_maps(get_session)
-
-    # insert var values
-    postdb.insert_var_values(
+    postdb.insert_resolution_groups(get_session, resolutions=np.array([0.1, 0.2]))
+    time_id_map, var_id_map = postdb.get_id_maps(get_session)
+    postdb.insert_var_tiles(
         get_engine_with_tables,
         get_dataset,
         "t2m",
-        grid_id_map,
         time_id_map,
         var_id_map,
-        to_monthly=False,
+        postdb.get_resolution_id_map(get_session),
     )
-
-    # insert resolution values
-    postdb.insert_resolution_groups(get_session, resolutions=np.array([0.1, 0.2]))
-    postdb.assign_grid_resolution_group_to_grid_point(get_session)
 
     yield get_session
-    # clean up
-    get_session.execute(
-        text(
-            """
-            TRUNCATE TABLE
-                var_value_nuts,
-                var_value,
-                grid_point_resolution,
-                resolution_group,
-                time_point,
-                grid_point,
-                var_type,
-                nuts_def
-            RESTART IDENTITY CASCADE
-            """
-        )
-    )
+    get_session.execute(TRUNCATE_ALL)
     get_session.commit()
 
 

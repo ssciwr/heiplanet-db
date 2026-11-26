@@ -1,12 +1,10 @@
 import gc
 import io
 import json
-import math
 import os
 import struct
 import time
 from pathlib import Path
-from typing import ClassVar
 
 import geopandas as gpd
 import numpy as np
@@ -15,65 +13,59 @@ import xarray as xr
 from fastapi import HTTPException
 from geoalchemy2 import Geometry, WKBElement
 from sqlalchemy import (
-    REAL,
+    DDL,
     BigInteger,
     Float,
     ForeignKey,
     ForeignKeyConstraint,
     Integer,
+    LargeBinary,
     Numeric,
     SmallInteger,
     String,
     UniqueConstraint,
-    and_,
     create_engine,
     engine,
-    func,
-    or_,
+    event,
     text,
 )
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.orm.session import Session, sessionmaker
-from sqlalchemy.schema import AddConstraint
+
+from heiplanet_db import tiles
 
 CRS = 4326
-# foreign key targets
-GRID_POINT_ID = "grid_point.id"
 TIME_POINT_ID = "time_point.id"
 VAR_TYPE_ID = "var_type.id"
 RESOLUTION_GROUP_ID = "resolution_group.id"
 NUTS_DEF_ID = "nuts_def.nuts_id"
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "10000"))
 VAR_TIME_CHUNK = int(os.environ.get("VAR_TIME_CHUNK", "6"))
-GRID_LAT_CHUNK = int(os.environ.get("GRID_LAT_CHUNK", "45"))
-GRID_LON_CHUNK = int(os.environ.get("GRID_LON_CHUNK", "360"))
 ROUND_DIGITS = int(os.environ.get("ROUND_DIGITS", "4"))
 
 
-def _q(value):
-    """Round a float coordinate to ROUND_DIGITS precision.
-
-    Ensures consistent rounding behavior for both Python floats and NumPy scalars.
-    Returns a Python float for reliable dictionary key lookups.
-    """
-    # Convert NumPy scalars to Python float first
-    if isinstance(value, (np.floating, np.integer)):
-        value = float(value)
-    return round(value, ROUND_DIGITS)
-
-
 def _normalize_time_key(t_val: np.datetime64) -> np.datetime64:
-    """Normalize a datetime64 value to a date-only key for time_id_map lookup.
+    """Normalize a datetime64 value to the key of its time point.
+
+    The database is monthly: every time point is the first day of a month, and
+    all values within a month belong to that time point.
 
     Args:
-        t_val: datetime64 value (may include time components).
+        t_val: datetime64 value (may include a day and time of day).
 
     Returns:
-        datetime64[ns] normalized to midnight of the date.
+        datetime64[ns] of midnight on the first day of the month.
     """
-    ts = pd.Timestamp(t_val)
-    return np.datetime64(pd.to_datetime(f"{ts.year}-{ts.month}-{ts.day}"), "ns")
+    return np.datetime64(t_val, "M").astype("datetime64[ns]")
+
+
+def month_starts(times: np.ndarray) -> np.ndarray:
+    """Sorted unique first days of the months of `times`, as datetime64[ns]."""
+    times = np.asarray(times)
+    if times.size == 0:
+        return np.array([], dtype="datetime64[ns]")
+    return np.unique(times.astype("datetime64[M]")).astype("datetime64[ns]")
 
 
 # Base declarative class
@@ -99,21 +91,6 @@ class NutsDef(Base):
     geometry: Mapped[WKBElement] = mapped_column(
         Geometry(geometry_type="MULTIPOLYGON", srid=CRS)
     )
-
-
-class GridPoint(Base):
-    """
-    Grid point table for storing latitude and longitude coordinates."""
-
-    __tablename__ = "grid_point"
-
-    id: Mapped[int] = mapped_column(Integer(), primary_key=True, autoincrement=True)
-    latitude: Mapped[float] = mapped_column(Numeric(precision=8, scale=4))
-    longitude: Mapped[float] = mapped_column(Numeric(precision=8, scale=4))
-
-    # There is no PostGIS point column: no query used it, and with its spatial
-    # index it took about 0.9 GB for the global 0.1 degree grid.
-    __table_args__ = (UniqueConstraint("latitude", "longitude", name="uq_lat_lon"),)
 
 
 class TimePoint(Base):
@@ -143,136 +120,16 @@ class VarType(Base):
     unit: Mapped[String] = mapped_column(String())
     description: Mapped[String] = mapped_column(String(), nullable=True)
     # how values at coarser grid resolutions are obtained:
-    # "subsample": coarse grid points reuse the value stored at the native
-    #   resolution (suitable for smooth, intensive quantities such as R0)
+    # "subsample": coarse grid points take the value of the native grid point
+    #   at the same place (suitable for smooth, intensive quantities such as R0)
     # "mean": coarse grid points carry the area-weighted mean over the fine
-    #   cells in their window, stored separately per resolution
+    #   cells in their window
+    # values of every resolution are stored as tiles, see `VarTile`
     aggregation: Mapped[String] = mapped_column(
         String(), nullable=False, default="subsample", server_default="subsample"
     )
 
     __table_args__ = (UniqueConstraint("name", name="uq_var_name"),)
-
-
-class VarValue(Base):
-    """
-    Variable value table for storing variable values at specific
-    grid points and time points.
-    """
-
-    __tablename__ = "var_value"
-
-    # This table holds hundreds of millions of rows, so it has no surrogate
-    # key: rows are identified by the unique constraint below. The columns are
-    # as narrow as the data allows and ordered so that PostgreSQL needs no
-    # alignment padding (int4, int4, int2, int2, float4: 16 bytes of data, 44
-    # bytes per row with the tuple header). float4 keeps about 7 significant
-    # digits, more than the maps and the downloads need.
-    # The foreign keys are declared once, in __table_args__.
-    grid_id: Mapped[int] = mapped_column(Integer())
-    time_id: Mapped[int] = mapped_column(Integer())
-    var_id: Mapped[int] = mapped_column(SmallInteger())
-    # NULL for variables with aggregation "subsample" (one value per grid point,
-    # shared by all resolutions); set for variables whose value depends on the
-    # resolution (aggregation "mean"), one row per resolution group
-    resolution_id: Mapped[int | None] = mapped_column(SmallInteger(), nullable=True)
-    value: Mapped[float] = mapped_column(REAL())
-
-    __mapper_args__: ClassVar[dict] = {
-        # identity for the ORM only; the database enforces it with
-        # uq_time_grid_var_res (resolution_id may be NULL)
-        "primary_key": [time_id, grid_id, var_id, resolution_id],
-    }
-
-    def __init__(self, **kw):
-        # part of the ORM identity, so it must be set even when it is NULL
-        kw.setdefault("resolution_id", None)
-        super().__init__(**kw)
-
-    __table_args__ = (
-        UniqueConstraint(
-            "time_id",
-            "grid_id",
-            "var_id",
-            "resolution_id",
-            name="uq_time_grid_var_res",
-            postgresql_nulls_not_distinct=True,
-        ),
-        ForeignKeyConstraint(
-            ["grid_id"],
-            [GRID_POINT_ID],
-            name="fk_grid_id",
-            ondelete="CASCADE",
-        ),
-        ForeignKeyConstraint(
-            ["time_id"],
-            [TIME_POINT_ID],
-            name="fk_time_id",
-            ondelete="CASCADE",
-        ),
-        ForeignKeyConstraint(
-            ["var_id"],
-            [VAR_TYPE_ID],
-            name="fk_var_id",
-            ondelete="CASCADE",
-        ),
-        ForeignKeyConstraint(
-            ["resolution_id"],
-            [RESOLUTION_GROUP_ID],
-            name="fk_resolution_id",
-            ondelete="CASCADE",
-        ),
-    )
-
-
-class VarCoverage(Base):
-    """Grid points where a variable has a value at every time point.
-
-    Values equal to 0 at these grid points are not stored in `var_value`; a
-    missing row there means 0. Outside of them, a missing row means that there
-    is no data (e.g. ocean cells), and zeros are stored. This keeps the many
-    zeros of the model output (e.g. no mosquitoes in winter) out of the
-    database. Like `var_value`, `resolution_id` is NULL for variables with
-    aggregation "subsample".
-    """
-
-    __tablename__ = "var_coverage"
-
-    var_id: Mapped[int] = mapped_column(SmallInteger())
-    resolution_id: Mapped[int | None] = mapped_column(SmallInteger(), nullable=True)
-    grid_id: Mapped[int] = mapped_column(Integer())
-
-    __mapper_args__: ClassVar[dict] = {"primary_key": [var_id, resolution_id, grid_id]}
-
-    def __init__(self, **kw):
-        # part of the ORM identity, so it must be set even when it is NULL
-        kw.setdefault("resolution_id", None)
-        super().__init__(**kw)
-
-    __table_args__ = (
-        UniqueConstraint(
-            "var_id",
-            "resolution_id",
-            "grid_id",
-            name="uq_coverage_var_res_grid",
-            postgresql_nulls_not_distinct=True,
-        ),
-        ForeignKeyConstraint(
-            ["var_id"], [VAR_TYPE_ID], name="fk_coverage_var_id", ondelete="CASCADE"
-        ),
-        ForeignKeyConstraint(
-            ["resolution_id"],
-            [RESOLUTION_GROUP_ID],
-            name="fk_coverage_resolution_id",
-            ondelete="CASCADE",
-        ),
-        ForeignKeyConstraint(
-            ["grid_id"],
-            [GRID_POINT_ID],
-            name="fk_coverage_grid_id",
-            ondelete="CASCADE",
-        ),
-    )
 
 
 class VarValueNuts(Base):
@@ -327,17 +184,117 @@ class ResolutionGroup(Base):
     description: Mapped[str] = mapped_column(String(), nullable=True)
 
 
-class GridPointResolution(Base):
-    """Many-to-many relationship between GridPoint and ResolutionGroup"""
+class GridDefinition(Base):
+    """The regular grid of one resolution group.
 
-    __tablename__ = "grid_point_resolution"
+    Grid points are implicit: cell (i, j) lies at
+    (lat0 + i * step, lon0 + j * step), both axes ascending. See
+    `heiplanet_db.tiles.GridDef`.
+    """
 
-    grid_id: Mapped[int] = mapped_column(
-        Integer(), ForeignKey(GRID_POINT_ID), primary_key=True
+    __tablename__ = "grid_def"
+
+    resolution_id: Mapped[int] = mapped_column(
+        SmallInteger(),
+        ForeignKey(RESOLUTION_GROUP_ID, ondelete="CASCADE"),
+        primary_key=True,
+    )
+    lat0: Mapped[float] = mapped_column(Float(), nullable=False)
+    lon0: Mapped[float] = mapped_column(Float(), nullable=False)
+    step: Mapped[float] = mapped_column(Float(), nullable=False)
+    n_lat: Mapped[int] = mapped_column(Integer(), nullable=False)
+    n_lon: Mapped[int] = mapped_column(Integer(), nullable=False)
+    tile_size: Mapped[int] = mapped_column(SmallInteger(), nullable=False)
+
+    def to_grid(self) -> tiles.GridDef:
+        return tiles.GridDef(
+            lat0=self.lat0,
+            lon0=self.lon0,
+            step=self.step,
+            n_lat=self.n_lat,
+            n_lon=self.n_lon,
+            tile_size=self.tile_size,
+        )
+
+
+class VarTile(Base):
+    """Values of a variable on one tile of a grid at one time point.
+
+    `data` holds tile_size × tile_size float32 values (little endian,
+    row-major, see `heiplanet_db.tiles`), NaN where there is no data. Tiles
+    without any data are not stored. PostgreSQL compresses the column with lz4.
+    """
+
+    __tablename__ = "var_tile"
+
+    var_id: Mapped[int] = mapped_column(
+        SmallInteger(), ForeignKey(VAR_TYPE_ID, ondelete="CASCADE"), primary_key=True
     )
     resolution_id: Mapped[int] = mapped_column(
-        Integer(), ForeignKey(RESOLUTION_GROUP_ID), primary_key=True
+        SmallInteger(),
+        ForeignKey("grid_def.resolution_id", ondelete="CASCADE"),
+        primary_key=True,
     )
+    time_id: Mapped[int] = mapped_column(
+        Integer(), ForeignKey(TIME_POINT_ID, ondelete="CASCADE"), primary_key=True
+    )
+    tile_row: Mapped[int] = mapped_column(SmallInteger(), primary_key=True)
+    tile_col: Mapped[int] = mapped_column(SmallInteger(), primary_key=True)
+    data: Mapped[bytes] = mapped_column(LargeBinary(), nullable=False)
+
+
+# Decodes value k of a tile (float32, little endian) in SQL, for the debug
+# view below. Slow, but only meant for ad-hoc inspection.
+_TILE_VALUE_FUNCTION = """
+CREATE OR REPLACE FUNCTION tile_value(data bytea, k integer) RETURNS real
+LANGUAGE sql IMMUTABLE STRICT AS $$
+    SELECT CASE
+        WHEN e = 255 AND m = 0 THEN
+            (CASE WHEN s = 1 THEN '-Infinity' ELSE 'Infinity' END)::real
+        WHEN e = 255 THEN 'NaN'::real
+        WHEN e = 0 THEN ((1 - 2 * s) * m * 2.0::float8 ^ (-149))::real
+        ELSE ((1 - 2 * s) * (1 + m / 8388608.0::float8)
+              * 2.0::float8 ^ (e - 127))::real
+    END
+    FROM (
+        SELECT (b >> 31) & 1 AS s, (b >> 23) & 255 AS e, b & 8388607 AS m
+        FROM (
+            -- | and << have the same precedence in PostgreSQL
+            SELECT get_byte(data, 4 * k)::bigint
+                | (get_byte(data, 4 * k + 1)::bigint << 8)
+                | (get_byte(data, 4 * k + 2)::bigint << 16)
+                | (get_byte(data, 4 * k + 3)::bigint << 24) AS b
+        ) AS raw
+    ) AS parts
+$$;
+"""
+
+# One row per stored value. For debugging only.
+# (DDL formats the statement with %, hence the %% for the modulo operator.)
+_VAR_VALUE_VIEW = """
+CREATE OR REPLACE VIEW var_value_v AS
+SELECT t.var_id, t.resolution_id, t.time_id,
+       round((g.lat0 + i * g.step)::numeric, 4) AS latitude,
+       round((g.lon0 + j * g.step)::numeric, 4) AS longitude,
+       tile_value(t.data, c.k) AS value
+FROM var_tile t
+JOIN grid_def g USING (resolution_id)
+CROSS JOIN LATERAL generate_series(0, g.tile_size * g.tile_size - 1) AS c(k)
+CROSS JOIN LATERAL (
+    SELECT t.tile_row * g.tile_size + c.k / g.tile_size AS i,
+           t.tile_col * g.tile_size + c.k %% g.tile_size AS j
+) AS cell
+WHERE i < g.n_lat AND j < g.n_lon AND tile_value(t.data, c.k) <> 'NaN'::real;
+"""
+
+event.listen(
+    VarTile.__table__,
+    "after_create",
+    DDL("ALTER TABLE var_tile ALTER COLUMN data SET COMPRESSION lz4"),
+)
+event.listen(VarTile.__table__, "after_create", DDL(_TILE_VALUE_FUNCTION))
+event.listen(VarTile.__table__, "after_create", DDL(_VAR_VALUE_VIEW))
+event.listen(VarTile.__table__, "before_drop", DDL("DROP VIEW IF EXISTS var_value_v"))
 
 
 def install_postgis(engine: engine.Engine):
@@ -378,6 +335,21 @@ def create_tables(engine: engine.Engine):
     print("All tables created.")
 
 
+# Gridded values used to be stored as one row per value in these tables. They
+# are now stored as tiles (`var_tile`, `grid_def`).
+LEGACY_TABLES = ("var_value", "var_coverage", "grid_point_resolution", "grid_point")
+
+
+def drop_legacy_tables(engine: engine.Engine) -> None:
+    """Drop the tables of the old row-per-value storage, if they exist.
+
+    Args:
+        engine (engine.Engine): SQLAlchemy engine object.
+    """
+    with engine.begin() as conn:
+        conn.execute(text(f"DROP TABLE IF EXISTS {', '.join(LEGACY_TABLES)} CASCADE;"))
+
+
 def create_or_replace_tables(engine: engine.Engine):
     """
     Create or replace tables in the database.
@@ -385,6 +357,8 @@ def create_or_replace_tables(engine: engine.Engine):
     Args:
         engine (engine.Engine): SQLAlchemy engine object.
     """
+    # they reference time_point and var_type, so they would block drop_all
+    drop_legacy_tables(engine)
     Base.metadata.drop_all(engine)
     print("All tables dropped.")
     create_tables(engine)
@@ -395,139 +369,23 @@ def upgrade_schema(engine: engine.Engine):
     Bring tables created by an older version of this package up to date.
 
     `create_all` only creates missing tables; it does not add columns to
-    existing ones. This adds the columns and constraints needed for
-    resolution-dependent variables. All statements are idempotent.
+    existing ones or remove old tables. All statements are idempotent.
+
+    The tables of the old row-per-value storage are dropped (see
+    `LEGACY_TABLES`); their data has to be loaded again as tiles.
 
     Args:
         engine (engine.Engine): SQLAlchemy engine object.
     """
-    statements = [
-        (
-            "ALTER TABLE var_type ADD COLUMN IF NOT EXISTS aggregation VARCHAR "
-            "NOT NULL DEFAULT 'subsample';"
-        ),
-        "ALTER TABLE var_value ADD COLUMN IF NOT EXISTS resolution_id INTEGER;",
-        # rows are identified by uq_time_grid_var_res; the surrogate key and its
-        # index took about 15 % of the database
-        "ALTER TABLE var_value DROP COLUMN IF EXISTS id;",
-        # duplicates of fk_grid_id, fk_time_id and fk_var_id
-        "ALTER TABLE var_value DROP CONSTRAINT IF EXISTS var_value_grid_id_fkey;",
-        "ALTER TABLE var_value DROP CONSTRAINT IF EXISTS var_value_time_id_fkey;",
-        "ALTER TABLE var_value DROP CONSTRAINT IF EXISTS var_value_var_id_fkey;",
-        "ALTER TABLE var_value DROP CONSTRAINT IF EXISTS uq_time_grid_var;",
-        """
-        DO $$
-        BEGIN
-            IF NOT EXISTS (
-                SELECT 1 FROM pg_constraint WHERE conname = 'uq_time_grid_var_res'
-            ) THEN
-                ALTER TABLE var_value ADD CONSTRAINT uq_time_grid_var_res
-                    UNIQUE NULLS NOT DISTINCT
-                    (time_id, grid_id, var_id, resolution_id);
-            END IF;
-            IF NOT EXISTS (
-                SELECT 1 FROM pg_constraint WHERE conname = 'fk_resolution_id'
-            ) THEN
-                ALTER TABLE var_value ADD CONSTRAINT fk_resolution_id
-                    FOREIGN KEY (resolution_id) REFERENCES resolution_group (id)
-                    ON DELETE CASCADE;
-            END IF;
-        END $$;
-        """,
-        # unused PostGIS point; dropping it also drops its two GiST indexes
-        "ALTER TABLE grid_point DROP COLUMN IF EXISTS point;",
-        # narrower types (rewrites the tables once, so only when needed)
-        """
-        DO $$
-        BEGIN
-            IF EXISTS (
-                SELECT 1 FROM information_schema.columns
-                WHERE table_name = 'var_value' AND (
-                    (column_name = 'value' AND data_type <> 'real')
-                    OR (column_name IN ('var_id', 'resolution_id')
-                        AND data_type <> 'smallint')
-                )
-            ) THEN
-                ALTER TABLE var_value
-                    ALTER COLUMN var_id TYPE smallint,
-                    ALTER COLUMN resolution_id TYPE smallint,
-                    ALTER COLUMN value TYPE real;
-            END IF;
-            IF EXISTS (
-                SELECT 1 FROM information_schema.columns
-                WHERE table_name = 'var_coverage'
-                    AND column_name IN ('var_id', 'resolution_id')
-                    AND data_type <> 'smallint'
-            ) THEN
-                ALTER TABLE var_coverage
-                    ALTER COLUMN var_id TYPE smallint,
-                    ALTER COLUMN resolution_id TYPE smallint;
-            END IF;
-        END $$;
-        """,
-    ]
     with engine.begin() as conn:
-        for statement in statements:
-            conn.execute(text(statement))
+        conn.execute(
+            text(
+                "ALTER TABLE var_type ADD COLUMN IF NOT EXISTS aggregation VARCHAR "
+                "NOT NULL DEFAULT 'subsample';"
+            )
+        )
+    drop_legacy_tables(engine)
     print("Database schema up to date.")
-
-
-# tables that receive hundreds of millions of rows in a bulk load
-BULK_LOAD_TABLES = ("var_value", "var_coverage")
-
-
-def _bulk_load_constraints(table_name: str) -> list:
-    """Unique and foreign key constraints of a table, as declared in the model."""
-    table = Base.metadata.tables[table_name]
-    return [
-        c
-        for c in table.constraints
-        if isinstance(c, (UniqueConstraint, ForeignKeyConstraint))
-    ]
-
-
-def drop_bulk_load_constraints(engine: engine.Engine) -> None:
-    """Drop the unique and foreign key constraints of `BULK_LOAD_TABLES`.
-
-    With the constraints in place, PostgreSQL checks every row against four
-    other tables and keeps a unique index up to date while rows arrive in no
-    particular order; a load is then about 25 times slower and the index about
-    20 % larger. Restore them with `add_bulk_load_constraints` after the load,
-    which validates all rows at once.
-
-    Needs an exclusive lock on the referenced tables, so no other transaction
-    may use them meanwhile.
-
-    Args:
-        engine (engine.Engine): SQLAlchemy engine object.
-    """
-    with engine.begin() as conn:
-        for table_name in BULK_LOAD_TABLES:
-            for constraint in _bulk_load_constraints(table_name):
-                conn.execute(
-                    text(
-                        f"ALTER TABLE {table_name} "
-                        f"DROP CONSTRAINT IF EXISTS {constraint.name};"
-                    )
-                )
-
-
-def add_bulk_load_constraints(engine: engine.Engine) -> None:
-    """(Re)create the missing constraints of `BULK_LOAD_TABLES`.
-
-    Fails if the loaded data contains duplicate rows or unknown IDs.
-
-    Args:
-        engine (engine.Engine): SQLAlchemy engine object.
-    """
-    with engine.begin() as conn:
-        existing = {
-            row[0] for row in conn.execute(text("SELECT conname FROM pg_constraint"))
-        }
-        for table_name in BULK_LOAD_TABLES:
-            for constraint in _bulk_load_constraints(table_name):
-                if constraint.name not in existing:
-                    conn.execute(AddConstraint(constraint))
 
 
 def normalize_db_url(db_url: str) -> str:
@@ -535,7 +393,7 @@ def normalize_db_url(db_url: str) -> str:
 
     SQLAlchemy >= 2.1 uses psycopg 3 for plain ``postgresql://`` URLs. psycopg 3
     sends query parameters separately and allows at most 65535 of them, which
-    large ``IN (...)`` filters (e.g. all grid points of a global request)
+    large ``IN (...)`` filters (e.g. long lists of IDs)
     exceed. psycopg2 inlines them, so keep using it unless a driver is named.
 
     Args:
@@ -560,9 +418,9 @@ def initialize_database(db_url: str, replace: bool = False, upgrade: bool = True
         replace (bool): Whether to drop and recreate the tables. Defaults to False.
         upgrade (bool): Whether to bring existing tables up to date with
             `upgrade_schema` (only if replace is False). Defaults to True.
-            The API passes False: `upgrade_schema` takes exclusive locks and
-            re-creates the constraints that a running bulk load has dropped,
-            so only the production runner upgrades the schema.
+            The API passes False: `upgrade_schema` drops the tables of the
+            previous storage and takes exclusive locks, so only the
+            production runner upgrades the schema.
     """
     # create engine
     engine = create_engine(
@@ -664,46 +522,6 @@ def add_data_list_bulk(session: Session, data_dict_list: list, class_type: type[
         raise RuntimeError(f"Error inserting data: {e}")
 
 
-def insert_grid_points(session: Session, latitudes: np.ndarray, longitudes: np.ndarray):
-    """
-    Insert grid points into the database.
-
-    Args:
-        session (Session): SQLAlchemy session object.
-        latitudes (np.ndarray): Array of latitudes.
-        longitudes (np.ndarray): Array of longitudes.
-    """
-    total_batches = math.ceil(len(latitudes) / GRID_LAT_CHUNK) * math.ceil(
-        len(longitudes) / GRID_LON_CHUNK
-    )
-    batch_count = 0
-    for lat_start in range(0, len(latitudes), GRID_LAT_CHUNK):
-        lat_end = min(lat_start + GRID_LAT_CHUNK, len(latitudes))
-        lat_slice = latitudes[lat_start:lat_end]
-
-        for lon_start in range(0, len(longitudes), GRID_LON_CHUNK):
-            lon_end = min(lon_start + GRID_LON_CHUNK, len(longitudes))
-            lon_slice = longitudes[lon_start:lon_end]
-
-            # Build batch
-            grid_points = [
-                {
-                    "latitude": _q(lat),
-                    "longitude": _q(lon),
-                }
-                for lat in lat_slice
-                for lon in lon_slice
-            ]
-
-            # Insert batch
-            add_data_list_bulk(session, grid_points, GridPoint)
-            session.expire_all()  # clear identity map
-            batch_count += 1
-            print(f"Grid points batch {batch_count}/{total_batches} inserted.")
-
-    print("All grid points inserted.")
-
-
 def insert_resolution_groups(
     session: Session,
     resolutions: np.ndarray | None = None,
@@ -739,75 +557,6 @@ def insert_resolution_groups(
     ]
     add_data_list_bulk(session, resolution_groups, ResolutionGroup)
     print("Resolution groups inserted:", resolutions)
-
-
-def assign_grid_resolution_group_to_grid_point(session: Session) -> None:
-    """
-    Assign the grid resolution group to each grid point,
-    creating the many-to-many relationship between resolutions and
-    grid points.
-
-    Uses raw SQL INSERT...SELECT so the database performs the matching
-    and insert directly, avoiding OOM when processing millions of grid points.
-
-    This function is idempotent due to ON CONFLICT DO NOTHING - reruns will
-    skip existing assignments without error. If you need to completely refresh
-    assignments (e.g., after changing resolution logic), manually TRUNCATE
-    the grid_point_resolution table before running this function.
-
-    Args:
-        session (Session): SQLAlchemy session object.
-    """
-    resolution_groups = session.query(ResolutionGroup).all()
-    if not resolution_groups:
-        raise ValueError("No resolution groups found in the database.")
-
-    insert_sql = text("""
-        INSERT INTO grid_point_resolution (grid_id, resolution_id)
-        SELECT gp.id, :resolution_id
-        FROM grid_point gp
-        WHERE (ROUND(gp.latitude::numeric * 10)::integer % :resolution_mod = 0)
-          AND (ROUND(gp.longitude::numeric * 10)::integer % :resolution_mod = 0)
-        ON CONFLICT DO NOTHING
-    """)
-
-    try:
-        for resolution_group in resolution_groups:
-            resolution_mod = int(float(resolution_group.resolution) * 10)
-            result = session.execute(
-                insert_sql,
-                {
-                    "resolution_id": resolution_group.id,
-                    "resolution_mod": resolution_mod,
-                },
-            )
-            rowcount = result.rowcount
-            if rowcount == 0:
-                # Check if assignments already exist for this resolution
-                existing_count = session.execute(
-                    text("""
-                        SELECT COUNT(*) FROM grid_point_resolution
-                        WHERE resolution_id = :resolution_id
-                    """),
-                    {"resolution_id": resolution_group.id},
-                ).scalar()
-                if existing_count == 0:
-                    raise ValueError(
-                        f"No matching grid points for {resolution_group.resolution} degree resolution found."
-                    )
-                else:
-                    print(
-                        f"Resolution {resolution_group.resolution}° already has {existing_count} assignments (skipped)."
-                    )
-            else:
-                print(
-                    f"Assigned {rowcount} grid points to resolution {resolution_group.resolution}°."
-                )
-        session.commit()
-        print("Grid point resolutions assigned.")
-    except Exception:
-        session.rollback()
-        raise
 
 
 def extract_time_point(
@@ -851,8 +600,8 @@ def get_unique_time_points(
     time_points = []
     for tpd, yearly in time_point_data:
         if not yearly:
-            # assume it's monthly TODO
-            time_points.append(tpd)
+            # the database is monthly: one time point per month, on its first day
+            time_points.append(month_starts(tpd))
         else:
             # convert to monthly for the whole range
             if np.datetime64(tpd[0]) > np.datetime64(tpd[-1]):
@@ -872,9 +621,7 @@ def get_unique_time_points(
     if not time_points:
         return np.array([])
 
-    concatenated = np.concatenate(time_points)
-    unique_time_points = np.unique(concatenated)
-    return np.sort(unique_time_points)
+    return month_starts(np.concatenate(time_points))
 
 
 def insert_time_points(
@@ -920,126 +667,66 @@ def insert_var_types(session: Session, var_types: list[dict]):
     print("Variable types inserted.")
 
 
-def get_id_maps(session: Session) -> tuple[dict, dict, dict]:
+def get_id_maps(session: Session) -> tuple[dict, dict]:
     """
-    Get ID maps for grid points, time points, and variable types.
-    Uses streaming to avoid loading all data into memory at once.
+    Get ID maps for time points and variable types.
 
     Args:
         session (Session): SQLAlchemy session object.
 
     Returns:
-        tuple: A tuple containing three dictionaries:\n
-            - grid_id_map: Mapping of (latitude, longitude) to grid point ID.\n
-            - time_id_map: Mapping of datetime64 to time point ID.\n
+        tuple: A tuple containing two dictionaries:\n
+            - time_id_map: Mapping of the first day of a month (datetime64,
+              see `_normalize_time_key`) to time point ID.\n
             - var_id_map: Mapping of variable name to variable type ID.
     """
-    grid_id_map = {}
     time_id_map = {}
-    var_id_map = {}
-
-    # Stream grid points in batches
-    grid_point_batch_size = 100000
-    for offset in range(0, session.query(GridPoint).count(), grid_point_batch_size):
-        grid_points = (
-            session.query(GridPoint.id, GridPoint.latitude, GridPoint.longitude)
-            .order_by(GridPoint.id)
-            .offset(offset)
-            .limit(grid_point_batch_size)
-            .all()
-        )
-
-        for grid_id, lat, lon in grid_points:
-            # Convert to Python float first, then apply _q() for consistent rounding
-            lat_float = float(lat)
-            lon_float = float(lon)
-            grid_id_map[(_q(lat_float), _q(lon_float))] = grid_id
-
-        session.expire_all()  # Clear session cache
-
-    # Stream time points in batches
-    time_point_batch_size = 10000
-    for offset in range(0, session.query(TimePoint).count(), time_point_batch_size):
-        time_points = (
-            session.query(TimePoint)
-            .order_by(TimePoint.id)
-            .offset(offset)
-            .limit(time_point_batch_size)
-            .all()
-        )
-
-        for row in time_points:
-            time_id_map[
-                np.datetime64(pd.to_datetime(f"{row.year}-{row.month}-{row.day}"), "ns")
-            ] = row.id
-
-        session.expire_all()
-
-    # Stream variable types in batches
-    var_type_batch_size = 1000
-    for offset in range(0, session.query(VarType).count(), var_type_batch_size):
-        var_types = (
-            session.query(VarType)
-            .order_by(VarType.id)
-            .offset(offset)
-            .limit(var_type_batch_size)
-            .all()
-        )
-
-        for row in var_types:
-            var_id_map[row.name] = row.id
-
-        session.expire_all()
-
-    return grid_id_map, time_id_map, var_id_map
-
-
-def convert_yearly_to_monthly(ds: xr.Dataset) -> xr.Dataset:
-    """Convert yearly data to monthly data.
-
-    Args:
-        ds (xr.Dataset): xarray dataset with yearly data.
-
-    Returns:
-        xr.Dataset: xarray dataset with monthly data.
-    """
-    if ds.time.values[0] > ds.time.values[-1]:
-        # sort the time points
-        ds = ds.sortby("time")
-
-    # create monthly time points
-    s_y, s_m, _, s_h, s_mi, s_s = extract_time_point(ds.time.values[0])
-    e_y, _, _, e_h, e_mi, e_s = extract_time_point(ds.time.values[-1])
-    new_time_points = pd.date_range(
-        start=pd.Timestamp(
-            year=s_y, month=s_m, day=1, hour=s_h, minute=s_mi, second=s_s
-        ),
-        end=pd.Timestamp(year=e_y, month=12, day=1, hour=e_h, minute=e_mi, second=e_s),
-        freq="MS",
-    )
-
-    # reindex dataset with new time points
-    return ds.reindex(time=new_time_points, method="ffill")
+    # earliest day first, so a month with several (legacy) time points maps
+    # to the same one that the API selects
+    for time_id, year, month in session.query(
+        TimePoint.id, TimePoint.year, TimePoint.month
+    ).order_by(TimePoint.year, TimePoint.month, TimePoint.day, TimePoint.id):
+        key = np.datetime64(f"{year:04d}-{month:02d}", "M").astype("datetime64[ns]")
+        time_id_map.setdefault(key, time_id)
+    var_id_map = {
+        name: var_id for var_id, name in session.query(VarType.id, VarType.name)
+    }
+    return time_id_map, var_id_map
 
 
 _PGCOPY_HEADER = b"PGCOPY\n\xff\r\n\x00" + struct.pack("!ii", 0, 0)
 _PGCOPY_TRAILER = struct.pack("!h", -1)
 
 
-def _pgcopy_binary(columns: list[tuple[str, np.ndarray | None]]) -> bytes:
-    """Encode rows in the binary format of PostgreSQL's COPY.
+CopyColumn = tuple[str, np.ndarray | list[np.ndarray] | None]
+
+
+def _column_length(values: np.ndarray | list[np.ndarray]) -> int:
+    if isinstance(values, list):
+        return sum(len(part) for part in values)
+    return len(values)
+
+
+def _pgcopy_rows(columns: list[CopyColumn]) -> np.ndarray:
+    """Encode rows in the binary row format of PostgreSQL's COPY.
+
+    The values are written straight into one structured array, so the data is
+    held only once more in memory.
 
     Args:
-        columns (list[tuple[str, np.ndarray | None]]): One (dtype, values) pair
-            per column, in table column order. `dtype` is a big-endian numpy
-            type matching the column exactly (">i4" for integer, ">i2" for
-            smallint, ">f4" for real). `values` is a 1D array with one entry
-            per row, or None for a column that is NULL in every row.
+        columns (list[CopyColumn]): One (dtype, values) pair per column, in
+            table column order. `dtype` is a big-endian numpy type matching the
+            column exactly (">i4" for integer, ">i2" for smallint, ">f4" for
+            real), or a void type ("V<n>") for a bytea of fixed length n.
+            `values` is a 1D array with one entry per row, a list of such
+            arrays that are concatenated, or None for a column that is NULL in
+            every row.
 
     Returns:
-        bytes: The COPY data, including header and trailer.
+        np.ndarray: Structured array whose bytes are the COPY rows, without
+            header and trailer.
     """
-    n_rows = next((len(v) for _, v in columns if v is not None), 0)
+    n_rows = next((_column_length(v) for _, v in columns if v is not None), 0)
     fields = [("n_fields", ">i2")]
     for k, (dtype, values) in enumerate(columns):
         fields.append((f"len{k}", ">i4"))
@@ -1050,36 +737,78 @@ def _pgcopy_binary(columns: list[tuple[str, np.ndarray | None]]) -> bytes:
     for k, (dtype, values) in enumerate(columns):
         if values is None:
             rows[f"len{k}"] = -1
-        else:
-            if len(values) != n_rows:
-                raise ValueError("All COPY columns must have the same length.")
-            rows[f"len{k}"] = np.dtype(dtype).itemsize
+            continue
+        if _column_length(values) != n_rows:
+            raise ValueError("All COPY columns must have the same length.")
+        rows[f"len{k}"] = np.dtype(dtype).itemsize
+        if not isinstance(values, list):
             rows[f"val{k}"] = values
-    return _PGCOPY_HEADER + rows.tobytes() + _PGCOPY_TRAILER
+            continue
+        start = 0
+        for part in values:
+            rows[f"val{k}"][start : start + len(part)] = part
+            start += len(part)
+    return rows
+
+
+def _pgcopy_binary(columns: list[CopyColumn]) -> bytes:
+    """The complete COPY data of `columns`, see `_pgcopy_rows`.
+
+    Returns:
+        bytes: The COPY data, including header and trailer.
+    """
+    return _PGCOPY_HEADER + _pgcopy_rows(columns).tobytes() + _PGCOPY_TRAILER
+
+
+class _BufferReader(io.RawIOBase):
+    """Read-only file over several buffers, without joining them."""
+
+    def __init__(self, *buffers):
+        self._parts = [memoryview(b).cast("B") for b in buffers]
+        self._index = 0
+        self._offset = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, target) -> int:
+        target = memoryview(target).cast("B")
+        written = 0
+        while written < len(target) and self._index < len(self._parts):
+            part = self._parts[self._index]
+            n = min(len(target) - written, len(part) - self._offset)
+            target[written : written + n] = part[self._offset : self._offset + n]
+            written += n
+            self._offset += n
+            if self._offset == len(part):
+                self._index += 1
+                self._offset = 0
+        return written
 
 
 def copy_rows(
     engine: engine.Engine,
     table: str,
     column_names: list[str],
-    columns: list[tuple[str, np.ndarray | None]],
+    columns: list[CopyColumn],
 ) -> int:
     """Insert rows with a binary COPY, in one transaction.
 
     Much faster than INSERT statements, and no Python object is created per
-    row. See `_pgcopy_binary` for `columns`.
+    row. The encoded rows are streamed to the server, not copied into one
+    bytes object. See `_pgcopy_rows` for `columns`.
 
     Args:
         engine (engine.Engine): SQLAlchemy engine object.
         table (str): Table name.
         column_names (list[str]): Names of the columns in `columns`.
-        columns (list[tuple[str, np.ndarray | None]]): Column data.
+        columns (list[CopyColumn]): Column data.
 
     Returns:
         int: Number of rows inserted.
     """
-    data = _pgcopy_binary(columns)
-    n_rows = next((len(v) for _, v in columns if v is not None), 0)
+    rows = _pgcopy_rows(columns)
+    n_rows = len(rows)
     if n_rows == 0:
         return 0
     connection = engine.raw_connection()
@@ -1088,7 +817,7 @@ def copy_rows(
             cursor.copy_expert(
                 f"COPY {table} ({', '.join(column_names)}) "
                 "FROM STDIN WITH (FORMAT BINARY)",
-                io.BytesIO(data),
+                _BufferReader(_PGCOPY_HEADER, rows, _PGCOPY_TRAILER),
             )
         connection.commit()
     except Exception:
@@ -1097,29 +826,6 @@ def copy_rows(
     finally:
         connection.close()
     return n_rows
-
-
-def grid_id_array(lats: np.ndarray, lons: np.ndarray, grid_id_map: dict) -> np.ndarray:
-    """Look up the grid point IDs of a regular (latitude, longitude) grid once.
-
-    Args:
-        lats (np.ndarray): Latitudes.
-        lons (np.ndarray): Longitudes.
-        grid_id_map (dict): Mapping of (latitude, longitude) to grid point ID.
-
-    Returns:
-        np.ndarray: int64 array (len(lats), len(lons)) of grid point IDs, -1
-            where the grid point is missing from `grid_id_map`.
-    """
-    ids = np.full((len(lats), len(lons)), -1, dtype=np.int64)
-    q_lons = [_q(lon) for lon in lons]
-    for i, lat in enumerate(lats):
-        q_lat = _q(lat)
-        ids[i] = [grid_id_map.get((q_lat, q_lon), -1) for q_lon in q_lons]
-    n_missing = int((ids < 0).sum())
-    if n_missing:
-        print(f"Warning: {n_missing} grid points are not in the database.")
-    return ids
 
 
 def time_id_array(times: np.ndarray, time_id_map: dict) -> np.ndarray:
@@ -1140,123 +846,6 @@ def time_id_array(times: np.ndarray, time_id_map: dict) -> np.ndarray:
             raise ValueError(f"Time point {time_key} is not in the database.")
         ids.append(time_id)
     return np.array(ids, dtype=np.int64)
-
-
-def copy_var_values(
-    engine: engine.Engine,
-    values: np.ndarray,
-    grid_ids: np.ndarray,
-    time_ids: np.ndarray,
-    var_id: int,
-    resolution_id: int | None = None,
-) -> int:
-    """Insert the non-NaN values of a (time, latitude, longitude) array.
-
-    Args:
-        engine (engine.Engine): SQLAlchemy engine object.
-        values (np.ndarray): Values over (time, latitude, longitude).
-        grid_ids (np.ndarray): Grid point IDs over (latitude, longitude), -1
-            for grid points that are not in the database (skipped).
-        time_ids (np.ndarray): Time point IDs, one per time step.
-        var_id (int): Variable type ID.
-        resolution_id (int | None): Resolution group of the values, None for
-            variables with aggregation "subsample".
-
-    Returns:
-        int: Number of values inserted.
-    """
-    values = np.asarray(values)
-    if values.ndim != 3 or values.shape[1:] != grid_ids.shape:
-        raise ValueError(
-            f"Values of shape {values.shape} do not match the grid {grid_ids.shape}."
-        )
-    if len(time_ids) != values.shape[0]:
-        raise ValueError("One time point ID per time step is needed.")
-    total = 0
-    known = grid_ids >= 0
-    for t in range(values.shape[0]):
-        keep = known & np.isfinite(values[t])
-        n_rows = int(keep.sum())
-        if n_rows == 0:
-            continue
-        resolution = None
-        if resolution_id is not None:
-            resolution = np.full(n_rows, resolution_id)
-        total += copy_rows(
-            engine,
-            "var_value",
-            ["grid_id", "time_id", "var_id", "resolution_id", "value"],
-            [
-                (">i4", grid_ids[keep]),
-                (">i4", np.full(n_rows, time_ids[t])),
-                (">i2", np.full(n_rows, var_id)),
-                (">i2", resolution),
-                (">f4", values[t][keep]),
-            ],
-        )
-    return total
-
-
-def insert_var_values(
-    engine: engine.Engine,
-    ds: xr.Dataset,
-    var_name: str,
-    grid_id_map: dict,
-    time_id_map: dict,
-    var_id_map: dict,
-    to_monthly: bool = False,
-) -> tuple[float, float]:
-    """Insert variable values into the database in streaming chunks."""
-    # the chunk processing indexes values positionally as (time, lat, lon);
-    # some model outputs (e.g. the P-Model) are written as (lon, lat, time)
-    ds = _to_time_lat_lon(ds, var_name)
-
-    if to_monthly:
-        print(f"Converting {var_name} data from yearly to monthly...")
-        ds = convert_yearly_to_monthly(ds)
-    t_yearly_to_monthly = time.time()
-
-    print(f"Prepare inserting {var_name} values...")
-
-    var_id = var_id_map.get(var_name)
-    if var_id is None:
-        raise ValueError(f"Variable {var_name} not found in var_type table.")
-    _check_no_coverage(engine, var_id, var_name)
-
-    grid_ids = grid_id_array(ds.latitude.values, ds.longitude.values, grid_id_map)
-
-    # grid points with a value at every time point: zeros there are not stored
-    covered = ds[var_name].notnull().all("time").compute()
-    data = drop_covered_zeros(ds[var_name], covered)
-    n_covered = insert_var_coverage(
-        engine,
-        var_id,
-        ds.latitude.values,
-        ds.longitude.values,
-        covered.values,
-        grid_id_map,
-        grid_ids=grid_ids,
-    )
-    print(f"Coverage of {var_name}: {n_covered} grid points.")
-
-    print(f"Start inserting {var_name} values in streaming chunks...")
-    t_start_insert = time.time()
-
-    total = 0
-    n_time = data.sizes["time"]
-    for t0 in range(0, n_time, VAR_TIME_CHUNK):
-        chunk = data.isel(time=slice(t0, min(t0 + VAR_TIME_CHUNK, n_time)))
-        total += copy_var_values(
-            engine,
-            chunk.values,
-            grid_ids,
-            time_id_array(chunk.time.values, time_id_map),
-            var_id,
-        )
-        del chunk
-        gc.collect()
-    print(f"Values of {var_name} inserted. Total: {total}")
-    return t_yearly_to_monthly, t_start_insert
 
 
 def _to_time_lat_lon(ds: xr.Dataset, var_name: str) -> xr.Dataset:
@@ -1337,11 +926,12 @@ def _grid_step(coords: np.ndarray) -> float:
 def _coarse_indices(coords: np.ndarray, resolution: float) -> np.ndarray:
     """Indices of the coordinates that are multiples of `resolution`.
 
-    Uses the same rule as `assign_grid_resolution_group_to_grid_point`, so the
-    selected points are exactly the grid points of that resolution group.
+    These are the grid points of that resolution group (see `GridDefinition`).
     """
-    tenths = np.round(coords.astype(np.float64) * 10).astype(np.int64)
-    return np.flatnonzero(tenths % round(float(resolution) * 10) == 0)
+    resolution = float(resolution)
+    ratio = coords.astype(np.float64) / resolution
+    offset = np.abs(ratio - np.round(ratio)) * resolution
+    return np.flatnonzero(offset <= tiles.COORD_ATOL)
 
 
 def _window_matrix(
@@ -1458,99 +1048,58 @@ def block_mean(values: np.ndarray, plan: dict) -> np.ndarray:
     return out
 
 
-def block_valid(valid: np.ndarray, plan: dict) -> np.ndarray:
-    """Coarse cells for which `block_mean` gives a value.
-
-    Args:
-        valid (np.ndarray): Boolean fine-grid array (lat, lon), True where the
-            fine cell has a value.
-        plan (dict): Plan from `_block_mean_plan`.
-
-    Returns:
-        np.ndarray: Boolean array (coarse lat, coarse lon).
-    """
-    if plan["factor"] == 1:
-        return valid.astype(bool)
-    weight = valid * plan["area_weight"][:, None]
-    return (plan["lat_matrix"] @ weight @ plan["lon_matrix_t"]) > 0
-
-
-def drop_covered_zeros(values, covered):
-    """Set values that are 0 at covered grid points to NaN, so they are not stored.
-
-    Args:
-        values: numpy array or xarray object over (time, latitude, longitude).
-        covered: Boolean (latitude, longitude) array, see `VarCoverage`.
-
-    Returns:
-        The values with those zeros replaced by NaN, same type as `values`.
-    """
-    drop = (values == 0) & covered
-    if isinstance(values, xr.DataArray):
-        return values.where(~drop)
-    return np.where(drop, np.nan, values)
-
-
-def _check_no_coverage(engine: engine.Engine, var_id: int, var_name: str) -> None:
-    """Raise if values of a variable were already inserted with coverage.
-
-    The coverage of a variable is computed over all its time points at once, so
-    a variable cannot be inserted in several parts.
-    """
-    with engine.connect() as conn:
-        exists = conn.execute(
-            text("SELECT 1 FROM var_coverage WHERE var_id = :v LIMIT 1"),
-            {"v": int(var_id)},
-        ).first()
-    if exists:
-        raise ValueError(
-            f"Values of {var_name} are already in the database; a variable has "
-            "to be inserted in one go (truncate the tables to reload it)."
-        )
-
-
-def insert_var_coverage(
-    engine: engine.Engine,
-    var_id: int,
+def _check_grid_usable(
     lats: np.ndarray,
     lons: np.ndarray,
-    covered: np.ndarray,
-    grid_id_map: dict,
-    resolution_id: int | None = None,
-    grid_ids: np.ndarray | None = None,
-) -> int:
-    """Store the grid points where a variable has a value at every time point.
+    resolution_id_map: dict[float, int],
+    var_name: str,
+) -> None:
+    """Reject grids that the frontend cannot use.
 
-    Args:
-        engine (engine.Engine): SQLAlchemy engine object.
-        var_id (int): Variable type ID.
-        lats (np.ndarray): Latitudes of `covered`.
-        lons (np.ndarray): Longitudes of `covered`.
-        covered (np.ndarray): Boolean (lat, lon) array.
-        grid_id_map (dict): Mapping of (latitude, longitude) to grid point ID.
-        resolution_id (int | None): Resolution group, None for variables with
-            aggregation "subsample".
-        grid_ids (np.ndarray | None): Grid point IDs of (lats, lons) from
-            `grid_id_array`, looked up from `grid_id_map` if None.
+    The frontend requests values at one of the resolution groups, on grid
+    points that are multiples of that resolution. Data on another grid could
+    never be shown, so it is rejected before anything is stored.
 
-    Returns:
-        int: Number of grid points stored.
+    Raises:
+        ValueError: With the reason and how to fix the data.
     """
-    if grid_ids is None:
-        grid_ids = grid_id_array(lats, lons, grid_id_map)
-    keep = np.asarray(covered, dtype=bool) & (grid_ids >= 0)
-    n_rows = int(keep.sum())
-    resolution = None if resolution_id is None else np.full(n_rows, resolution_id)
-    return copy_rows(
-        engine,
-        "var_coverage",
-        ["var_id", "resolution_id", "grid_id"],
-        [
-            (">i2", np.full(n_rows, var_id)),
-            (">i2", resolution),
-            (">i4", grid_ids[keep]),
-        ],
-    )
+    resolutions = ", ".join(f"{r:g}" for r in sorted(resolution_id_map))
+    try:
+        step = _grid_step(lats)
+        lon_step = _grid_step(lons)
+    except ValueError as e:
+        raise ValueError(
+            f"The grid of {var_name} cannot be loaded: {e} Gridded variables "
+            "need a regular latitude/longitude grid with at least two points "
+            "per axis."
+        ) from e
+    if not np.isclose(lon_step, step, rtol=0, atol=tiles.COORD_ATOL):
+        raise ValueError(
+            f"The grid of {var_name} cannot be loaded: its latitude step "
+            f"({step:g}°) and longitude step ({lon_step:g}°) differ. Regrid the "
+            "data to the same step on both axes."
+        )
+    if not any(
+        np.isclose(r, step, rtol=0, atol=tiles.COORD_ATOL) for r in resolution_id_map
+    ):
+        raise ValueError(
+            f"The grid step of {var_name} ({step:g}°) is not one of the "
+            f"resolution groups ({resolutions}°). The frontend only requests "
+            "these resolutions, so values on this grid could not be shown. "
+            "Regrid the data to one of them (e.g. 0.1°)."
+        )
+    for axis, coords in (("latitude", lats), ("longitude", lons)):
+        ratio = coords.astype(np.float64) / step
+        offset = np.abs(ratio - np.round(ratio)) * step
+        if (offset > tiles.COORD_ATOL).any():
+            bad = float(coords[np.argmax(offset)])
+            raise ValueError(
+                f"The grid of {var_name} cannot be loaded: its points are not "
+                f"multiples of its step {step:g}° (e.g. {axis} {bad:g}). The "
+                "frontend requests grid points at multiples of the resolution, "
+                "so values on this grid could not be shown. Shift or regrid the "
+                f"data so that its coordinates are multiples of {step:g}°."
+            )
 
 
 def _resolution_plans(
@@ -1570,15 +1119,27 @@ def _resolution_plans(
     Returns:
         list[tuple[float, int, dict]]: (resolution, resolution_id, plan), finest
             first. The first one is always the native resolution.
+
+    Raises:
+        ValueError: If the grid cannot be served to the frontend: it is not
+            regular, its step is not one of the resolution groups, or its
+            points are not multiples of the step.
     """
+    _check_grid_usable(lats, lons, resolution_id_map, var_name)
+    step = _grid_step(lats)
     plans = []
     for resolution, resolution_id in sorted(resolution_id_map.items()):
         plan = _block_mean_plan(lats, lons, resolution)
         if plan is None:
-            print(
-                f"Skipping {resolution} degree resolution for {var_name}: "
-                "not a multiple of the data grid step."
-            )
+            ratio = float(resolution) / step
+            if round(ratio) < 1 or not np.isclose(ratio, round(ratio)):
+                reason = f"not a whole multiple of the data grid step {step:g}°"
+            else:
+                reason = (
+                    "the data covers no grid point of this resolution "
+                    "(its area is smaller than one cell)"
+                )
+            print(f"Skipping {resolution} degree resolution for {var_name}: {reason}.")
             continue
         plans.append((resolution, resolution_id, plan))
     if not plans or plans[0][2]["factor"] != 1:
@@ -1590,24 +1151,26 @@ def _resolution_plans(
 
 
 def _align_mask(
-    mask: xr.DataArray | None, lats: np.ndarray, lons: np.ndarray, var_name: str
+    mask: xr.DataArray | None, data: xr.DataArray, var_name: str
 ) -> xr.DataArray | None:
-    """Order a mask as (time, latitude, longitude) and check its grid."""
+    """Order a mask as (time, latitude, longitude) and check that it covers `data`."""
     if mask is None:
         return None
     mask = mask.transpose("time", "latitude", "longitude")
     if not (
-        np.array_equal(mask.latitude.values, lats)
-        and np.array_equal(mask.longitude.values, lons)
+        np.array_equal(mask.latitude.values, data.latitude.values)
+        and np.array_equal(mask.longitude.values, data.longitude.values)
     ):
         raise ValueError(f"The mask for {var_name} is on a different grid.")
+    if not np.isin(data.time.values, mask.time.values).all():
+        raise ValueError(f"The mask for {var_name} does not cover all time points.")
     return mask
 
 
-def _masked_chunks(data: xr.DataArray, mask: xr.DataArray | None, var_name: str):
+def _masked_chunks(data: xr.DataArray, mask: xr.DataArray | None):
     """Yield (first time index, times, float64 values) per chunk of time steps.
 
-    Values where `mask` is False are set to NaN.
+    Values where `mask` is False are set to NaN. See `_align_mask` for `mask`.
     """
     n_time = data.sizes["time"]
     for t0 in range(0, n_time, VAR_TIME_CHUNK):
@@ -1615,76 +1178,244 @@ def _masked_chunks(data: xr.DataArray, mask: xr.DataArray | None, var_name: str)
         times = chunk.time.values
         values = chunk.values.astype(np.float64)
         if mask is not None:
-            try:
-                mask_values = mask.sel(time=times).values.astype(bool)
-            except KeyError as e:
-                raise ValueError(
-                    f"The mask for {var_name} does not cover all time points."
-                ) from e
+            mask_values = mask.sel(time=times).values.astype(bool)
             values = np.where(mask_values, values, np.nan)
         yield t0, times, values
 
 
-def _coverage_by_resolution(
-    data: xr.DataArray,
-    mask: xr.DataArray | None,
-    plans: list[tuple[float, int, dict]],
-    var_name: str,
-) -> dict[int, np.ndarray]:
-    """Coarse cells that have a value at every time point, per resolution ID."""
-    covered = {
-        resolution_id: np.ones(
-            (len(plan["latitude"]), len(plan["longitude"])), dtype=bool
+def _ascending(
+    values: np.ndarray, lats: np.ndarray, lons: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Flip a (..., lat, lon) array so that both axes are ascending."""
+    if len(lats) > 1 and lats[0] > lats[-1]:
+        values, lats = values[..., ::-1, :], lats[::-1]
+    if len(lons) > 1 and lons[0] > lons[-1]:
+        values, lons = values[..., ::-1], lons[::-1]
+    return values, lats, lons
+
+
+def _plan_grid(plan: dict, resolution: float, tile_size: int) -> tiles.GridDef:
+    """The grid of a resolution plan, both axes ascending."""
+    lats = np.sort(plan["latitude"].astype(np.float64))
+    lons = np.sort(plan["longitude"].astype(np.float64))
+    return tiles.grid_def_from_coords(
+        lats, lons, step=float(resolution), tile_size=tile_size
+    )
+
+
+def ensure_grid_defs(engine: engine.Engine, grids: dict[int, tiles.GridDef]) -> None:
+    """Store the grid of each resolution group, or check the stored one.
+
+    All gridded variables must share one grid per resolution group. A stored
+    grid that no tile uses yet (e.g. left over from a load that failed) is
+    replaced.
+
+    Args:
+        engine (engine.Engine): SQLAlchemy engine object.
+        grids (dict[int, tiles.GridDef]): Grid per resolution group ID.
+    """
+    with engine.begin() as conn:
+        for resolution_id, grid in grids.items():
+            stored = conn.execute(
+                text(
+                    "SELECT lat0, lon0, step, n_lat, n_lon, tile_size "
+                    "FROM grid_def WHERE resolution_id = :r"
+                ),
+                {"r": int(resolution_id)},
+            ).first()
+            if stored is None:
+                conn.execute(
+                    text(
+                        "INSERT INTO grid_def "
+                        "(resolution_id, lat0, lon0, step, n_lat, n_lon, tile_size) "
+                        "VALUES (:r, :lat0, :lon0, :step, :n_lat, :n_lon, :ts)"
+                    ),
+                    {
+                        "r": int(resolution_id),
+                        "lat0": grid.lat0,
+                        "lon0": grid.lon0,
+                        "step": grid.step,
+                        "n_lat": grid.n_lat,
+                        "n_lon": grid.n_lon,
+                        "ts": grid.tile_size,
+                    },
+                )
+                continue
+            stored_grid = tiles.GridDef(*stored)
+            same = np.allclose(
+                [stored_grid.lat0, stored_grid.lon0, stored_grid.step],
+                [grid.lat0, grid.lon0, grid.step],
+                rtol=0,
+                atol=tiles.COORD_ATOL,
+            ) and (stored_grid.n_lat, stored_grid.n_lon, stored_grid.tile_size) == (
+                grid.n_lat,
+                grid.n_lon,
+                grid.tile_size,
+            )
+            if same:
+                continue
+            in_use = conn.execute(
+                text("SELECT 1 FROM var_tile WHERE resolution_id = :r LIMIT 1"),
+                {"r": int(resolution_id)},
+            ).first()
+            if in_use is None:
+                print(
+                    f"Replacing the unused grid of resolution group "
+                    f"{resolution_id}: {stored_grid} -> {grid}."
+                )
+                conn.execute(
+                    text(
+                        "UPDATE grid_def SET lat0 = :lat0, lon0 = :lon0, "
+                        "step = :step, n_lat = :n_lat, n_lon = :n_lon, "
+                        "tile_size = :ts WHERE resolution_id = :r"
+                    ),
+                    {
+                        "r": int(resolution_id),
+                        "lat0": grid.lat0,
+                        "lon0": grid.lon0,
+                        "step": grid.step,
+                        "n_lat": grid.n_lat,
+                        "n_lon": grid.n_lon,
+                        "ts": grid.tile_size,
+                    },
+                )
+            else:
+                raise ValueError(
+                    f"The grid of resolution group {resolution_id} differs from "
+                    f"the stored one: {grid} vs. {stored_grid}. All gridded "
+                    "variables must share one grid."
+                )
+
+
+def _check_not_loaded(
+    engine: engine.Engine, var_id: int, time_ids: np.ndarray, var_name: str
+) -> None:
+    """Raise if `var_id` already has tiles at any of `time_ids`."""
+    with engine.connect() as conn:
+        loaded = conn.execute(
+            text(
+                "SELECT DISTINCT tp.year, tp.month FROM var_tile v "
+                "JOIN time_point tp ON tp.id = v.time_id "
+                "WHERE v.var_id = :v AND v.time_id = ANY(:t) "
+                "ORDER BY tp.year, tp.month"
+            ),
+            {"v": int(var_id), "t": [int(t) for t in time_ids]},
+        ).all()
+    if loaded:
+        months = ", ".join(f"{y}-{m:02d}" for y, m in loaded[:5])
+        more = f" and {len(loaded) - 5} more" if len(loaded) > 5 else ""
+        raise ValueError(
+            f"{var_name} is already loaded for {months}{more}. Remove its tiles "
+            "first (or reset the production tables) to load it again, and make "
+            "sure no two files or config entries cover the same months."
         )
-        for _, resolution_id, plan in plans
-    }
-    for _, _, values in _masked_chunks(data, mask, var_name):
-        valid = np.isfinite(values)
-        for _, resolution_id, plan in plans:
-            for valid_t in valid:
-                covered[resolution_id] &= block_valid(valid_t, plan)
-    return covered
 
 
-def insert_var_values_by_resolution(
+def _delete_var_tiles(engine: engine.Engine, var_id: int, time_ids: np.ndarray):
+    """Delete the tiles of `var_id` at `time_ids`, at all resolutions."""
+    with engine.begin() as conn:
+        conn.execute(
+            text("DELETE FROM var_tile WHERE var_id = :v AND time_id = ANY(:t)"),
+            {"v": int(var_id), "t": [int(t) for t in time_ids]},
+        )
+
+
+def copy_var_tiles(
+    engine: engine.Engine,
+    var_id: int,
+    resolution_id: int,
+    time_ids: np.ndarray,
+    values: np.ndarray,
+    tile_size: int,
+) -> int:
+    """Cut (time, lat, lon) values into tiles and store them with a binary COPY.
+
+    Args:
+        engine (engine.Engine): SQLAlchemy engine object.
+        var_id (int): Variable type ID.
+        resolution_id (int): Resolution group ID.
+        time_ids (np.ndarray): Time point ID per entry of the first axis.
+        values (np.ndarray): Values on the full grid of the resolution group,
+            both axes ascending, NaN where there is no data.
+        tile_size (int): Cells per tile side.
+
+    Returns:
+        int: Number of tiles stored.
+    """
+    # all tiles have the same size, so they fit a fixed-size numpy type
+    blob_dtype = np.dtype(f"V{tile_size * tile_size * tiles.TILE_DTYPE.itemsize}")
+    t_ids, rows, cols, blocks = [], [], [], []
+    for time_id, values_t in zip(time_ids, values):
+        tile_rows, tile_cols, blocks_t = tiles.array_to_tile_blocks(values_t, tile_size)
+        if len(tile_rows) == 0:
+            continue
+        t_ids.append(np.full(len(tile_rows), time_id))
+        rows.append(tile_rows)
+        cols.append(tile_cols)
+        # a view: each tile becomes one fixed-size bytea value
+        blocks.append(blocks_t.reshape(len(tile_rows), -1).view(blob_dtype)[:, 0])
+    n_tiles = sum(len(r) for r in rows)
+    if n_tiles == 0:
+        return 0
+    return copy_rows(
+        engine,
+        "var_tile",
+        ["var_id", "resolution_id", "time_id", "tile_row", "tile_col", "data"],
+        [
+            (">i2", np.full(n_tiles, var_id)),
+            (">i2", np.full(n_tiles, resolution_id)),
+            (">i4", t_ids),
+            (">i2", rows),
+            (">i2", cols),
+            (blob_dtype.str, blocks),
+        ],
+    )
+
+
+def insert_var_tiles(
     engine: engine.Engine,
     ds: xr.Dataset,
     var_name: str,
-    grid_id_map: dict,
     time_id_map: dict,
     var_id_map: dict,
     resolution_id_map: dict[float, int],
+    aggregation: str = "subsample",
     mask: xr.DataArray | None = None,
     transform: str | None = None,
     transform_floor: float = 1.0,
+    tile_size: int = tiles.DEFAULT_TILE_SIZE,
 ) -> int:
-    """Insert a variable whose value depends on the grid resolution.
+    """Insert a gridded variable as tiles, at every fitting resolution group.
 
     For every resolution group that is an integer multiple of the data's grid
-    step, the area-weighted mean over each coarse cell is computed and stored
-    with that group's `resolution_id`. The native resolution is stored as is.
-    Resolutions that are finer than the data, or not a multiple of its step,
-    are skipped.
+    step, the values are computed on that group's grid and stored as tiles
+    (see `VarTile`): by taking every n-th grid point (aggregation
+    "subsample") or the area-weighted mean over each coarse cell (aggregation
+    "mean"). The grid of each group is stored in `grid_def` (or checked
+    against the stored one).
 
     Args:
         engine (engine.Engine): SQLAlchemy engine object.
         ds (xr.Dataset): Dataset with `var_name` over (time, latitude, longitude),
             in any dimension order.
         var_name (str): Name of the variable to insert.
-        grid_id_map (dict): Mapping of (latitude, longitude) to grid point ID.
         time_id_map (dict): Mapping of datetime64 to time point ID.
         var_id_map (dict): Mapping of variable name to variable type ID.
         resolution_id_map (dict[float, int]): Mapping of resolution to group ID.
+        aggregation (str): "subsample" or "mean". Defaults to "subsample".
         mask (xr.DataArray | None): Boolean (time, latitude, longitude) array on
-            the same grid. Fine cells where it is False are set to NaN before
-            aggregating, e.g. to drop ocean cells. Defaults to None.
+            the same grid. Cells where it is False are set to NaN first, e.g.
+            to drop ocean cells. Defaults to None.
         transform (str | None): Transform applied after aggregating, see
             `apply_transform`. Means are always taken over the original values.
         transform_floor (float): Floor for the transform. Defaults to 1.
+        tile_size (int): Cells per tile side.
 
     Returns:
-        int: Total number of values inserted over all resolutions.
+        int: Total number of tiles inserted over all resolutions.
     """
+    if aggregation not in ("subsample", "mean"):
+        raise ValueError(f"Unknown aggregation {aggregation} for {var_name}.")
     # fail early, before any data is read
     apply_transform(np.array([1.0]), transform, transform_floor)
     var_id = var_id_map.get(var_name)
@@ -1695,184 +1426,61 @@ def insert_var_values_by_resolution(
     lons = data.longitude.values
 
     plans = _resolution_plans(lats, lons, resolution_id_map, var_name)
-    mask = _align_mask(mask, lats, lons, var_name)
-
-    _check_no_coverage(engine, var_id, var_name)
-    grid_ids = {
-        resolution_id: grid_id_array(plan["latitude"], plan["longitude"], grid_id_map)
-        for _, resolution_id, plan in plans
+    mask = _align_mask(mask, data, var_name)
+    # check every time point before anything is stored
+    all_time_ids = time_id_array(data.time.values, time_id_map)
+    if len(np.unique(all_time_ids)) != len(all_time_ids):
+        raise ValueError(
+            f"{var_name} has several time steps in one month. The database "
+            "stores one value per month; aggregate the data to monthly first."
+        )
+    _check_not_loaded(engine, var_id, all_time_ids, var_name)
+    grids = {
+        resolution_id: _plan_grid(plan, resolution, tile_size)
+        for resolution, resolution_id, plan in plans
+    }
+    ensure_grid_defs(engine, grids)
+    strides = {
+        resolution_id: (
+            _coarse_indices(lats, resolution),
+            _coarse_indices(lons, resolution),
+        )
+        for resolution, resolution_id, plan in plans
+        if plan["factor"] > 1
     }
 
-    # first pass: coarse cells that have a value at every time point
-    covered = _coverage_by_resolution(data, mask, plans, var_name)
-    for resolution, resolution_id, plan in plans:
-        n_covered = insert_var_coverage(
-            engine,
-            var_id,
-            plan["latitude"],
-            plan["longitude"],
-            covered[resolution_id],
-            grid_id_map,
-            resolution_id=resolution_id,
-            grid_ids=grid_ids[resolution_id],
-        )
-        print(f"Coverage of {var_name} at {resolution} degree: {n_covered} points.")
-
-    # second pass: values, without the zeros at covered grid points
     total = 0
-    for t0, times, values in _masked_chunks(data, mask, var_name):
-        time_ids = time_id_array(times, time_id_map)
-        for resolution, resolution_id, plan in plans:
-            coarse = values if plan["factor"] == 1 else block_mean(values, plan)
-            coarse = apply_transform(coarse, transform, transform_floor)
-            coarse = drop_covered_zeros(coarse, covered[resolution_id])
-            total += copy_var_values(
-                engine,
-                coarse,
-                grid_ids[resolution_id],
-                time_ids,
-                var_id,
-                resolution_id=resolution_id,
-            )
-            print(
-                f"{var_name}: inserted {resolution} degree values for time "
-                f"indices {t0}:{t0 + len(times)}."
-            )
-        del values
-        gc.collect()
+    try:
+        for t0, times, values in _masked_chunks(data, mask):
+            time_ids = all_time_ids[t0 : t0 + len(times)]
+            for resolution, resolution_id, plan in plans:
+                if plan["factor"] == 1:
+                    coarse = values
+                elif aggregation == "mean":
+                    coarse = block_mean(values, plan)
+                else:
+                    lat_idx, lon_idx = strides[resolution_id]
+                    coarse = values[:, lat_idx][:, :, lon_idx]
+                coarse = apply_transform(coarse, transform, transform_floor)
+                coarse, _, _ = _ascending(coarse, plan["latitude"], plan["longitude"])
+                total += copy_var_tiles(
+                    engine, var_id, resolution_id, time_ids, coarse, tile_size
+                )
+                print(
+                    f"{var_name}: inserted {resolution} degree tiles for time "
+                    f"indices {t0}:{t0 + len(times)}."
+                )
+            del values
+            gc.collect()
+    except BaseException:
+        # the chunks are committed one by one: remove what this call stored, so
+        # that the variable is not left half-loaded and can be loaded again
+        _delete_var_tiles(engine, var_id, all_time_ids)
+        print(f"Loading {var_name} failed; its tiles stored so far were removed.")
+        raise
 
-    print(f"Values of {var_name} inserted for all resolutions. Total: {total}")
+    print(f"Tiles of {var_name} inserted for all resolutions. Total: {total}")
     return total
-
-
-def get_var_value(
-    session: Session,
-    var_name: str,
-    lat: float,
-    lon: float,
-    year: int,
-    month: int,
-    day: int,
-    resolution: float | None = None,
-) -> float | int | str | None:
-    """Get variable value from the database.
-
-    Args:
-        session (Session): SQLAlchemy session object.
-        var_name (str): Name of the variable to retrieve.
-        lat (float): Latitude of the grid point.
-        lon (float): Longitude of the grid point.
-        year (int): Year of the time point.
-        month (int): Month of the time point.
-        day (int): Day of the time point.
-        resolution (float | None): Grid resolution in degrees, only used for
-            variables stored per resolution. If None, the finest available
-            resolution is returned. Defaults to None.
-
-    Returns:
-        float | int | str | None: Value of the variable at
-            the specified grid point and time point.
-    """
-    if day != 1:
-        print(
-            "The current database only supports monthly data."
-            "Retieving data for the first day of the month..."
-        )
-        day = 1
-
-    lat = _q(lat)
-    lon = _q(lon)
-
-    var_type = session.query(VarType).filter(VarType.name == var_name).first()
-    if var_type is None:
-        return None
-    # one row per (grid point, time point) for "subsample" variables; for the
-    # others, look at a single resolution only. Falling back to the next
-    # coarser resolution when a row is missing would be wrong: a missing row
-    # at a covered grid point means 0, not "ask the coarser cell".
-    if var_type.aggregation == "subsample":
-        value_resolution = VarValue.resolution_id.is_(None)
-        coverage_resolution = VarCoverage.resolution_id.is_(None)
-    else:
-        if resolution is None:
-            resolution_id = _finest_resolution_id(session, var_type.id)
-        else:
-            resolution_id = get_resolution_id(session, resolution)
-        if resolution_id is None:
-            return None
-        value_resolution = VarValue.resolution_id == resolution_id
-        coverage_resolution = VarCoverage.resolution_id == resolution_id
-
-    result = (
-        session.query(VarValue.value)
-        .join(GridPoint, VarValue.grid_id == GridPoint.id)
-        .join(TimePoint, VarValue.time_id == TimePoint.id)
-        .filter(
-            GridPoint.latitude == lat,
-            GridPoint.longitude == lon,
-            TimePoint.year == year,
-            TimePoint.month == month,
-            TimePoint.day == day,
-            VarValue.var_id == var_type.id,
-            value_resolution,
-        )
-        .first()
-    )
-    if result is not None:
-        return result.value
-
-    # no stored value: 0 if the grid point is covered (see VarCoverage)
-    time_exists = (
-        session.query(TimePoint.id)
-        .filter(TimePoint.year == year, TimePoint.month == month, TimePoint.day == day)
-        .first()
-    )
-    if time_exists is None:
-        return None
-    covered = (
-        session.query(VarCoverage.grid_id)
-        .join(GridPoint, VarCoverage.grid_id == GridPoint.id)
-        .filter(
-            GridPoint.latitude == lat,
-            GridPoint.longitude == lon,
-            VarCoverage.var_id == var_type.id,
-            coverage_resolution,
-        )
-        .first()
-    )
-    return 0.0 if covered is not None else None
-
-
-def _finest_resolution_id(session: Session, var_id: int) -> int | None:
-    """Finest resolution group at which a variable stored per resolution has data.
-
-    `var_coverage` is checked first: it is small and indexed by var_id. Only if
-    the variable has no coverage at all is `var_value` searched, which may scan
-    a large part of the table.
-
-    Args:
-        session (Session): SQLAlchemy session object.
-        var_id (int): Variable type ID.
-
-    Returns:
-        int | None: Resolution group ID, None if the variable has no data.
-    """
-    resolution_ids = [
-        rid
-        for (rid,) in session.query(ResolutionGroup.id).order_by(
-            ResolutionGroup.resolution.asc()
-        )
-    ]
-    for table in (VarCoverage, VarValue):
-        for rid in resolution_ids:
-            exists = (
-                session.query(table.var_id)
-                .filter(table.var_id == var_id, table.resolution_id == rid)
-                .first()
-            )
-            if exists is not None:
-                return rid
-    return None
 
 
 def get_var_value_nuts(
@@ -1976,61 +1584,6 @@ def get_resolution_id(session: Session, resolution: float) -> int | None:
     return resolution_group.id if resolution_group else None
 
 
-def get_grid_ids_by_resolution(session: Session, resolution_id: int) -> list[int]:
-    """Get all grid point IDs for a specific resolution.
-
-    Args:
-        session (Session): SQLAlchemy session object.
-        resolution_id (int): Resolution ID to filter by.
-
-    Returns:
-        List[int]: List of grid point IDs belonging to the specified resolution.
-    """
-    grid_point_resolutions = (
-        session.query(GridPointResolution.grid_id)
-        .filter(GridPointResolution.resolution_id == resolution_id)
-        .all()
-    )
-    return [gpr.grid_id for gpr in grid_point_resolutions]
-
-
-def get_grid_points(
-    session: Session,
-    area: None | tuple[float, float, float, float] = None,
-    resolution_id: int | None = None,
-) -> list[GridPoint]:
-    """Get grid points from the database that fall within a specified area.
-    Args:
-        session (Session): SQLAlchemy session object.
-        area (None | Tuple[float, float, float, float]):
-            Area as (North, West, South, East).
-            If None, all grid points are returned.
-        resolution_id (int | None): Resolution ID of the grid points. Defaults to None.
-    Returns:
-        List[GridPoint]: List of GridPoint objects within the specified area.
-    """
-
-    query = session.query(GridPoint)
-
-    # Filter by resolution if specified
-    if resolution_id is not None:
-        query = query.join(
-            GridPointResolution, GridPoint.id == GridPointResolution.grid_id
-        ).filter(GridPointResolution.resolution_id == resolution_id)
-
-    # Filter by area if specified
-    if area is not None:
-        north, west, south, east = area
-        query = query.filter(
-            GridPoint.latitude <= north,
-            GridPoint.latitude >= south,
-            GridPoint.longitude >= west,
-            GridPoint.longitude <= east,
-        )
-
-    return query.all()
-
-
 def get_var_types(
     session: Session,
     var_names: None | list[str] = None,
@@ -2051,23 +1604,159 @@ def get_var_types(
     return session.query(VarType).filter(VarType.name.in_(var_names)).all()
 
 
-def sort_grid_points_get_ids(
-    grid_points: list[GridPoint],
-) -> tuple[dict, list[float], list[float]]:
-    # Sort and deduplicate latitudes and longitudes
-    latitudes = sorted({_q(gp.latitude) for gp in grid_points})
-    longitudes = sorted({_q(gp.longitude) for gp in grid_points})
+def get_grid_def(session: Session, resolution_id: int) -> tiles.GridDef | None:
+    """The stored grid of a resolution group, None if there is none."""
+    row = session.get(GridDefinition, resolution_id)
+    return None if row is None else row.to_grid()
 
-    # Create fast index maps for latitude and longitude
-    lat_to_index = {lat: i for i, lat in enumerate(latitudes)}
-    lon_to_index = {lon: i for i, lon in enumerate(longitudes)}
 
-    # Map grid_id to (lat_index, lon_index)
-    grid_ids = {
-        gp.id: (lat_to_index[_q(gp.latitude)], lon_to_index[_q(gp.longitude)])
-        for gp in grid_points
-    }
-    return grid_ids, latitudes, longitudes
+def _finest_resolution_id(session: Session, var_id: int) -> int | None:
+    """Finest resolution group that has tiles of a variable."""
+    row = session.execute(
+        text(
+            """
+            SELECT g.resolution_id
+            FROM grid_def g
+            JOIN resolution_group r ON r.id = g.resolution_id
+            WHERE EXISTS (
+                SELECT 1 FROM var_tile t
+                WHERE t.var_id = :v AND t.resolution_id = g.resolution_id
+            )
+            ORDER BY r.resolution
+            LIMIT 1
+            """
+        ),
+        {"v": int(var_id)},
+    ).first()
+    return None if row is None else row[0]
+
+
+def read_tile_values(
+    session: Session,
+    var_id: int,
+    resolution_id: int,
+    time_ids: list[int],
+    grid: tiles.GridDef,
+    index_range: tuple[int, int, int, int],
+) -> np.ndarray:
+    """Values of a variable on a block of cells, from the tiles, in one query.
+
+    Args:
+        session (Session): SQLAlchemy session object.
+        var_id (int): Variable type ID.
+        resolution_id (int): Resolution group ID.
+        time_ids (list[int]): Time point IDs.
+        grid (tiles.GridDef): Grid of the resolution group.
+        index_range (tuple[int, int, int, int]): Cells
+            (i_start, i_stop, j_start, j_stop), see `tiles.area_to_index_range`.
+
+    Returns:
+        np.ndarray: float32 array (time, lat, lon), both axes ascending, NaN
+            where there is no data.
+    """
+    i0, i1, j0, j1 = index_range
+    r0, r1, c0, c1 = tiles.tile_range(grid, i0, i1, j0, j1)
+    rows = session.execute(
+        text(
+            """
+            SELECT time_id, tile_row, tile_col, data FROM var_tile
+            WHERE var_id = :v AND resolution_id = :r AND time_id = ANY(:t)
+                AND tile_row >= :r0 AND tile_row < :r1
+                AND tile_col >= :c0 AND tile_col < :c1
+            """
+        ),
+        {
+            "v": int(var_id),
+            "r": int(resolution_id),
+            "t": [int(t) for t in time_ids],
+            "r0": r0,
+            "r1": r1,
+            "c0": c0,
+            "c1": c1,
+        },
+    ).all()
+    by_time: dict[int, list] = {int(t): [] for t in time_ids}
+    for time_id, tile_row, tile_col, data in rows:
+        by_time[time_id].append((tile_row, tile_col, data))
+    return np.stack(
+        [
+            tiles.tiles_to_array(by_time[int(t)], grid.tile_size, i0, i1, j0, j1)
+            for t in time_ids
+        ]
+    )
+
+
+def get_var_value(
+    session: Session,
+    var_name: str,
+    lat: float,
+    lon: float,
+    year: int,
+    month: int,
+    day: int,
+    resolution: float | None = None,
+) -> float | None:
+    """Get the value of a variable at one grid point and time point.
+
+    Args:
+        session (Session): SQLAlchemy session object.
+        var_name (str): Name of the variable to retrieve.
+        lat (float): Latitude of the grid point.
+        lon (float): Longitude of the grid point.
+        year (int): Year of the time point.
+        month (int): Month of the time point.
+        day (int): Day of the time point. Only monthly data is stored, so the
+            first day of the month is always used.
+        resolution (float | None): Grid resolution in degrees, only used for
+            variables with aggregation "mean". If None, the finest resolution
+            with data is used. "subsample" values are the same at every
+            resolution, so the finest one is always used for them.
+
+    Returns:
+        float | None: The value, or None if the variable, time point or grid
+            point does not exist or there is no data at that point.
+    """
+    if day != 1:
+        print(
+            "The current database only supports monthly data."
+            "Retieving data for the first day of the month..."
+        )
+        day = 1
+    var_type = session.query(VarType).filter(VarType.name == var_name).first()
+    if var_type is None:
+        return None
+    if resolution is None or var_type.aggregation == "subsample":
+        resolution_id = _finest_resolution_id(session, var_type.id)
+    else:
+        resolution_id = get_resolution_id(session, resolution)
+    if resolution_id is None:
+        return None
+    grid = get_grid_def(session, resolution_id)
+    time_point = (
+        session.query(TimePoint.id)
+        .filter(TimePoint.year == year, TimePoint.month == month, TimePoint.day == day)
+        .first()
+    )
+    if grid is None or time_point is None:
+        return None
+    cell = tiles.cell_index(grid, lat, lon)
+    if cell is None:
+        return None
+    i, j = cell
+    value = read_tile_values(
+        session, var_type.id, resolution_id, [time_point.id], grid, (i, i + 1, j, j + 1)
+    )[0, 0, 0]
+    return None if np.isnan(value) else float(tiles.shortest_float64(value))
+
+
+def _area_to_index_range(
+    grid: tiles.GridDef, area: tuple[float, float, float, float] | None
+) -> tuple[int, int, int, int] | None:
+    """`tiles.area_to_index_range`, rejecting invalid areas with HTTP 400."""
+    try:
+        return tiles.area_to_index_range(grid, area)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 def get_var_values_cartesian(
@@ -2084,29 +1773,26 @@ def get_var_values_cartesian(
         time_point (Tuple[int, int]): Date point as (year, month).
         grid_resolution (float): Resolution of the grid points. Defaults to 0.1 degree.
         area (None | Tuple[float, float, float, float]):
-            Area as (North, West, South, East).
+            Area as (North, West, South, East), boundaries included.
             If None, all grid points are used.
         var_name (None | str): Variable name for which values should be returned.
          If None, the default model values will be returned.
 
     Returns:
-        dict: a dict with (latitude, longitude, var_value) for the requested date.
+        dict: a dict with (latitude, longitude, var_value) for the requested
+            date, ordered by latitude and then longitude. Grid points without
+            data (NaN, e.g. ocean) are left out.
     """
-    # get the time points and their ids
     date_object = (
         session.query(TimePoint)
         .filter((TimePoint.year == time_point[0]) & (TimePoint.month == time_point[1]))
+        .order_by(TimePoint.day, TimePoint.id)
         .first()
     )
-
     if not date_object:
         print("No time point found for the specified date.")
         raise HTTPException(status_code=400, detail="Missing data for requested date.")
 
-    # get time id
-    time_id = date_object.id
-
-    # get the resolution id for the targeted resolution
     resolution_id = get_resolution_id(session=session, resolution=grid_resolution)
     if not resolution_id:
         print("No resolution id found for requested resolution.")
@@ -2114,24 +1800,9 @@ def get_var_values_cartesian(
             status_code=400, detail="No id found for specified resolution."
         )
 
-    # grid points of the requested resolution in the requested area
-    grid_query = session.query(GridPoint.id).join(
-        GridPointResolution,
-        and_(
-            GridPointResolution.grid_id == GridPoint.id,
-            GridPointResolution.resolution_id == resolution_id,
-        ),
-    )
-    if area is not None:
-        north, west, south, east = area
-        area_filter = and_(
-            GridPoint.latitude <= north,
-            GridPoint.latitude >= south,
-            GridPoint.longitude >= west,
-            GridPoint.longitude <= east,
-        )
-        grid_query = grid_query.filter(area_filter)
-    if grid_query.first() is None:
+    grid = get_grid_def(session, resolution_id)
+    index_range = None if grid is None else _area_to_index_range(grid, area)
+    if index_range is None:
         print(
             "No grid points found in the specified area or with the specified resolution."
         )
@@ -2140,7 +1811,6 @@ def get_var_values_cartesian(
             detail="No grid points found in specified area or with the specified resolution.",
         )
 
-    # get the var type
     if not var_name:
         var_name = "t2m"  # default variable name
     var_type = session.query(VarType).filter(VarType.name == var_name).first()
@@ -2150,60 +1820,22 @@ def get_var_values_cartesian(
             status_code=400, detail="Missing variable type for requested time point."
         )
 
-    # get the variable type id
-    var_id = var_type.id
-
-    # variables that are aggregated per resolution store one row per
-    # resolution group; the others store a single row shared by all resolutions
-    if var_type.aggregation == "subsample":
-        value_resolution = VarValue.resolution_id.is_(None)
-        coverage_resolution = VarCoverage.resolution_id.is_(None)
-    else:
-        value_resolution = VarValue.resolution_id == resolution_id
-        coverage_resolution = VarCoverage.resolution_id == resolution_id
-
-    # values of the grid points; at covered grid points a missing row means 0
-    # (see VarCoverage), elsewhere it means that there is no data
-    query = (
-        session.query(
-            GridPoint.latitude,
-            GridPoint.longitude,
-            func.coalesce(VarValue.value, 0.0),
+    values = read_tile_values(
+        session, var_type.id, resolution_id, [date_object.id], grid, index_range
+    )[0]
+    i0, i1, j0, j1 = index_range
+    lat_idx, lon_idx = np.nonzero(~np.isnan(values))
+    # ordered by latitude, then longitude
+    lats = np.round(grid.latitudes(i0, i1), ROUND_DIGITS)[lat_idx]
+    lons = np.round(grid.longitudes(j0, j1), ROUND_DIGITS)[lon_idx]
+    values_list = list(
+        zip(
+            lats.tolist(),
+            lons.tolist(),
+            tiles.shortest_float64(values[lat_idx, lon_idx]).tolist(),
         )
-        .join(
-            GridPointResolution,
-            and_(
-                GridPointResolution.grid_id == GridPoint.id,
-                GridPointResolution.resolution_id == resolution_id,
-            ),
-        )
-        .outerjoin(
-            VarValue,
-            and_(
-                VarValue.grid_id == GridPoint.id,
-                VarValue.time_id == time_id,
-                VarValue.var_id == var_id,
-                value_resolution,
-            ),
-        )
-        .outerjoin(
-            VarCoverage,
-            and_(
-                VarCoverage.grid_id == GridPoint.id,
-                VarCoverage.var_id == var_id,
-                coverage_resolution,
-            ),
-        )
-        .filter(or_(VarValue.value.isnot(None), VarCoverage.grid_id.isnot(None)))
     )
-    if area is not None:
-        query = query.filter(area_filter)
-    values = query.order_by(GridPoint.latitude, GridPoint.longitude).all()
-    # Convert directly to list of tuples
-    values_list = [(np.float64(lat), np.float64(lon), val) for lat, lon, val in values]
-
-    mydict = {"latitude, longitude, var_value": values_list}
-    return mydict
+    return {"latitude, longitude, var_value": values_list}
 
 
 def get_var_values_cartesian_for_download(
@@ -2214,7 +1846,10 @@ def get_var_values_cartesian_for_download(
     var_names: None | list[str] = None,
     netcdf_file: str = "cartesian_grid_data_heiplanet.nc",
 ) -> dict:
-    """Get variable values for a cartesian map.
+    """Write variable values for a cartesian map to a NetCDF file.
+
+    Every variable is exported at the finest resolution at which it has data,
+    on the grid of the finest stored resolution.
 
     Args:
         session (Session): SQLAlchemy session object.
@@ -2222,50 +1857,51 @@ def get_var_values_cartesian_for_download(
         end_time_point (Tuple[int, int] | None): End time point as (year, month).
             If None, only the start time point is used.
         area (None | Tuple[float, float, float, float]):
-            Area as (North, West, South, East).
+            Area as (North, West, South, East), boundaries included.
             If None, all grid points are used.
         var_names (None | List[str]): List of variable names to filter by.
             If None, all variable types are used.
         netcdf_file (str): Name of the NetCDF file to save the dataset.
 
     Returns:
-        dict: a dict with (time, latitude, longitude, var_value) keys.
-            time or var_value is empty if no data is found.
+        dict: a dict with the keys "response" and "netcdf_file".
     """
-    # get the time points and their ids
-    time_points = get_time_points(session, start_time_point, end_time_point)
-
+    time_points = sorted(
+        get_time_points(session, start_time_point, end_time_point),
+        key=lambda tp: (tp.year, tp.month, tp.day),
+    )
     if not time_points:
         print("No time points found in the specified range.")
         raise HTTPException(
             status_code=400, detail="Missing data for requested time point."
         )
+    time_values = np.asarray(
+        [
+            np.datetime64(pd.Timestamp(year=tp.year, month=tp.month, day=1), "ns")
+            for tp in time_points
+        ],
+        dtype="datetime64[ns]",
+    )
+    time_ids = [tp.id for tp in time_points]
 
-    # create a list of time points and their ids
-    time_values = [
-        np.datetime64(pd.Timestamp(year=tp.year, month=tp.month, day=1), "ns")
-        for tp in time_points
-    ]
-    time_ids = {tp.id: tidx for tidx, tp in enumerate(time_points)}
-
-    # get the grid points and their ids
-    grid_points = get_grid_points(session, area)
-
-    if not grid_points:
+    # the finest stored grid gives the coordinates of the dataset
+    finest = (
+        session.query(GridDefinition)
+        .join(ResolutionGroup, ResolutionGroup.id == GridDefinition.resolution_id)
+        .order_by(ResolutionGroup.resolution.asc())
+        .first()
+    )
+    out_grid = None if finest is None else finest.to_grid()
+    out_range = None if out_grid is None else _area_to_index_range(out_grid, area)
+    if out_range is None:
         print("No grid points found in the specified area.")
         raise HTTPException(
             status_code=400, detail="No grid points found in specified area."
         )
+    oi0, oi1, oj0, oj1 = out_range
+    latitudes = np.round(out_grid.latitudes(oi0, oi1), ROUND_DIGITS)
+    longitudes = np.round(out_grid.longitudes(oj0, oj1), ROUND_DIGITS)
 
-    # Sort and deduplicate latitudes and longitudes
-    grid_ids, latitudes, longitudes = sort_grid_points_get_ids(grid_points)
-
-    # Force netCDF-safe coordinate dtypes
-    time_values = np.asarray(time_values, dtype="datetime64[ns]")
-    latitudes = np.asarray(latitudes, dtype=np.float64)
-    longitudes = np.asarray(longitudes, dtype=np.float64)
-
-    # get variable types and their ids
     var_types = get_var_types(session, var_names)
     if not var_types:
         print("No variable types found in the specified names.")
@@ -2273,7 +1909,6 @@ def get_var_values_cartesian_for_download(
             status_code=400, detail="Missing variable type for requested time point."
         )
 
-    # create an empty dataset
     ds = xr.Dataset(
         coords={
             "time": ("time", time_values),
@@ -2281,77 +1916,41 @@ def get_var_values_cartesian_for_download(
             "longitude": ("longitude", longitudes),
         }
     )
-
-    # get variable values for each grid point and time point
     for vt in var_types:
-        var_name = vt.name
-        # variables stored per resolution are exported at the finest resolution
-        # of the variable (as in get_var_value), not the finest one that
-        # happens to have rows in the requested area
-        resolution_id = (
-            None
-            if vt.aggregation == "subsample"
-            else _finest_resolution_id(session, vt.id)
-        )
-        values = (
-            session.query(VarValue)
-            .filter(
-                VarValue.grid_id.in_(grid_ids.keys()),
-                VarValue.time_id.in_(time_ids.keys()),
-                VarValue.var_id == vt.id,
-                VarValue.resolution_id.is_(None)
-                if resolution_id is None
-                else VarValue.resolution_id == resolution_id,
-            )
-            .all()
-        )
-        covered_ids = [
-            row.grid_id
-            for row in session.query(VarCoverage.grid_id)
-            .filter(
-                VarCoverage.var_id == vt.id,
-                VarCoverage.grid_id.in_(grid_ids.keys()),
-                VarCoverage.resolution_id.is_(None)
-                if resolution_id is None
-                else VarCoverage.resolution_id == resolution_id,
-            )
-            .all()
-        ]
-
-        # dummy values array
         values_array = np.full(
-            (len(time_values), len(latitudes), len(longitudes)),
-            np.nan,
-            dtype=np.float64,
+            (len(time_values), len(latitudes), len(longitudes)), np.nan
         )
-        # covered grid points without a stored value are 0 (see VarCoverage)
-        for grid_id in covered_ids:
-            lat_index, lon_index = grid_ids[grid_id]
-            values_array[:, lat_index, lon_index] = 0.0
+        resolution_id = _finest_resolution_id(session, vt.id)
+        grid = None if resolution_id is None else get_grid_def(session, resolution_id)
+        index_range = None if grid is None else _area_to_index_range(grid, area)
+        if index_range is not None:
+            values = read_tile_values(
+                session, vt.id, resolution_id, time_ids, grid, index_range
+            )
+            i0, i1, j0, j1 = index_range
+            # positions of this variable's cells on the output grid
+            rows = np.round(
+                (grid.latitudes(i0, i1) - latitudes[0]) / out_grid.step
+            ).astype(int)
+            cols = np.round(
+                (grid.longitudes(j0, j1) - longitudes[0]) / out_grid.step
+            ).astype(int)
+            keep_r = (rows >= 0) & (rows < len(latitudes))
+            keep_c = (cols >= 0) & (cols < len(longitudes))
+            values_array[:, rows[keep_r][:, None], cols[keep_c][None, :]] = (
+                tiles.shortest_float64(values[:, keep_r][:, :, keep_c])
+            )
+        ds[vt.name] = (("time", "latitude", "longitude"), values_array)
+        # NetCDF attributes cannot be None
+        for attr in ("unit", "description"):
+            if getattr(vt, attr) is not None:
+                ds[vt.name].attrs[attr] = getattr(vt, attr)
 
-        # fill the values array with the variable values
-        for vv in values:
-            grid_index = grid_ids[vv.grid_id]
-            lat_index, lon_index = grid_index
-            time_index = time_ids[vv.time_id]
-            values_array[time_index, lat_index, lon_index] = vv.value
-
-        # add data to the dataset
-        ds[var_name] = (("time", "latitude", "longitude"), values_array)
-
-    # add variable attributes
-    for var_type in var_types:
-        ds[var_type.name].attrs["unit"] = var_type.unit
-        ds[var_type.name].attrs["description"] = var_type.description
-    # add global attributes
     ds.attrs["source"] = "OneHealth Database"
     ds.attrs["created_at"] = pd.Timestamp.now().isoformat()
     ds.attrs["description"] = "Variable values for a cartesian map from the database."
-
-    # save the dataset to a NetCDF file
     ds.to_netcdf(netcdf_file)
     print(f"Dataset saved to {netcdf_file}")
-
     return {"response": "Dataset created successfully.", "netcdf_file": netcdf_file}
 
 
@@ -2416,60 +2015,6 @@ def get_nuts_regions_geojson(
     return json.loads(nuts_regions.to_json())
 
 
-def get_grid_ids_in_nuts(
-    engine: engine.Engine,
-    nuts_regions: gpd.GeoDataFrame,
-) -> list[int]:
-    """Get grid point IDs that are within the NUTS regions.
-
-    Args:
-        engine (engine.Engine): SQLAlchemy engine object.
-        nuts_regions (gpd.GeoDataFrame): GeoDataFrame with NUTS region geometries.
-
-    Returns:
-        List[int]: List of grid point IDs that intersect with the NUTS regions.
-    """
-    if nuts_regions.empty:
-        return []
-
-    # the points are built from latitude/longitude, and only for the grid
-    # points in the bounding box of the regions, not for the whole grid
-    west, south, east, north = nuts_regions.to_crs(epsg=CRS).total_bounds
-    sql = text(f"""
-    SELECT id,
-        ST_SetSRID(
-            ST_MakePoint(longitude::float8, latitude::float8), {CRS}
-        ) AS geometry
-    FROM grid_point
-    WHERE latitude BETWEEN :south AND :north
-        AND longitude BETWEEN :west AND :east
-    """)
-
-    # turn the grid points into a GeoDataFrame
-    grid_points_gdf = gpd.read_postgis(
-        sql,
-        engine,
-        geom_col="geometry",
-        crs=f"EPSG:{CRS!s}",
-        params={
-            "south": float(south),
-            "north": float(north),
-            "west": float(west),
-            "east": float(east),
-        },
-    )
-    if grid_points_gdf.empty:
-        return []
-    nuts_regions = nuts_regions.to_crs(epsg=CRS)
-
-    # filter grid points that intersect with NUTS regions
-    filtered_grid_points_gdf = gpd.sjoin(
-        grid_points_gdf, nuts_regions, how="inner", predicate="intersects"
-    )
-
-    return sorted(set(filtered_grid_points_gdf["id"].tolist()))
-
-
 def filter_nuts_ids_for_resolution(nuts_ids: list[str], resolution: str) -> list[str]:
     """Filter NUTS IDs based on the specified resolution.
 
@@ -2521,6 +2066,7 @@ def get_var_values_nuts(
     date_object = (
         session.query(TimePoint)
         .filter((TimePoint.year == time_point[0]) & (TimePoint.month == time_point[1]))
+        .order_by(TimePoint.day, TimePoint.id)
         .first()
     )
 
@@ -2623,6 +2169,12 @@ def insert_var_value_nuts(
     # Some inputs come as (NUTS_ID, time). Normalize to (time, NUTS_ID) so the
     # chunking/insertion logic always treats axis 0 as time.
     var_data = var_data.transpose("time", "NUTS_ID")
+    months = var_data["time"].values.astype("datetime64[M]")
+    if len(np.unique(months)) != len(months):
+        raise ValueError(
+            f"{var_name} has several time steps in one month. The database "
+            "stores one value per month; aggregate the data to monthly first."
+        )
 
     nuts_ids = var_data["NUTS_ID"].values
 

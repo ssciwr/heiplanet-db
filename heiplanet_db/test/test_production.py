@@ -278,10 +278,9 @@ def test_reset_production_data_executes_truncate_statement():
     # The SQLAlchemy text object should contain our TRUNCATE statement and key tables.
     sql_str = str(sql_arg)
     assert "TRUNCATE TABLE" in sql_str
-    assert "grid_point_resolution" in sql_str
+    assert "var_tile" in sql_str
+    assert "grid_def" in sql_str
     assert "var_value_nuts" in sql_str
-    assert "var_value" in sql_str
-    assert "grid_point" in sql_str
     assert "time_point" in sql_str
     assert "var_type" in sql_str
     assert "resolution_group" in sql_str
@@ -451,6 +450,16 @@ def test_main():
         pytest.fail(f"Main function raised an exception: {e}")
 
 
+def _assert_autovacuum_enabled(engine):
+    """The load sets autovacuum_enabled explicitly, so it must be 'true'."""
+    with engine.connect() as conn:
+        for table in prod.BULK_LOAD_TABLES:
+            reloptions = conn.execute(
+                text("SELECT reloptions FROM pg_class WHERE relname = :t"), {"t": table}
+            ).scalar_one()
+            assert "autovacuum_enabled=true" in (reloptions or []), (table, reloptions)
+
+
 def test_autovacuum_restoration_on_failure(get_engine_with_tables, monkeypatch):
     engine = get_engine_with_tables
 
@@ -464,97 +473,7 @@ def test_autovacuum_restoration_on_failure(get_engine_with_tables, monkeypatch):
     with pytest.raises(RuntimeError, match="Insertion failed"):
         prod.load_data_with_optimization(engine, grid_vars=grid_vars)
 
-    # Verify autovacuum is enabled for all tables
-    with engine.connect() as conn:
-        for table in ["grid_point", "time_point", "var_value", "var_value_nuts"]:
-            result = conn.execute(
-                text(f"SELECT reloptions FROM pg_class WHERE relname = '{table}'")
-            )
-            row = result.fetchone()
-            # If autovacuum was disabled and NOT re-enabled, it would likely show up in reloptions.
-            # Postgres doesn't always clear the option when set to true, it might show 'autovacuum_enabled=true'.
-            # Or if it was reset, it might be None.
-            # IMPORTANT: The code explicitly sets it to true.
-            reloptions = row[0] if row else []
-            if reloptions:
-                opts = {k: v for k, v in (x.split("=") for x in reloptions)}
-                assert opts.get("autovacuum_enabled") == "true", (
-                    f"Autovacuum not enabled for {table}: {reloptions}"
-                )
-
-
-def test_failed_load_with_bad_data_keeps_original_error(
-    get_engine_with_tables, monkeypatch
-):
-    """If the constraints cannot be restored after a failed load, the load's
-    own error is raised and autovacuum is still re-enabled."""
-    engine = get_engine_with_tables
-
-    def insert_bad_row_and_fail(*_args, **_kwargs):
-        # a row with unknown IDs: restoring the foreign keys fails
-        with engine.begin() as conn:
-            conn.execute(
-                text(
-                    "INSERT INTO var_value (grid_id, time_id, var_id, value) "
-                    "VALUES (999, 999, 99, 1.0)"
-                )
-            )
-        raise RuntimeError("Insertion failed")
-
-    grid_vars = [prod.GridVar("R0", [Path("dummy.nc")])]
-    try:
-        monkeypatch.setattr(prod, "insert_grid_var_values", insert_bad_row_and_fail)
-        with pytest.raises(RuntimeError, match="Insertion failed"):
-            prod.load_data_with_optimization(engine, grid_vars=grid_vars)
-
-        with engine.connect() as conn:
-            for table in ["grid_point", "time_point", "var_value", "var_value_nuts"]:
-                reloptions = conn.execute(
-                    text("SELECT reloptions FROM pg_class WHERE relname = :t"),
-                    {"t": table},
-                ).scalar()
-                assert "autovacuum_enabled=true" in (reloptions or []), table
-            # the constraints could not be restored
-            assert (
-                conn.execute(
-                    text("SELECT 1 FROM pg_constraint WHERE conname = 'fk_grid_id'")
-                ).first()
-                is None
-            )
-    finally:
-        with engine.begin() as conn:
-            conn.execute(text("DELETE FROM var_value"))
-        prod.db.add_bulk_load_constraints(engine)
-
-
-def test_constraint_error_after_successful_load_is_raised(
-    get_engine_with_tables, monkeypatch
-):
-    engine = get_engine_with_tables
-
-    def insert_bad_row(*_args, **_kwargs):
-        with engine.begin() as conn:
-            conn.execute(
-                text(
-                    "INSERT INTO var_value (grid_id, time_id, var_id, value) "
-                    "VALUES (999, 999, 99, 1.0)"
-                )
-            )
-
-    grid_vars = [prod.GridVar("R0", [Path("dummy.nc")])]
-    try:
-        monkeypatch.setattr(prod, "insert_grid_var_values", insert_bad_row)
-        with pytest.raises(Exception, match="fk_"):
-            prod.load_data_with_optimization(engine, grid_vars=grid_vars)
-        with engine.connect() as conn:
-            reloptions = conn.execute(
-                text("SELECT reloptions FROM pg_class WHERE relname = 'var_value'")
-            ).scalar()
-        assert "autovacuum_enabled=true" in (reloptions or [])
-    finally:
-        with engine.begin() as conn:
-            conn.execute(text("DELETE FROM var_value"))
-        prod.db.add_bulk_load_constraints(engine)
+    _assert_autovacuum_enabled(engine)
 
 
 def test_autovacuum_restoration_on_success(get_engine_with_tables):
@@ -569,6 +488,7 @@ def test_autovacuum_restoration_on_success(get_engine_with_tables):
         prod.load_data_with_optimization(engine, grid_vars=grid_vars)
     insert_grid.assert_called_once_with(engine, grid_vars)
     insert_nuts.assert_not_called()
+    _assert_autovacuum_enabled(engine)
 
 
 def test_load_data_with_optimization_nuts_only(get_engine_with_tables):
@@ -582,19 +502,7 @@ def test_load_data_with_optimization_nuts_only(get_engine_with_tables):
     insert_grid.assert_not_called()
     insert_nuts.assert_called_once_with(engine, nuts_vars)
 
-    # Verify autovacuum is enabled
-    with engine.connect() as conn:
-        for table in ["grid_point", "time_point", "var_value", "var_value_nuts"]:
-            result = conn.execute(
-                text(f"SELECT reloptions FROM pg_class WHERE relname = '{table}'")
-            )
-            row = result.fetchone()
-            reloptions = row[0] if row else []
-            if reloptions:
-                opts = {k: v for k, v in (x.split("=") for x in reloptions)}
-                assert opts.get("autovacuum_enabled") == "true", (
-                    f"Autovacuum not enabled for {table}: {reloptions}"
-                )
+    _assert_autovacuum_enabled(engine)
 
 
 # --- config handling for several variables and files ---
@@ -890,16 +798,18 @@ def test_insert_grid_var_values_end_to_end(get_engine_with_tables, tmp_path):
     with engine.connect() as conn:
         rows = conn.execute(
             text(
-                "SELECT vt.name, rg.resolution, COUNT(*), MIN(vv.value), "
-                "MAX(vv.value) FROM var_value vv "
-                "JOIN var_type vt ON vt.id = vv.var_id "
-                "LEFT JOIN resolution_group rg ON rg.id = vv.resolution_id "
+                "SELECT vt.name, rg.resolution, COUNT(*), MIN(v.value), "
+                "MAX(v.value) FROM var_value_v v "
+                "JOIN var_type vt ON vt.id = v.var_id "
+                "JOIN resolution_group rg ON rg.id = v.resolution_id "
                 "GROUP BY vt.name, rg.resolution ORDER BY vt.name, rg.resolution"
             )
         ).all()
-    summary = {(name, None if res is None else float(res)): r for name, res, *r in rows}
-    # R0: 4 months x 20 land cells, one row each (no resolution)
-    assert summary[("R0", None)] == [80, 1.0, 1.0]
+    summary = {(name, float(res)): r for name, res, *r in rows}
+    # R0: 4 months x 20 land cells (the first column is ocean, NaN)
+    assert summary[("R0", 0.1)] == [80, 1.0, 1.0]
+    # R0 at 0.2: every second point, 3 x 2 land points
+    assert summary[("R0", 0.2)] == [24, 1.0, 1.0]
     # adults at 0.1: ocean column masked out, so the zeros are gone
     assert summary[("adults", 0.1)] == [80, 2.0, 2.0]
     # adults at 0.2: 3x3 coarse cells; the column at lon 0.0 still has land
@@ -1039,10 +949,10 @@ def test_insert_grid_and_nuts_values_with_transform(get_engine_with_tables, tmp_
     with engine.connect() as conn:
         rows = conn.execute(
             text(
-                "SELECT vt.name, rg.resolution, COUNT(*), MIN(vv.value), "
-                "MAX(vv.value) FROM var_value vv "
-                "JOIN var_type vt ON vt.id = vv.var_id "
-                "LEFT JOIN resolution_group rg ON rg.id = vv.resolution_id "
+                "SELECT vt.name, rg.resolution, COUNT(*), MIN(v.value), "
+                "MAX(v.value) FROM var_value_v v "
+                "JOIN var_type vt ON vt.id = v.var_id "
+                "JOIN resolution_group rg ON rg.id = v.resolution_id "
                 "GROUP BY vt.name, rg.resolution ORDER BY vt.name, rg.resolution"
             )
         ).all()
@@ -1054,22 +964,11 @@ def test_insert_grid_and_nuts_values_with_transform(get_engine_with_tables, tmp_
                 )
             ).all()
         )
-    summary = {(n, None if r is None else float(r)): rest for n, r, *rest in rows}
+    summary = {(n, float(r)): rest for n, r, *rest in rows}
     log2 = float(np.log10(2.0))
-    # R0 = 1 everywhere -> log10 = 0 at every covered grid point: no rows,
-    # only the coverage
-    assert ("R0_log10", None) not in summary
-    with engine.connect() as conn:
-        coverage = dict(
-            conn.execute(
-                text(
-                    "SELECT vt.name, COUNT(*) FROM var_coverage c "
-                    "JOIN var_type vt ON vt.id = c.var_id GROUP BY vt.name"
-                )
-            ).all()
-        )
-    # 5 x 5 grid, first column is ocean
-    assert coverage["R0_log10"] == 20
+    # R0 = 1 everywhere -> log10 = 0 at the 20 land cells (5 x 5 grid, the
+    # first column is ocean), 4 months
+    assert summary[("R0_log10", 0.1)] == [80, 0.0, 0.0]
     session = db.create_session(engine)
     assert db.get_var_value(session, "R0_log10", 0.0, 0.1, 2023, 1, 1) == 0.0
     assert db.get_var_value(session, "R0_log10", 0.0, 0.0, 2023, 1, 1) is None
@@ -1079,3 +978,83 @@ def test_insert_grid_and_nuts_values_with_transform(get_engine_with_tables, tmp_
     np.testing.assert_allclose(summary[("adults_log10", 0.2)][1:], [log2, log2])
     # 100 -> 2, 0.5 is below the floor -> 0
     assert nuts == {1: 2.0, 2: 0.0}
+
+
+def test_insert_nuts_var_values_without_grid_vars(get_engine_with_tables, tmp_path):
+    import geopandas as gpd
+    import numpy as np
+    import xarray as xr
+    from shapely.geometry import Polygon
+
+    from heiplanet_db import postgresql_database as db
+
+    engine = get_engine_with_tables
+    nuts_path = tmp_path / "nuts.nc"
+    xr.Dataset(
+        {"R0": (("NUTS_ID", "time"), np.array([[1.5, 2.5]]))},
+        coords={
+            "NUTS_ID": ["DE11"],
+            "time": np.array(["2031-01-01", "2031-02-01"], dtype="datetime64[ns]"),
+        },
+    ).to_netcdf(nuts_path)
+    session = db.create_session(engine)
+    db.insert_var_types(session, [{"name": "R0", "unit": "1", "description": "r0"}])
+    session.close()
+    gdf = gpd.GeoDataFrame(
+        {
+            "NUTS_ID": ["DE11"],
+            "LEVL_CODE": [2],
+            "CNTR_CODE": ["DE"],
+            "NAME_LATN": ["x"],
+            "NUTS_NAME": ["x"],
+            "MOUNT_TYPE": [0.0],
+            "URBN_TYPE": [1.0],
+            "COAST_TYPE": [1.0],
+        },
+        geometry=[Polygon([(0, 0), (1, 0), (1, 1), (0, 1)])],
+        crs="EPSG:4326",
+    )
+    (tmp_path / "shp").mkdir()
+    gdf.to_file(tmp_path / "shp" / "nuts.shp", driver="ESRI Shapefile")
+    db.insert_nuts_def(engine, tmp_path / "shp")
+
+    # no gridded variables were loaded, so no time points are stored yet
+    prod.insert_nuts_var_values(engine, [prod.NutsVar("R0", nuts_path)])
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT tp.year, tp.month, v.value FROM var_value_nuts v "
+                "JOIN time_point tp ON tp.id = v.time_id ORDER BY tp.month"
+            )
+        ).all()
+    assert [tuple(r) for r in rows] == [(2031, 1, 1.5), (2031, 2, 2.5)]
+
+
+def test_insert_time_points_one_per_month(get_engine_with_tables):
+    import numpy as np
+    import xarray as xr
+
+    def ds(times):
+        return xr.Dataset(coords={"time": np.array(times, dtype="datetime64[ns]")})
+
+    with get_engine_with_tables.begin() as conn:
+        conn.execute(text("TRUNCATE TABLE time_point RESTART IDENTITY CASCADE"))
+    # same day at different times, and mid-month dates: one point per month
+    prod._insert_time_points(
+        get_engine_with_tables,
+        {
+            "a": ds(["2020-01-01T00:00", "2020-02-01"]),
+            "b": ds(["2020-01-01T12:00", "2020-02-15"]),
+        },
+    )
+    # a later file dated mid-month adds no second point for a stored month
+    prod._insert_time_points(
+        get_engine_with_tables, {"c": ds(["2020-01-15", "2020-03-31"])}
+    )
+    with get_engine_with_tables.connect() as conn:
+        rows = conn.execute(
+            text("SELECT year, month, day FROM time_point ORDER BY year, month")
+        ).all()
+        conn.execute(text("TRUNCATE TABLE time_point RESTART IDENTITY CASCADE"))
+        conn.commit()
+    assert [tuple(r) for r in rows] == [(2020, 1, 1), (2020, 2, 1), (2020, 3, 1)]
