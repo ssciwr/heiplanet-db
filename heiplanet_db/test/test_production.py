@@ -978,3 +978,53 @@ def test_insert_grid_and_nuts_values_with_transform(get_engine_with_tables, tmp_
     np.testing.assert_allclose(summary[("adults_log10", 0.2)][1:], [log2, log2])
     # 100 -> 2, 0.5 is below the floor -> 0
     assert nuts == {1: 2.0, 2: 0.0}
+
+
+def test_insert_nuts_var_values_without_grid_vars(get_engine_with_tables, tmp_path):
+    import geopandas as gpd
+    import numpy as np
+    import xarray as xr
+    from shapely.geometry import Polygon
+
+    from heiplanet_db import postgresql_database as db
+
+    engine = get_engine_with_tables
+    nuts_path = tmp_path / "nuts.nc"
+    xr.Dataset(
+        {"R0": (("NUTS_ID", "time"), np.array([[1.5, 2.5]]))},
+        coords={
+            "NUTS_ID": ["DE11"],
+            "time": np.array(["2031-01-01", "2031-02-01"], dtype="datetime64[ns]"),
+        },
+    ).to_netcdf(nuts_path)
+    session = db.create_session(engine)
+    db.insert_var_types(session, [{"name": "R0", "unit": "1", "description": "r0"}])
+    session.close()
+    gdf = gpd.GeoDataFrame(
+        {
+            "NUTS_ID": ["DE11"],
+            "LEVL_CODE": [2],
+            "CNTR_CODE": ["DE"],
+            "NAME_LATN": ["x"],
+            "NUTS_NAME": ["x"],
+            "MOUNT_TYPE": [0.0],
+            "URBN_TYPE": [1.0],
+            "COAST_TYPE": [1.0],
+        },
+        geometry=[Polygon([(0, 0), (1, 0), (1, 1), (0, 1)])],
+        crs="EPSG:4326",
+    )
+    (tmp_path / "shp").mkdir()
+    gdf.to_file(tmp_path / "shp" / "nuts.shp", driver="ESRI Shapefile")
+    db.insert_nuts_def(engine, tmp_path / "shp")
+
+    # no gridded variables were loaded, so no time points are stored yet
+    prod.insert_nuts_var_values(engine, [prod.NutsVar("R0", nuts_path)])
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT tp.year, tp.month, v.value FROM var_value_nuts v "
+                "JOIN time_point tp ON tp.id = v.time_id ORDER BY tp.month"
+            )
+        ).all()
+    assert [tuple(r) for r in rows] == [(2031, 1, 1.5), (2031, 2, 2.5)]

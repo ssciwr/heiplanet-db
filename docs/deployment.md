@@ -508,9 +508,15 @@ Optional keys for `grid` and `nuts` variables:
 
 #### Grid alignment
 
-All `grid` variables must be on the same grid. The grid points of a coarser resolution are the points whose latitude and longitude, multiplied by 10 and rounded to an integer, are multiples of the resolution × 10 (e.g. every second 0.1° point for 0.2°). A resolution is only stored if it is a whole multiple of the grid step of the data.
+All `grid` variables must be on the same grid. The grid points of a coarser resolution are the points whose latitude and longitude are multiples of that resolution (e.g. every second 0.1° point for 0.2°). A resolution is only stored if it is a whole multiple of the grid step of the data.
 
-The coordinates must lie on whole tenths of a degree (e.g. 90.0, 89.9, …, -179.9), as in the current J-Model and P-Model data. On a grid that is offset by half a step, with cell centres at x.x5 (e.g. 0.05, 0.15, …), the coarse points selected by this rule are not regularly spaced, and the loader stops with an error before it stores anything. Shift or regrid such data to whole tenths of a degree first.
+The frontend only requests the resolutions of the resolution groups (0.1, 0.2, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0 and 5.0°), on grid points that are multiples of the resolution. Data on any other grid could not be shown, so the loader stops with an error before it stores anything if a `grid` variable:
+
+- is not on a regular grid with the same step on both axes and at least two points per axis,
+- has a grid step that is not one of the resolution groups (e.g. 0.25° ERA5 data), or
+- has coordinates that are not multiples of its grid step, such as a grid that is offset by half a step (cell centres at 0.05, 0.15, … for 0.1°, or at 0.25, 0.75, … for 0.5°).
+
+The current J-Model and P-Model data are on a 0.1° grid with coordinates on whole tenths of a degree (90.0, 89.9, …, -179.9) and load as they are. Regrid or shift other data to such a grid first.
 
 #### Storage of gridded values
 

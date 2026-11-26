@@ -135,6 +135,8 @@ def cell_index(grid: GridDef, lat: float, lon: float) -> tuple[int, int] | None:
     """
     fi = (lat - grid.lat0) / grid.step
     fj = (lon - grid.lon0) / grid.step
+    if not (np.isfinite(fi) and np.isfinite(fj)):
+        return None
     i, j = round(fi), round(fj)
     if not (0 <= i < grid.n_lat and 0 <= j < grid.n_lon):
         return None
@@ -145,6 +147,9 @@ def cell_index(grid: GridDef, lat: float, lon: float) -> tuple[int, int] | None:
 
 def _axis_range(start: float, n: int, step: float, low: float, high: float):
     """Half-open index range of the axis values within [low, high]."""
+    # clip to just beyond the axis, so that huge bounds cannot overflow
+    low = min(max(low, start - step), start + n * step)
+    high = min(max(high, start - step), start + n * step)
     first = max(0, int(np.ceil((low - start) / step - COORD_ATOL / step)))
     stop = min(n, int(np.floor((high - start) / step + COORD_ATOL / step)) + 1)
     return first, stop

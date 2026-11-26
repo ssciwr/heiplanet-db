@@ -1342,10 +1342,35 @@ def test_insert_var_tiles_errors(get_engine_with_tables):
         )
     with pytest.raises(ValueError, match="not found in var_type"):
         postdb.insert_var_tiles(get_engine_with_tables, ds, "adults", {}, {}, {})
-    with pytest.raises(ValueError, match="No resolution group matches"):
+    with pytest.raises(ValueError, match="not one of the resolution groups"):
         postdb.insert_var_tiles(
             get_engine_with_tables, ds, "adults", {}, {"adults": 1}, {0.2: 1}
         )
+
+
+def test_check_grid_usable():
+    groups = {0.1: 1, 0.2: 2, 0.5: 3, 1.0: 4}
+    lats = np.round(np.arange(0.0, 1.05, 0.1), 1)
+    # 0.1 degree grid on whole tenths: fine
+    postdb._check_grid_usable(lats, lats, groups, "x")
+    # step that is not a resolution group (e.g. 0.25 degree ERA5)
+    quarter = np.arange(0.0, 2.1, 0.25)
+    with pytest.raises(ValueError, match=r"grid step of x \(0.25°\) is not one"):
+        postdb._check_grid_usable(quarter, quarter, groups, "x")
+    # offset by half a step
+    offset = np.arange(0.25, 5.0, 0.5)
+    with pytest.raises(ValueError, match="not multiples of its step 0.5°"):
+        postdb._check_grid_usable(offset, offset, groups, "x")
+    with pytest.raises(ValueError, match="latitude 0.05"):
+        postdb._check_grid_usable(lats + 0.05, lats, groups, "x")
+    # different steps per axis
+    with pytest.raises(ValueError, match="steps differ|step .* differ"):
+        postdb._check_grid_usable(lats, np.arange(0.0, 2.1, 0.2), groups, "x")
+    # irregular or too short
+    with pytest.raises(ValueError, match="not regularly spaced"):
+        postdb._check_grid_usable(np.array([0.0, 0.1, 0.3]), lats, groups, "x")
+    with pytest.raises(ValueError, match="at least two"):
+        postdb._check_grid_usable(np.array([0.0]), lats, groups, "x")
 
 
 def test_insert_var_tiles_mask_errors(get_engine_with_tables):

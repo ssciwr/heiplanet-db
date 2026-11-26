@@ -73,6 +73,10 @@ def test_cell_index(grid):
     assert tiles.cell_index(grid, 0.25, 12.5) is None
     assert tiles.cell_index(grid, 2.0, 12.5) is None
     assert tiles.cell_index(grid, 0.0, 9.5) is None
+    # non-finite coordinates
+    for bad in (np.nan, np.inf, -np.inf):
+        assert tiles.cell_index(grid, bad, 12.5) is None
+        assert tiles.cell_index(grid, 0.0, bad) is None
 
 
 def test_area_to_index_range(grid):
@@ -88,6 +92,15 @@ def test_area_to_index_range(grid):
     assert tiles.area_to_index_range(grid, (10, 20, 5, 30)) is None
     # a single cell
     assert tiles.area_to_index_range(grid, (0, 12.5, 0, 12.5)) == (3, 4, 5, 6)
+    # huge finite bounds are clipped to the grid
+    assert tiles.area_to_index_range(grid, (1e308, -1e308, -1e308, 1e308)) == (
+        0,
+        7,
+        0,
+        9,
+    )
+    assert tiles.area_to_index_range(grid, (1e308, 1e308, 1e307, 1e308)) is None
+    assert tiles.area_to_index_range(grid, (-1e307, -1e308, -1e308, -1e307)) is None
     # non-finite bounds
     for bad in (np.inf, -np.inf, np.nan):
         with pytest.raises(ValueError, match="finite"):

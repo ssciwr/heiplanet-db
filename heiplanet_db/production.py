@@ -311,18 +311,20 @@ def insert_nuts_var_values(engine: engine.Engine, nuts_vars: list[NutsVar]) -> i
         nuts_vars (list[NutsVar]): NUTS variables to insert.
     """
     check_paths([nv.path for nv in nuts_vars])
-    id_map_session = db.create_session(engine)
-    time_id_map, var_type_id_map = db.get_id_maps(id_map_session)
-    id_map_session.close()
     datasets: dict[Path, xr.Dataset] = {}
     for nv in nuts_vars:
         db.apply_transform(np.array([1.0]), nv.transform, nv.transform_floor)
-    for nv in nuts_vars:
         if nv.path not in datasets:
             datasets[nv.path] = xr.open_dataset(nv.path, chunks={})
+        if nv.file_variable not in datasets[nv.path]:
+            raise ValueError(f"Variable {nv.file_variable} not found in {nv.path}.")
+    # the time points may not be stored yet, e.g. without gridded variables
+    _insert_time_points(engine, datasets)
+    id_map_session = db.create_session(engine)
+    time_id_map, var_type_id_map = db.get_id_maps(id_map_session)
+    id_map_session.close()
+    for nv in nuts_vars:
         source = nv.file_variable
-        if source not in datasets[nv.path]:
-            raise ValueError(f"Variable {source} not found in {nv.path}.")
         da = db.apply_transform(
             datasets[nv.path][source], nv.transform, nv.transform_floor
         )

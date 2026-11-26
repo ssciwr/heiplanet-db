@@ -408,9 +408,9 @@ def initialize_database(db_url: str, replace: bool = False, upgrade: bool = True
         replace (bool): Whether to drop and recreate the tables. Defaults to False.
         upgrade (bool): Whether to bring existing tables up to date with
             `upgrade_schema` (only if replace is False). Defaults to True.
-            The API passes False: `upgrade_schema` takes exclusive locks and
-            re-creates the constraints that a running bulk load has dropped,
-            so only the production runner upgrades the schema.
+            The API passes False: `upgrade_schema` drops the tables of the
+            previous storage and takes exclusive locks, so only the
+            production runner upgrades the schema.
     """
     # create engine
     engine = create_engine(
@@ -978,6 +978,60 @@ def block_mean(values: np.ndarray, plan: dict) -> np.ndarray:
     return out
 
 
+def _check_grid_usable(
+    lats: np.ndarray,
+    lons: np.ndarray,
+    resolution_id_map: dict[float, int],
+    var_name: str,
+) -> None:
+    """Reject grids that the frontend cannot use.
+
+    The frontend requests values at one of the resolution groups, on grid
+    points that are multiples of that resolution. Data on another grid could
+    never be shown, so it is rejected before anything is stored.
+
+    Raises:
+        ValueError: With the reason and how to fix the data.
+    """
+    resolutions = ", ".join(f"{r:g}" for r in sorted(resolution_id_map))
+    try:
+        step = _grid_step(lats)
+        lon_step = _grid_step(lons)
+    except ValueError as e:
+        raise ValueError(
+            f"The grid of {var_name} cannot be loaded: {e} Gridded variables "
+            "need a regular latitude/longitude grid with at least two points "
+            "per axis."
+        ) from e
+    if not np.isclose(lon_step, step, rtol=0, atol=tiles.COORD_ATOL):
+        raise ValueError(
+            f"The grid of {var_name} cannot be loaded: its latitude step "
+            f"({step:g}°) and longitude step ({lon_step:g}°) differ. Regrid the "
+            "data to the same step on both axes."
+        )
+    if not any(
+        np.isclose(r, step, rtol=0, atol=tiles.COORD_ATOL) for r in resolution_id_map
+    ):
+        raise ValueError(
+            f"The grid step of {var_name} ({step:g}°) is not one of the "
+            f"resolution groups ({resolutions}°). The frontend only requests "
+            "these resolutions, so values on this grid could not be shown. "
+            "Regrid the data to one of them (e.g. 0.1°)."
+        )
+    for axis, coords in (("latitude", lats), ("longitude", lons)):
+        ratio = coords.astype(np.float64) / step
+        offset = np.abs(ratio - np.round(ratio)) * step
+        if (offset > tiles.COORD_ATOL).any():
+            bad = float(coords[np.argmax(offset)])
+            raise ValueError(
+                f"The grid of {var_name} cannot be loaded: its points are not "
+                f"multiples of its step {step:g}° (e.g. {axis} {bad:g}). The "
+                "frontend requests grid points at multiples of the resolution, "
+                "so values on this grid could not be shown. Shift or regrid the "
+                f"data so that its coordinates are multiples of {step:g}°."
+            )
+
+
 def _resolution_plans(
     lats: np.ndarray,
     lons: np.ndarray,
@@ -995,7 +1049,13 @@ def _resolution_plans(
     Returns:
         list[tuple[float, int, dict]]: (resolution, resolution_id, plan), finest
             first. The first one is always the native resolution.
+
+    Raises:
+        ValueError: If the grid cannot be served to the frontend: it is not
+            regular, its step is not one of the resolution groups, or its
+            points are not multiples of the step.
     """
+    _check_grid_usable(lats, lons, resolution_id_map, var_name)
     plans = []
     for resolution, resolution_id in sorted(resolution_id_map.items()):
         plan = _block_mean_plan(lats, lons, resolution)
